@@ -1,13 +1,13 @@
-use super::{
-    MySqlCdcScanConfig, MySqlCdcScanDefinition, MySqlCdcScanError, MySqlCdcScanSpec,
-    convert::{SnapshotProgress, convert_snapshot_values, convert_values},
-};
+use super::{MySqlCdcScanConfig, MySqlCdcScanDefinition, MySqlCdcScanError, MySqlCdcScanSpec};
 use crate::operation::OperationError;
-use crate::operation::scan::cdc_runtime::{Captured, CdcRuntime, Phase, Source};
-use arrow_schema::SchemaRef;
-use dogpaddle_change::Change;
-use dogpaddle_debezium::{Checkpoint, Connector, Record};
+use crate::operation::scan::{
+    cdc_convert::{ConvertError, Row, SnapshotMarker},
+    cdc_runtime::{CdcRuntime, Phase, Source},
+};
+use arrow_schema::{Fields, SchemaRef};
+use dogpaddle_debezium::{Checkpoint, Connector};
 use dogpaddle_store::{Cell, Queue};
+use serde_json::Value;
 
 pub(super) type MySqlCdcScanOperation = CdcRuntime<MySqlSource>;
 pub(super) struct MySqlSource {
@@ -41,20 +41,44 @@ impl MySqlCdcScanOperation {
 }
 
 impl Source for MySqlSource {
-    type Progress = SnapshotProgress;
     const RESET_REQUIRES_SOURCE_CLEANUP: bool = false;
-    fn source_fields(&self) -> usize {
-        self.spec.columns.len()
+    const CAPTURE_ACCEPTS_STREAMING: bool = false;
+    const STREAMING_TOMBSTONES: bool = true;
+    fn columns(&self) -> &Fields {
+        &self.spec.columns
     }
-    fn data_envelopes(&self, records: &[Record]) -> usize {
-        let topic = format!(
+    fn output_projection(&self) -> &[u32] {
+        &self.output_projection
+    }
+    fn engine_name(&self) -> &str {
+        &self.spec.engine_name
+    }
+    fn table_topic(&self) -> String {
+        format!(
             "{}.{}.{}",
             self.spec.engine_name, self.spec.database, self.spec.table
-        );
-        records
-            .iter()
-            .filter(|record| record.topic() == Some(topic.as_str()))
-            .count()
+        )
+    }
+    fn snapshot_marker(
+        &self,
+        payload: &Row,
+        capturing: bool,
+    ) -> Result<SnapshotMarker, ConvertError> {
+        if capturing {
+            validate_snapshot_metadata(payload, &self.spec.database, &self.spec.table).map(|last| {
+                if last {
+                    SnapshotMarker::Last
+                } else {
+                    SnapshotMarker::Snapshot
+                }
+            })
+        } else {
+            validate_metadata(payload, &self.spec.database, &self.spec.table)?;
+            Ok(SnapshotMarker::Streaming)
+        }
+    }
+    fn conversion_error(error: ConvertError) -> OperationError {
+        MySqlCdcScanError::from(error).into()
     }
     fn start_snapshot(&self) -> Result<Connector, OperationError> {
         Ok(self.config.start_snapshot(&self.spec)?)
@@ -64,36 +88,6 @@ impl Source for MySqlSource {
     }
     fn cleanup_snapshot(&self) -> Result<(), OperationError> {
         Ok(())
-    }
-    fn capture(
-        &self,
-        schema: SchemaRef,
-        records: &[Record],
-        progress: Self::Progress,
-    ) -> Result<Captured<Self::Progress>, OperationError> {
-        Ok(convert_snapshot_values(
-            &self.spec,
-            &self.output_projection,
-            schema,
-            records
-                .iter()
-                .map(|record| (record.topic(), record.value())),
-            progress,
-        )?)
-    }
-    fn stream(
-        &self,
-        schema: SchemaRef,
-        records: &[Record],
-    ) -> Result<Option<Change>, OperationError> {
-        Ok(convert_values(
-            &self.spec,
-            &self.output_projection,
-            schema,
-            records
-                .iter()
-                .map(|record| (record.topic(), record.value())),
-        )?)
     }
     fn restore_checkpoint(
         &self,
@@ -137,5 +131,80 @@ impl Source for MySqlSource {
     }
     fn codec_error(error: dogpaddle_change::CodecError) -> OperationError {
         Box::new(error)
+    }
+}
+
+fn validate_snapshot_metadata(
+    payload: &Row,
+    database: &str,
+    table: &str,
+) -> Result<bool, ConvertError> {
+    let metadata = payload
+        .get("source")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid("missing Debezium snapshot metadata"))?;
+    for (field, expected) in [("db", database), ("table", table), ("connector", "mysql")] {
+        if metadata.get(field).and_then(Value::as_str) != Some(expected) {
+            return Err(invalid(format!(
+                "Debezium snapshot metadata does not match configured {field}"
+            )));
+        }
+    }
+    match metadata.get("snapshot").and_then(Value::as_str) {
+        Some("true" | "first" | "first_in_data_collection") => Ok(false),
+        Some("last" | "last_in_data_collection") => Ok(true),
+        _ => Err(invalid(
+            "Debezium record is not part of the initial snapshot",
+        )),
+    }
+}
+
+fn validate_metadata(payload: &Row, database: &str, table: &str) -> Result<(), ConvertError> {
+    let metadata = payload
+        .get("source")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid("missing Debezium CDC metadata"))?;
+    for (field, expected) in [("db", database), ("table", table), ("connector", "mysql")] {
+        if metadata.get(field).and_then(Value::as_str) != Some(expected) {
+            return Err(invalid(format!(
+                "Debezium CDC metadata does not match configured {field}"
+            )));
+        }
+    }
+    // SnapshotRecord.FALSE deliberately leaves this Struct field unset in
+    // some Debezium paths. Snapshot operations are independently rejected by
+    // the operation guard below.
+    if !matches!(
+        metadata.get("snapshot"),
+        Some(Value::Null | Value::Bool(false))
+    ) && metadata.get("snapshot").and_then(Value::as_str) != Some("false")
+    {
+        return Err(invalid(
+            "Debezium CDC metadata does not identify a non-snapshot record",
+        ));
+    }
+    Ok(())
+}
+
+fn invalid(message: impl Into<String>) -> ConvertError {
+    ConvertError::Invalid(message.into())
+}
+
+#[cfg(test)]
+impl MySqlSource {
+    pub(super) fn for_test(spec: &MySqlCdcScanSpec, projection: &[u32]) -> Self {
+        Self {
+            spec: spec.clone(),
+            output_projection: projection.to_vec(),
+            config: MySqlCdcScanConfig::new_unencrypted(
+                "/unused/runtime",
+                "localhost",
+                1,
+                "unused",
+                "unused",
+                "",
+            )
+            .unwrap(),
+        }
     }
 }

@@ -116,17 +116,23 @@ const fn optional_u64_override(name: &'static str) -> ParameterSpec {
     }
 }
 
-struct CdcTuningParameters {
-    connect_timeout_ms: Option<Parameter>,
-    query_timeout_ms: Option<Parameter>,
-    retry_limit: Option<Parameter>,
-    retry_max_delay_ms: Option<Parameter>,
-    heartbeat_interval_ms: Option<Parameter>,
-    snapshot_fetch_size: Option<Parameter>,
-}
+// The parser owns name/type/presence validation. Resolution reads this immutable
+// argument set once into the concrete Resolved endpoint snapshot.
+pub(crate) struct Arguments(Vec<(&'static str, Parameter)>);
 
-impl CdcTuningParameters {
-    fn resolve(&self, endpoint: &str) -> Result<CdcOptions, SqlError> {
+impl Arguments {
+    fn get(&self, name: &str) -> Option<&Parameter> {
+        self.0
+            .iter()
+            .find_map(|(key, value)| (*key == name).then_some(value))
+    }
+
+    fn required(&self, name: &str) -> &Parameter {
+        self.get(name)
+            .expect("the endpoint specification requires this parameter")
+    }
+
+    fn resolve_tuning(&self, endpoint: &str) -> Result<CdcOptions, SqlError> {
         let mut options = CdcOptions::new();
         if let Some(value) = self.milliseconds(endpoint, "connect_timeout_ms")? {
             options = options
@@ -166,7 +172,7 @@ impl CdcTuningParameters {
         endpoint: &str,
         name: &str,
     ) -> Result<Option<std::time::Duration>, SqlError> {
-        self.parameter(name)
+        self.get(name)
             .map(|parameter| {
                 parameter
                     .resolve_u64(endpoint, name)
@@ -176,7 +182,7 @@ impl CdcTuningParameters {
     }
 
     fn unsigned(&self, endpoint: &str, name: &str) -> Result<Option<u32>, SqlError> {
-        self.parameter(name)
+        self.get(name)
             .map(|parameter| {
                 let value = parameter.resolve_u64(endpoint, name)?;
                 u32::try_from(value).map_err(|_| {
@@ -198,18 +204,6 @@ impl CdcTuningParameters {
                 })
             })
             .transpose()
-    }
-
-    fn parameter(&self, name: &str) -> Option<&Parameter> {
-        match name {
-            "connect_timeout_ms" => self.connect_timeout_ms.as_ref(),
-            "query_timeout_ms" => self.query_timeout_ms.as_ref(),
-            "retry_limit" => self.retry_limit.as_ref(),
-            "retry_max_delay_ms" => self.retry_max_delay_ms.as_ref(),
-            "heartbeat_interval_ms" => self.heartbeat_interval_ms.as_ref(),
-            "snapshot_fetch_size" => self.snapshot_fetch_size.as_ref(),
-            _ => unreachable!("CDC tuning parameter names are fixed"),
-        }
     }
 }
 
@@ -378,25 +372,10 @@ fn invalid_connection(endpoint: &str) -> SqlError {
     ))
 }
 
-pub(crate) struct PostgresCdcEndpoint {
-    connection: Parameter,
-    table: Parameter,
-    publication: Parameter,
-    bootstrap_spool_bytes: Parameter,
-    tuning: CdcTuningParameters,
-}
-
-pub(crate) struct MySqlCdcEndpoint {
-    connection: Parameter,
-    table: Parameter,
-    bootstrap_spool_bytes: Parameter,
-    tuning: CdcTuningParameters,
-}
-
 pub(crate) enum ScanEndpoint {
-    Sequence { start: Parameter },
-    PostgresCdc(Box<PostgresCdcEndpoint>),
-    MySqlCdc(Box<MySqlCdcEndpoint>),
+    Sequence(Arguments),
+    PostgresCdc(Arguments),
+    MySqlCdc(Arguments),
 }
 
 pub(crate) struct ResolvedEndpoints {
@@ -466,16 +445,18 @@ pub(crate) struct ResolvedMySqlCdc {
 impl ScanEndpoint {
     pub(crate) fn resolve(&self) -> Result<ResolvedScanEndpoint, SqlError> {
         match self {
-            Self::Sequence { start } => Ok(ResolvedScanEndpoint::Sequence {
-                start: start.resolve_u64("sequence", "start")?,
+            Self::Sequence(arguments) => Ok(ResolvedScanEndpoint::Sequence {
+                start: arguments
+                    .required("start")
+                    .resolve_u64("sequence", "start")?,
             }),
             Self::PostgresCdc(endpoint) => {
                 let connection =
-                    DatabaseConnection::postgres(&endpoint.connection, "postgres_cdc")?;
-                let (schema, table) = qualified_table(&endpoint.table, "postgres_cdc")?;
+                    DatabaseConnection::postgres(endpoint.required("connection"), "postgres_cdc")?;
+                let (schema, table) = qualified_table(endpoint.required("table"), "postgres_cdc")?;
                 validate_cdc_identifier(&schema, "postgres_cdc", "table schema")?;
                 validate_cdc_identifier(&table, "postgres_cdc", "table name")?;
-                let publication = endpoint.publication.resolve()?;
+                let publication = endpoint.required("publication").resolve()?;
                 validate_cdc_identifier(&publication, "postgres_cdc", "publication")?;
                 Ok(ResolvedScanEndpoint::PostgresCdc(Box::new(
                     ResolvedPostgresCdc {
@@ -484,15 +465,15 @@ impl ScanEndpoint {
                         table,
                         publication,
                         bootstrap_spool_bytes: endpoint
-                            .bootstrap_spool_bytes
+                            .required("bootstrap_spool_bytes")
                             .resolve_nonzero_u64("postgres_cdc", "bootstrap_spool_bytes")?,
-                        options: endpoint.tuning.resolve("postgres_cdc")?,
+                        options: endpoint.resolve_tuning("postgres_cdc")?,
                     },
                 )))
             }
             Self::MySqlCdc(endpoint) => {
-                let connection = DatabaseConnection::mysql(&endpoint.connection)?;
-                let (database, table) = qualified_table(&endpoint.table, "mysql_cdc")?;
+                let connection = DatabaseConnection::mysql(endpoint.required("connection"))?;
+                let (database, table) = qualified_table(endpoint.required("table"), "mysql_cdc")?;
                 require_database(&connection, &database, "mysql_cdc")?;
                 validate_cdc_identifier(&database, "mysql_cdc", "database")?;
                 validate_cdc_identifier(&table, "mysql_cdc", "table name")?;
@@ -500,9 +481,9 @@ impl ScanEndpoint {
                     connection,
                     table,
                     bootstrap_spool_bytes: endpoint
-                        .bootstrap_spool_bytes
+                        .required("bootstrap_spool_bytes")
                         .resolve_nonzero_u64("mysql_cdc", "bootstrap_spool_bytes")?,
-                    options: endpoint.tuning.resolve("mysql_cdc")?,
+                    options: endpoint.resolve_tuning("mysql_cdc")?,
                 })))
             }
         }
@@ -516,14 +497,11 @@ impl ScanEndpoint {
             return Err(SqlError::invalid("scan functions do not accept SETTINGS"));
         }
         match endpoint_name(name).as_deref() {
-            Some("sequence") => {
-                let [start] = exact_parameters(parse_arguments(
-                    "sequence",
-                    &arguments.args,
-                    &[u64_parameter("start")],
-                )?);
-                Ok(Self::Sequence { start })
-            }
+            Some("sequence") => Ok(Self::Sequence(parse_arguments(
+                "sequence",
+                &arguments.args,
+                &[u64_parameter("start")],
+            )?)),
             Some("postgres_cdc") => parse_postgres_cdc(arguments),
             Some("mysql_cdc") => parse_mysql_cdc(arguments),
             _ => Err(SqlError::invalid(format!("unknown scan function {name}"))),
@@ -639,18 +617,7 @@ impl ResolvedScanEndpoint {
 }
 
 fn parse_postgres_cdc(arguments: &TableFunctionArgs) -> Result<ScanEndpoint, SqlError> {
-    let [
-        Some(connection),
-        Some(table),
-        Some(publication),
-        Some(bootstrap_spool_bytes),
-        connect_timeout_ms,
-        query_timeout_ms,
-        retry_limit,
-        retry_max_delay_ms,
-        heartbeat_interval_ms,
-        snapshot_fetch_size,
-    ] = exact_parameter_slots(parse_argument_slots(
+    Ok(ScanEndpoint::PostgresCdc(parse_arguments(
         "postgres_cdc",
         &arguments.args,
         &[
@@ -665,38 +632,11 @@ fn parse_postgres_cdc(arguments: &TableFunctionArgs) -> Result<ScanEndpoint, Sql
             optional_u64_override("heartbeat_interval_ms"),
             optional_u64_override("snapshot_fetch_size"),
         ],
-    )?)
-    else {
-        unreachable!("required PostgreSQL CDC parameters are present")
-    };
-    Ok(ScanEndpoint::PostgresCdc(Box::new(PostgresCdcEndpoint {
-        connection,
-        table,
-        publication,
-        bootstrap_spool_bytes,
-        tuning: CdcTuningParameters {
-            connect_timeout_ms,
-            query_timeout_ms,
-            retry_limit,
-            retry_max_delay_ms,
-            heartbeat_interval_ms,
-            snapshot_fetch_size,
-        },
-    })))
+    )?))
 }
 
 fn parse_mysql_cdc(arguments: &TableFunctionArgs) -> Result<ScanEndpoint, SqlError> {
-    let [
-        Some(connection),
-        Some(table),
-        Some(bootstrap_spool_bytes),
-        connect_timeout_ms,
-        query_timeout_ms,
-        retry_limit,
-        retry_max_delay_ms,
-        heartbeat_interval_ms,
-        snapshot_fetch_size,
-    ] = exact_parameter_slots(parse_argument_slots(
+    Ok(ScanEndpoint::MySqlCdc(parse_arguments(
         "mysql_cdc",
         &arguments.args,
         &[
@@ -710,28 +650,7 @@ fn parse_mysql_cdc(arguments: &TableFunctionArgs) -> Result<ScanEndpoint, SqlErr
             optional_u64_override("heartbeat_interval_ms"),
             optional_u64_override("snapshot_fetch_size"),
         ],
-    )?)
-    else {
-        unreachable!("required MySQL CDC parameters are present")
-    };
-    Ok(ScanEndpoint::MySqlCdc(Box::new(MySqlCdcEndpoint {
-        connection,
-        table,
-        bootstrap_spool_bytes,
-        tuning: CdcTuningParameters {
-            connect_timeout_ms,
-            query_timeout_ms,
-            retry_limit,
-            retry_max_delay_ms,
-            heartbeat_interval_ms,
-            snapshot_fetch_size,
-        },
-    })))
-}
-
-pub(crate) struct DatabaseSinkEndpoint {
-    connection: Parameter,
-    table: Parameter,
+    )?))
 }
 
 pub(crate) struct ResolvedDatabaseSink {
@@ -749,10 +668,10 @@ pub(crate) enum ResolvedSinkEndpoint {
 }
 
 pub(crate) enum SinkEndpoint {
-    ClickHouse(DatabaseSinkEndpoint),
-    Doris(DatabaseSinkEndpoint),
-    Postgres(DatabaseSinkEndpoint),
-    Sqlite { path: Parameter, table: Parameter },
+    ClickHouse(Arguments),
+    Doris(Arguments),
+    Postgres(Arguments),
+    Sqlite(Arguments),
     Discard,
 }
 
@@ -760,8 +679,8 @@ impl SinkEndpoint {
     pub(crate) fn resolve(&self) -> Result<ResolvedSinkEndpoint, SqlError> {
         match self {
             Self::ClickHouse(endpoint) => {
-                let connection = DatabaseConnection::clickhouse(&endpoint.connection)?;
-                let (namespace, table) = qualified_table(&endpoint.table, "clickhouse")?;
+                let connection = DatabaseConnection::clickhouse(endpoint.required("connection"))?;
+                let (namespace, table) = qualified_table(endpoint.required("table"), "clickhouse")?;
                 require_connection_database(&connection, &namespace, "clickhouse")?;
                 Ok(ResolvedSinkEndpoint::ClickHouse(ResolvedDatabaseSink {
                     connection,
@@ -770,8 +689,8 @@ impl SinkEndpoint {
                 }))
             }
             Self::Doris(endpoint) => {
-                let connection = DatabaseConnection::doris(&endpoint.connection)?;
-                let (namespace, table) = qualified_table(&endpoint.table, "doris")?;
+                let connection = DatabaseConnection::doris(endpoint.required("connection"))?;
+                let (namespace, table) = qualified_table(endpoint.required("table"), "doris")?;
                 require_connection_database(&connection, &namespace, "doris")?;
                 Ok(ResolvedSinkEndpoint::Doris(ResolvedDatabaseSink {
                     connection,
@@ -780,17 +699,18 @@ impl SinkEndpoint {
                 }))
             }
             Self::Postgres(endpoint) => {
-                let connection = DatabaseConnection::postgres(&endpoint.connection, "postgres")?;
-                let (namespace, table) = qualified_table(&endpoint.table, "postgres")?;
+                let connection =
+                    DatabaseConnection::postgres(endpoint.required("connection"), "postgres")?;
+                let (namespace, table) = qualified_table(endpoint.required("table"), "postgres")?;
                 Ok(ResolvedSinkEndpoint::Postgres(ResolvedDatabaseSink {
                     connection,
                     namespace,
                     table,
                 }))
             }
-            Self::Sqlite { path, table } => Ok(ResolvedSinkEndpoint::Sqlite {
-                path: path.resolve()?,
-                table: table.resolve()?,
+            Self::Sqlite(endpoint) => Ok(ResolvedSinkEndpoint::Sqlite {
+                path: endpoint.required("path").resolve()?,
+                table: endpoint.required("table").resolve()?,
             }),
             Self::Discard => Ok(ResolvedSinkEndpoint::Discard),
         }
@@ -818,38 +738,26 @@ impl SinkEndpoint {
         }
 
         match endpoint_name(&function.name).as_deref() {
-            Some("clickhouse") => {
-                let [connection, table] = exact_parameters(parse_arguments(
-                    "clickhouse",
-                    &arguments.args,
-                    &[string("connection"), string("table")],
-                )?);
-                Ok(Self::ClickHouse(DatabaseSinkEndpoint { connection, table }))
-            }
-            Some("doris") => {
-                let [connection, table] = exact_parameters(parse_arguments(
-                    "doris",
-                    &arguments.args,
-                    &[string("connection"), string("table")],
-                )?);
-                Ok(Self::Doris(DatabaseSinkEndpoint { connection, table }))
-            }
-            Some("postgres") => {
-                let [connection, table] = exact_parameters(parse_arguments(
-                    "postgres",
-                    &arguments.args,
-                    &[string("connection"), string("table")],
-                )?);
-                Ok(Self::Postgres(DatabaseSinkEndpoint { connection, table }))
-            }
-            Some("sqlite") => {
-                let [path, table] = exact_parameters(parse_arguments(
-                    "sqlite",
-                    &arguments.args,
-                    &[string("path"), string("table")],
-                )?);
-                Ok(Self::Sqlite { path, table })
-            }
+            Some("clickhouse") => Ok(Self::ClickHouse(parse_arguments(
+                "clickhouse",
+                &arguments.args,
+                &[string("connection"), string("table")],
+            )?)),
+            Some("doris") => Ok(Self::Doris(parse_arguments(
+                "doris",
+                &arguments.args,
+                &[string("connection"), string("table")],
+            )?)),
+            Some("postgres") => Ok(Self::Postgres(parse_arguments(
+                "postgres",
+                &arguments.args,
+                &[string("connection"), string("table")],
+            )?)),
+            Some("sqlite") => Ok(Self::Sqlite(parse_arguments(
+                "sqlite",
+                &arguments.args,
+                &[string("path"), string("table")],
+            )?)),
             Some("discard") => {
                 parse_arguments("discard", &arguments.args, &[])?;
                 Ok(Self::Discard)
@@ -1110,29 +1018,8 @@ fn parse_arguments(
     endpoint: &str,
     arguments: &[FunctionArg],
     expected: &[ParameterSpec],
-) -> Result<Vec<Parameter>, SqlError> {
-    parse_argument_slots(endpoint, arguments, expected)?
-        .into_iter()
-        .zip(expected)
-        .map(|(value, specification)| {
-            value.ok_or_else(|| {
-                SqlError::invalid(format!(
-                    "missing {endpoint} parameter {:?}",
-                    specification.name
-                ))
-            })
-        })
-        .collect()
-}
-
-fn parse_argument_slots(
-    endpoint: &str,
-    arguments: &[FunctionArg],
-    expected: &[ParameterSpec],
-) -> Result<Vec<Option<Parameter>>, SqlError> {
-    let mut values = std::iter::repeat_with(|| None)
-        .take(expected.len())
-        .collect::<Vec<_>>();
+) -> Result<Arguments, SqlError> {
+    let mut values = Arguments(Vec::with_capacity(expected.len()));
     for argument in arguments {
         let FunctionArg::Named {
             name,
@@ -1150,10 +1037,9 @@ fn parse_argument_slots(
             )));
         }
         let name = normalized_identifier(name);
-        let Some((index, specification)) = expected
+        let Some(specification) = expected
             .iter()
-            .enumerate()
-            .find(|(_, specification)| specification.name == name)
+            .find(|specification| specification.name == name)
         else {
             if expected.is_empty() {
                 return Err(SqlError::invalid(format!(
@@ -1169,7 +1055,7 @@ fn parse_argument_slots(
                 "unknown {endpoint} parameter {name:?}; supported parameters are {supported}"
             )));
         };
-        if values[index].is_some() {
+        if values.get(specification.name).is_some() {
             return Err(SqlError::invalid(format!(
                 "duplicate {endpoint} parameter {name:?}"
             )));
@@ -1179,45 +1065,32 @@ fn parse_argument_slots(
                 "{endpoint} parameter {name:?} must be a literal or env('NAME')"
             )));
         };
-        values[index] = Some(parse_parameter(
-            endpoint,
+        values.0.push((
             specification.name,
-            specification.kind,
-            expression,
-        )?);
+            parse_parameter(endpoint, specification.name, specification.kind, expression)?,
+        ));
     }
 
-    expected
-        .iter()
-        .zip(values)
-        .map(
-            |(specification, value)| match (value, specification.presence) {
-                (Some(value), _) => Ok(Some(value)),
-                (None, ParameterPresence::Default(value)) => {
-                    Ok(Some(Parameter::Literal(value.to_owned())))
-                }
-                (None, ParameterPresence::Optional) => Ok(None),
-                (None, ParameterPresence::Required) => Err(SqlError::invalid(format!(
+    for specification in expected {
+        if values.get(specification.name).is_some() {
+            continue;
+        }
+        match specification.presence {
+            ParameterPresence::Default(value) => {
+                values
+                    .0
+                    .push((specification.name, Parameter::Literal(value.to_owned())));
+            }
+            ParameterPresence::Optional => {}
+            ParameterPresence::Required => {
+                return Err(SqlError::invalid(format!(
                     "missing {endpoint} parameter {:?}",
                     specification.name
-                ))),
-            },
-        )
-        .collect()
-}
-
-fn exact_parameters<const N: usize>(values: Vec<Parameter>) -> [Parameter; N] {
-    let Ok(values) = values.try_into() else {
-        unreachable!("the parameter specification fixes the result length")
-    };
-    values
-}
-
-fn exact_parameter_slots<const N: usize>(values: Vec<Option<Parameter>>) -> [Option<Parameter>; N] {
-    let Ok(values) = values.try_into() else {
-        unreachable!("the parameter specification fixes the result length")
-    };
-    values
+                )));
+            }
+        }
+    }
+    Ok(values)
 }
 
 fn parse_parameter(
@@ -1350,14 +1223,17 @@ mod tests {
 
     #[test]
     fn cdc_tuning_names_translate_to_the_exact_connector_options() {
-        let tuning = CdcTuningParameters {
-            connect_timeout_ms: Some(Parameter::Literal("1001".to_owned())),
-            query_timeout_ms: Some(Parameter::Literal("2002".to_owned())),
-            retry_limit: Some(Parameter::Literal("3".to_owned())),
-            retry_max_delay_ms: Some(Parameter::Literal("4004".to_owned())),
-            heartbeat_interval_ms: Some(Parameter::Literal("5005".to_owned())),
-            snapshot_fetch_size: Some(Parameter::Literal("6006".to_owned())),
-        };
+        let tuning = Arguments(vec![
+            ("connect_timeout_ms", Parameter::Literal("1001".to_owned())),
+            ("query_timeout_ms", Parameter::Literal("2002".to_owned())),
+            ("retry_limit", Parameter::Literal("3".to_owned())),
+            ("retry_max_delay_ms", Parameter::Literal("4004".to_owned())),
+            (
+                "heartbeat_interval_ms",
+                Parameter::Literal("5005".to_owned()),
+            ),
+            ("snapshot_fetch_size", Parameter::Literal("6006".to_owned())),
+        ]);
         let expected = CdcOptions::new()
             .connect_timeout(std::time::Duration::from_millis(1001))
             .unwrap()
@@ -1371,7 +1247,7 @@ mod tests {
             .unwrap()
             .snapshot_fetch_size(NonZeroU32::new(6006).unwrap())
             .unwrap();
-        assert_eq!(tuning.resolve("postgres_cdc").unwrap(), expected);
-        assert_eq!(tuning.resolve("mysql_cdc").unwrap(), expected);
+        assert_eq!(tuning.resolve_tuning("postgres_cdc").unwrap(), expected);
+        assert_eq!(tuning.resolve_tuning("mysql_cdc").unwrap(), expected);
     }
 }

@@ -13,10 +13,10 @@ use serde_json::{Value, json};
 
 use super::{
     PostgresCdcScanError, PostgresCdcScanSpec,
-    convert::{CaptureProgress, convert_capture_values, convert_values},
+    convert::{convert_capture_values, convert_values},
     schema,
 };
-use crate::operation::scan::cdc_runtime::Captured;
+use crate::operation::scan::{cdc_convert::SnapshotProgress, cdc_runtime::Captured};
 
 fn column(data_type: DataType) -> Field {
     Field::new("value", data_type, true)
@@ -131,8 +131,8 @@ fn snapshot(columns: &[Field], marker: &str, row: Value) -> Value {
 fn capture(
     columns: &[Field],
     events: &[(&str, Value)],
-    progress: CaptureProgress,
-) -> Result<Captured<CaptureProgress>, PostgresCdcScanError> {
+    progress: SnapshotProgress,
+) -> Result<Captured, PostgresCdcScanError> {
     let projection = identity_projection(columns);
     capture_projected(columns, &projection, events, progress)
 }
@@ -141,8 +141,8 @@ fn capture_projected(
     columns: &[Field],
     projection: &[u32],
     events: &[(&str, Value)],
-    progress: CaptureProgress,
-) -> Result<Captured<CaptureProgress>, PostgresCdcScanError> {
+    progress: SnapshotProgress,
+) -> Result<Captured, PostgresCdcScanError> {
     let bytes = events
         .iter()
         .map(|(_, event)| serde_json::to_vec(event).unwrap())
@@ -273,7 +273,7 @@ fn postgres_cdc_projection_rejects_bad_unselected_values_in_streaming_and_captur
                 &columns,
                 projection,
                 &[("source.public.events", capture_event)],
-                CaptureProgress::default(),
+                SnapshotProgress::default(),
             )
             .is_err()
         );
@@ -600,7 +600,7 @@ fn postgres_cdc_uses_the_single_table_debezium_snapshot_marker_contract() {
                 "source.public.events",
                 snapshot(&columns, marker, json!({"value":1})),
             )],
-            CaptureProgress::default(),
+            SnapshotProgress::default(),
         )
         .unwrap();
         assert!(!captured.sealed);
@@ -612,7 +612,7 @@ fn postgres_cdc_uses_the_single_table_debezium_snapshot_marker_contract() {
             "source.public.events",
             snapshot(&columns, "last", json!({"value":1})),
         )],
-        CaptureProgress::default(),
+        SnapshotProgress::default(),
     )
     .unwrap();
     assert!(
@@ -664,7 +664,7 @@ fn postgres_cdc_capture_keeps_snapshot_and_wal_rows_across_the_completion_bounda
             ),
             ("source.public.events", inserted_after_snapshot),
         ],
-        CaptureProgress::default(),
+        SnapshotProgress::default(),
     )
     .unwrap();
     assert!(!first.sealed);
@@ -722,7 +722,7 @@ fn postgres_cdc_capture_uses_explicit_completion_for_an_empty_snapshot() {
                 envelope(&columns, "c", Value::Null, json!({"value":1})),
             ),
         ],
-        CaptureProgress::default(),
+        SnapshotProgress::default(),
     )
     .unwrap();
     assert!(captured.sealed);
@@ -743,7 +743,7 @@ fn postgres_cdc_capture_rejects_incomplete_or_reopened_snapshot_order() {
             ("__debezium-heartbeat.source", heartbeat()),
             ("__dogpaddle-notification.source", notification("COMPLETED")),
         ],
-        CaptureProgress::default(),
+        SnapshotProgress::default(),
     );
     assert!(incomplete.is_err());
 
@@ -756,7 +756,7 @@ fn postgres_cdc_capture_rejects_incomplete_or_reopened_snapshot_order() {
                 snapshot(&columns, "last", json!({"value":1})),
             ),
         ],
-        CaptureProgress::default(),
+        SnapshotProgress::default(),
     );
     assert!(reopened.is_err());
 
@@ -766,14 +766,14 @@ fn postgres_cdc_capture_rejects_incomplete_or_reopened_snapshot_order() {
             "source.public.events",
             envelope(&columns, "c", Value::Null, json!({"value":1})),
         )],
-        CaptureProgress::default(),
+        SnapshotProgress::default(),
     );
     assert!(streaming_before_last.is_err());
 
     let progress = capture(
         &columns,
         &[("__dogpaddle-notification.source", notification("STARTED"))],
-        CaptureProgress::default(),
+        SnapshotProgress::default(),
     )
     .unwrap();
     assert!(!progress.sealed);
@@ -782,7 +782,7 @@ fn postgres_cdc_capture_rejects_incomplete_or_reopened_snapshot_order() {
             capture(
                 &columns,
                 &[("__dogpaddle-notification.source", notification(kind))],
-                CaptureProgress::default(),
+                SnapshotProgress::default(),
             )
             .is_err()
         );
@@ -794,7 +794,7 @@ fn postgres_cdc_capture_rejects_incomplete_or_reopened_snapshot_order() {
                 ("__dogpaddle-notification.source", notification("COMPLETED")),
                 ("__dogpaddle-notification.source", notification("COMPLETED")),
             ],
-            CaptureProgress::default(),
+            SnapshotProgress::default(),
         )
         .is_err()
     );
@@ -804,7 +804,7 @@ fn postgres_cdc_capture_rejects_incomplete_or_reopened_snapshot_order() {
         capture(
             &columns,
             &[("__dogpaddle-notification.source", malformed)],
-            CaptureProgress::default(),
+            SnapshotProgress::default(),
         )
         .is_err()
     );
@@ -939,5 +939,150 @@ fn postgres_cdc_float_preserves_signed_zero_nan_and_infinities() {
                 assert_eq!(actual.to_bits(), expected.to_bits());
             }
         }
+    }
+}
+
+#[test]
+fn postgres_cdc_empty_completion_keeps_wal_in_same_or_later_conversion() {
+    let columns = [column(DataType::Int64)];
+    let projection = [0];
+    let output_schema = projected_schema(&columns, &projection).unwrap();
+    let source = super::runtime::PostgresSource::for_test(&spec(&columns), &projection);
+    let completion = serde_json::to_vec(&notification("COMPLETED")).unwrap();
+    let wal =
+        serde_json::to_vec(&envelope(&columns, "c", Value::Null, json!({"value":19}))).unwrap();
+    let completed = crate::operation::scan::cdc_convert::convert_values(
+        &source,
+        output_schema.clone(),
+        [(
+            Some("__dogpaddle-notification.source"),
+            Some(completion.as_slice()),
+        )],
+        Some(SnapshotProgress::default()),
+    )
+    .unwrap();
+    assert!(completed.sealed);
+    assert!(completed.change.is_none());
+    assert_ne!(completed.progress, SnapshotProgress::default());
+    let later = crate::operation::scan::cdc_convert::convert_values(
+        &source,
+        output_schema.clone(),
+        [(Some("source.public.events"), Some(wal.as_slice()))],
+        Some(completed.progress),
+    )
+    .unwrap();
+    assert!(!later.sealed);
+    let same = crate::operation::scan::cdc_convert::convert_values(
+        &source,
+        output_schema.clone(),
+        [
+            (
+                Some("__dogpaddle-notification.source"),
+                Some(completion.as_slice()),
+            ),
+            (Some("source.public.events"), Some(wal.as_slice())),
+        ],
+        Some(SnapshotProgress::default()),
+    )
+    .unwrap();
+    assert!(same.sealed);
+    let expected = arrow_array::RecordBatch::try_new(
+        output_schema,
+        vec![Arc::new(Int64Array::from(vec![19]))],
+    )
+    .unwrap();
+    let later = later.change.unwrap();
+    let same = same.change.unwrap();
+    assert_eq!(later.records(), &expected);
+    assert_eq!(same.records(), &expected);
+    assert_eq!(later.diffs(), &Int64Array::from(vec![1]));
+    assert_eq!(same.diffs(), &Int64Array::from(vec![1]));
+}
+
+#[test]
+fn postgres_cdc_mixed_capture_preserves_complete_output_across_every_delivery_cut() {
+    use arrow_select::concat::concat_batches;
+
+    let columns = [column(DataType::Int64)];
+    let projection = [0];
+    let output_schema = projected_schema(&columns, &projection).unwrap();
+    let source = super::runtime::PostgresSource::for_test(&spec(&columns), &projection);
+    let records = [
+        (
+            "source.public.events",
+            snapshot(&columns, "true", json!({"value":1})),
+        ),
+        (
+            "source.public.events",
+            snapshot(&columns, "last", json!({"value":2})),
+        ),
+        (
+            "source.public.events",
+            envelope(&columns, "c", Value::Null, json!({"value":3})),
+        ),
+        (
+            "source.public.events",
+            envelope(&columns, "u", json!({"value":3}), json!({"value":4})),
+        ),
+        ("__debezium-heartbeat.source", heartbeat()),
+        ("__dogpaddle-notification.source", notification("COMPLETED")),
+        (
+            "source.public.events",
+            envelope(&columns, "d", json!({"value":4}), Value::Null),
+        ),
+    ];
+    let bytes = records
+        .iter()
+        .map(|(_, value)| serde_json::to_vec(value).unwrap())
+        .collect::<Vec<_>>();
+    let expected = arrow_array::RecordBatch::try_new(
+        output_schema.clone(),
+        vec![Arc::new(Int64Array::from(vec![1, 2, 3, 3, 4, 4]))],
+    )
+    .unwrap();
+    let expected_diffs = Int64Array::from(vec![1, 1, 1, -1, 1, -1]);
+    // The six gaps define every one of the 64 possible ordered Delivery cuts.
+    for cuts in 0_u8..64 {
+        let mut progress = Some(SnapshotProgress::default());
+        let mut start = 0;
+        let mut seals = 0;
+        let mut batches = Vec::new();
+        let mut diffs = Vec::new();
+        for end in 1..=records.len() {
+            if end != records.len() && cuts & (1 << (end - 1)) == 0 {
+                continue;
+            }
+            let captured = crate::operation::scan::cdc_convert::convert_values(
+                &source,
+                output_schema.clone(),
+                records[start..end]
+                    .iter()
+                    .zip(&bytes[start..end])
+                    .map(|((topic, _), bytes)| (Some(*topic), Some(bytes.as_slice()))),
+                progress,
+            )
+            .unwrap();
+            if captured.sealed {
+                seals += 1;
+                // The ACK of this whole Delivery changes the next poll to streaming.
+                progress = None;
+            } else if progress.is_some() {
+                progress = Some(captured.progress);
+            }
+            if let Some(change) = captured.change {
+                batches.push(change.records().clone());
+                diffs.extend_from_slice(change.diffs().values());
+            }
+            start = end;
+        }
+        assert_eq!(seals, 1, "cuts={cuts:06b}");
+        assert!(progress.is_none(), "cuts={cuts:06b}");
+        assert_eq!(start, records.len());
+        assert_eq!(
+            concat_batches(&output_schema, &batches).unwrap(),
+            expected,
+            "cuts={cuts:06b}"
+        );
+        assert_eq!(Int64Array::from(diffs), expected_diffs, "cuts={cuts:06b}");
     }
 }

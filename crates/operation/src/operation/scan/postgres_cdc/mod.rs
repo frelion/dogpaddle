@@ -1,6 +1,7 @@
 //! Single-table, fixed-Schema `PostgreSQL` WAL scan backed by Debezium.
 
 mod connection;
+#[cfg(test)]
 mod convert;
 mod definition;
 mod error;

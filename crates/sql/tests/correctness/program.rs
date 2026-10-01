@@ -1054,3 +1054,39 @@ fn endpoint_programs_with_missing_parameter(variable: &str) -> Vec<String> {
         ),
     ]
 }
+
+#[test]
+fn endpoint_argument_errors_follow_source_order_before_required_fields() {
+    let cases = [
+        (
+            "sequence(start => 0, START => 1 + 1)",
+            "duplicate sequence parameter \"start\"",
+        ),
+        (
+            "sequence(step => 1 + 1)",
+            "unknown sequence parameter \"step\"; supported parameters are \"start\"",
+        ),
+        (
+            "sequence(start := 1 + 1)",
+            "sequence named arguments must use =>",
+        ),
+        (
+            "postgres_cdc()",
+            "missing postgres_cdc parameter \"connection\"",
+        ),
+        (
+            "postgres_cdc(table => 'public.events')",
+            "missing postgres_cdc parameter \"connection\"",
+        ),
+    ];
+    for (endpoint, expected) in cases {
+        let sql = format!("INSERT INTO discard() SELECT * FROM {endpoint}");
+        let Err(error) = SqlProgram::parse(&sql) else {
+            panic!("accepted invalid endpoint {endpoint}");
+        };
+        assert!(
+            matches!(error, SqlError::Invalid(ref message) if message == expected),
+            "{endpoint}: {error}"
+        );
+    }
+}

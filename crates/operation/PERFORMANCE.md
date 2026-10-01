@@ -640,3 +640,35 @@ warehouse lookup 的单独原生资源对照位于 `/tmp/dp-ch-history-lookup-_1
 实际产品适配器证据位于 `/tmp/dp-prefix-warehouse-product-5qp72yu_`：ClickHouse/Doris 六项测试全部退出 0，包括 signed-ID/full-row rebinding 拒绝、历史 lookup、宽 SQL 事务分片，以及已提交长前缀重新切短/切后缀的完整 FIFO oracle。真实 PG 17.10 gate 位于 `/tmp/dp-occurrence-postgres-c5x9ise1`，退出 0，覆盖缺失/错布局/越界 F、实际 UNIQUE 回滚、未知提交重开、16,385 行分批和两连接锁后重读；角色默认 Repeatable Read 已读回，adapter 显式 ReadCommitted。
 
 Doris 4.1.3 的独立真实发布故障证据保存在 `/tmp/dogpaddle-doris-occurrence-native`，同 txn/label 的后续状态回读保存在 `/tmp/dp-podman-native-6qytk18x/commands.json`：standalone INSERT 实际 COMMITTED 被拒，随后同 txn/label 发布为 VISIBLE；显式 VALUES 事务 COMMIT 实际客户端超时，随后同 txn/label VISIBLE 且完整关系正确。没有观测到最终显式 COMMIT 的 OK COMMITTED envelope，不能声称覆盖该分支；该故障 harness 也不证明网络故障与产品 Store settlement 的组合。实际产品 strict VISIBLE parser 对空、PREPARE、COMMITTED 与 malformed envelope 拒绝。同步 mysql 驱动的五秒是接受预算及 socket 空闲 timeout，不能保证协议 read、连接 Drop 或产品停止在五秒内返回；未知或迟到结果保留输入并在重开后重新强读。单 FE/BE 验证不代表 follower/failover 或全规模资源保证。
+
+## 2026-10-02 单一 CDC 记录循环
+
+PG/MySQL 的 capture 和 streaming 共用一个私有转换循环、一个 SnapshotProgress 和一个 Captured 结果。具体源继续拥有 metadata、连接和 checkpoint 校验；pending progress 仍只在真实 ACK 成功后发布。没有改变 phase/checkpoint/input 的持久布局、准入或事务边界。本轮 Operation 生产代码净减 233 行，SQL 参数的独立简化及冷态成本见其 owner README。
+
+固定旧版 b53beab 与新版 release 私有测试二进制在同一 Rust 1.96/aarch64 主机上按 A1/C1/C2/A2 串行执行；首次对照及一次预先声明的完整复测各 52 个独立进程，共 104 个，实际退出码全部为 0。两轮使用同一批冻结二进制，保留所有结果。临时 fixture 先经过真实 Definition 准入；12 个正常场景与一个显式末行损坏场景均在计时外检查完整 RecordBatch、列、值、validity 和 diff，损坏场景检查具体错误。宽数据保留 64 KiB 字符串和未投影的 16 KiB Binary；不扩大配额。原 v1 的逆序投影 fixture 违反 owner 准入、实际退出 101，已完整保留并排除；最终仅使用合法 v2 fixture。
+
+每个进程有三个预热、十二个固定 iterations 的原始 CPU 分段，并单独 profile 一次实际转换及输出/错误释放。输入 JSON、schema、spec、具体 Source 和期望输出都在测量外。CPU 使用相同临时 dhat allocator、profiler inactive；表中比例只是配对分段 median，没有 Criterion 置信区间，不代表正常 System allocator 吞吐、真实 connector 延迟或 RSS。堆数据只计 Rust requested bytes，不含 JVM/native malloc；全部 output Drop 后 current bytes/blocks 归零。
+
+| 源 / case | 初测 C1/A1 | 初测 C2/A2 | 复测 C1/A1 | 复测 C2/A2 | total bytes 变化 | peak bytes 变化 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| postgres / `capture_narrow_1` | +2.11% | +0.72% | +2.67% | +1.68% | +0 B | +0 B |
+| postgres / `capture_narrow_256` | +2.97% | +1.63% | +1.71% | -0.26% | +0 B | +0 B |
+| postgres / `capture_wide_projected_8` | +0.49% | -0.17% | -0.01% | -0.54% | +0 B | +0 B |
+| postgres / `stream_narrow_1` | +1.78% | +0.17% | +1.12% | +0.27% | -50 B | -50 B |
+| postgres / `stream_narrow_256` | +1.82% | +1.88% | +1.60% | +1.71% | -50 B | -50 B |
+| postgres / `stream_wide_projected_8` | +1.11% | +0.84% | +0.92% | +1.03% | -50 B | -50 B |
+| mysql / `capture_narrow_1` | +0.75% | +1.64% | +0.51% | +0.98% | +24 B | +32 B |
+| mysql / `capture_narrow_256` | -0.55% | +0.56% | -0.93% | +1.04% | +2,016 B | +0 B |
+| mysql / `capture_wide_projected_8` | -1.20% | +0.22% | +1.46% | -0.72% | +32 B | +0 B |
+| mysql / `stream_narrow_1` | +54.56% | -0.26% | +2.83% | +0.39% | +0 B | +0 B |
+| mysql / `stream_narrow_256` | +0.01% | -1.04% | +3.16% | -0.97% | +0 B | +0 B |
+| mysql / `stream_wide_projected_8` | -1.49% | -0.21% | -1.20% | +2.69% | +0 B | +0 B |
+| mysql / `capture_late_malformed_256` | +0.64% | +0.22% | +1.07% | +0.44% | +2,016 B | +1,555 B |
+
+去掉 streaming 无用通知 topic 分配后，MySQL streaming 与原版堆计数相同，PG streaming 每 Delivery 少一次 50 B 分配。MySQL snapshot 逐行增长 diffs 的代价仍保留：256 行正常与末行损坏都多累计分配 2,016 B；正常峰值不变，末行损坏峰值多 1,555 B。小批次与宽行也有表中的正成本。首次对照耗时变化为 −1.49% 至 +54.56%，其中 MySQL 单行 streaming 初测 C1/A1 为 +54.56%，C2/A2 为 −0.26%。原始 C1 的前五段约 3.4 µs，后七段约 5.2–7.6 µs。随后预先声明只进行一次完整 13-case ABBA 复测，保留初测，不单独重试异常 case；复测范围 -1.20% 至 +3.16%。异常未稳定复现，原因未定位，不能归因于代码或宣称普遍提速、所有场景无回归。
+
+证据保存在 `/tmp/dogpaddle-cdc-arguments-performance/converter-v5` 与 `converter-v5-repeat`（含复测前的 diagnostic-plan）：source/binary SHA、原始 stdout/stderr、12 段 samples、52 个实际退出码、heap 和 comparison JSON。首次实测 v2 的 unused notification 分配及全部结果仍保留在 converter-v2；去掉该分配后的 converter-v3 及收尾中间实现的 converter-v4 也原样保留。最终直接返回 progress 的源码在 v5 冻结新 binary 并全部重测，没有将旧样本改名。原 `cdc_bootstrap` 只测 sealed publication/reset，不运行此转换器，不将它解释为 ingest 性能。
+
+实测 candidate `cdc_convert.rs` SHA256 为 `efa637e8ad05a2f4c2be5d744c7622ed864a023752b53d5d22105c2563fadd2d`；临时 allocator/witness 在冻结二进制后逐文件精确恢复，未进入产品。
+
+最终源码的 `cargo xtask check`、`cargo build --workspace --locked`、`cargo test --workspace --benches --locked` 和 `cdc_bootstrap` smoke 均实际退出 0，记录位于 `/tmp/dp-cdc-arguments-final-f4u56i3i`。最终真实 PG/MySQL CDC 恢复验收均退出 0，记录位于 `/tmp/dp-cdc-arguments-native-z_gpmijt`；使用当前 Java 源码重建并通过 58 项测试的 protocol 2 runtime bundle，未改写原 protocol 1 bundle。性能表的后续文档更新没有改变已验证的 Rust/Java 源码。

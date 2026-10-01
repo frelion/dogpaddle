@@ -1,13 +1,15 @@
 use super::{
     PostgresCdcScanConfig, PostgresCdcScanDefinition, PostgresCdcScanError, PostgresCdcScanSpec,
-    convert::{CaptureProgress, convert_capture_values, convert_values},
 };
 use crate::operation::OperationError;
-use crate::operation::scan::cdc_runtime::{Captured, CdcRuntime, Phase, Source};
-use arrow_schema::SchemaRef;
-use dogpaddle_change::Change;
-use dogpaddle_debezium::{Checkpoint, Connector, Record};
+use crate::operation::scan::{
+    cdc_convert::{ConvertError, Row, SnapshotMarker},
+    cdc_runtime::{CdcRuntime, Phase, Source},
+};
+use arrow_schema::{Fields, SchemaRef};
+use dogpaddle_debezium::{Checkpoint, Connector};
 use dogpaddle_store::{Cell, Queue};
+use serde_json::Value;
 
 pub(super) type PostgresCdcScanOperation = CdcRuntime<PostgresSource>;
 pub(super) struct PostgresSource {
@@ -41,20 +43,34 @@ impl PostgresCdcScanOperation {
 }
 
 impl Source for PostgresSource {
-    type Progress = CaptureProgress;
     const RESET_REQUIRES_SOURCE_CLEANUP: bool = true;
-    fn source_fields(&self) -> usize {
-        self.spec.columns.len()
+    const CAPTURE_ACCEPTS_STREAMING: bool = true;
+    const STREAMING_TOMBSTONES: bool = false;
+    fn columns(&self) -> &Fields {
+        &self.spec.columns
     }
-    fn data_envelopes(&self, records: &[Record]) -> usize {
-        let topic = format!(
+    fn output_projection(&self) -> &[u32] {
+        &self.output_projection
+    }
+    fn engine_name(&self) -> &str {
+        &self.spec.engine_name
+    }
+    fn table_topic(&self) -> String {
+        format!(
             "{}.{}.{}",
             self.spec.engine_name, self.spec.schema, self.spec.table
-        );
-        records
-            .iter()
-            .filter(|record| record.topic() == Some(topic.as_str()))
-            .count()
+        )
+    }
+    fn snapshot_marker(
+        &self,
+        payload: &Row,
+        capturing: bool,
+    ) -> Result<SnapshotMarker, ConvertError> {
+        let _ = capturing;
+        validate_metadata(payload, &self.spec.schema, &self.spec.table)
+    }
+    fn conversion_error(error: ConvertError) -> OperationError {
+        PostgresCdcScanError::from(error).into()
     }
     fn start_snapshot(&self) -> Result<Connector, OperationError> {
         Ok(self.config.start_snapshot(&self.spec)?)
@@ -65,36 +81,6 @@ impl Source for PostgresSource {
     fn cleanup_snapshot(&self) -> Result<(), OperationError> {
         self.config.drop_snapshot_slot(&self.spec)?;
         Ok(())
-    }
-    fn capture(
-        &self,
-        schema: SchemaRef,
-        records: &[Record],
-        progress: Self::Progress,
-    ) -> Result<Captured<Self::Progress>, OperationError> {
-        Ok(convert_capture_values(
-            &self.spec,
-            &self.output_projection,
-            schema,
-            records
-                .iter()
-                .map(|record| (record.topic(), record.value())),
-            progress,
-        )?)
-    }
-    fn stream(
-        &self,
-        schema: SchemaRef,
-        records: &[Record],
-    ) -> Result<Option<Change>, OperationError> {
-        Ok(convert_values(
-            &self.spec,
-            &self.output_projection,
-            schema,
-            records
-                .iter()
-                .map(|record| (record.topic(), record.value())),
-        )?)
     }
     fn restore_checkpoint(
         &self,
@@ -137,4 +123,59 @@ fn parse_checkpoint(
         ));
     }
     Ok(checkpoint)
+}
+
+fn validate_metadata(
+    payload: &Row,
+    table_schema: &str,
+    table: &str,
+) -> Result<SnapshotMarker, ConvertError> {
+    let metadata = payload
+        .get("source")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid("missing Debezium CDC metadata"))?;
+    for (field, expected) in [
+        ("schema", table_schema),
+        ("table", table),
+        ("connector", "postgresql"),
+    ] {
+        if metadata.get(field).and_then(Value::as_str) != Some(expected) {
+            return Err(invalid(format!(
+                "Debezium CDC metadata does not match configured {field}"
+            )));
+        }
+    }
+    match metadata.get("snapshot") {
+        Some(Value::String(value)) if matches!(value.as_str(), "true" | "first") => {
+            Ok(SnapshotMarker::Snapshot)
+        }
+        Some(Value::String(value)) if value == "last" => Ok(SnapshotMarker::Last),
+        Some(Value::Null) => Ok(SnapshotMarker::Streaming),
+        _ => Err(invalid(
+            "Debezium CDC metadata has an invalid snapshot marker",
+        )),
+    }
+}
+
+fn invalid(message: impl Into<String>) -> ConvertError {
+    ConvertError::Invalid(message.into())
+}
+
+#[cfg(test)]
+impl PostgresSource {
+    pub(super) fn for_test(spec: &PostgresCdcScanSpec, projection: &[u32]) -> Self {
+        Self {
+            spec: spec.clone(),
+            output_projection: projection.to_vec(),
+            config: PostgresCdcScanConfig::new_unencrypted(
+                "/unused/runtime",
+                "localhost",
+                1,
+                "unused",
+                "unused",
+                "",
+            )
+            .unwrap(),
+        }
+    }
 }

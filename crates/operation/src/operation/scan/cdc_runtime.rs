@@ -1,6 +1,7 @@
 //! Source-owned input queue, hidden until bootstrap is durably sealed.
+use super::cdc_convert::{self, ConvertError, Row, SnapshotMarker, SnapshotProgress};
 use crate::operation::{OperationError, SourceOperation};
-use arrow_schema::SchemaRef;
+use arrow_schema::{Fields, SchemaRef};
 use dogpaddle_change::{Change, CodecError, SchemaBoundChangeCodec};
 use dogpaddle_debezium::{Checkpoint, Connector, Delivery, Record};
 use dogpaddle_store::{Cell, Queue, ReadTransactionAccess, TransactionAccess};
@@ -47,35 +48,38 @@ pub(super) enum NextStep {
     Stream,
 }
 
-pub(super) struct Captured<P> {
+pub(super) struct Captured {
     pub(super) change: Option<Change>,
     pub(super) sealed: bool,
-    pub(super) progress: P,
+    pub(super) progress: SnapshotProgress,
 }
 
 /// Only database-specific work lives here; the runtime owns Connector and typed capture state; Flow owns transactions.
 pub(super) trait Source: Send + 'static {
-    type Progress: Copy + Default + Send + 'static;
     /// `PostgreSQL` must remove its abandoned slot before durably entering reset.
     const RESET_REQUIRES_SOURCE_CLEANUP: bool;
-    fn source_fields(&self) -> usize;
+    const CAPTURE_ACCEPTS_STREAMING: bool;
+    const STREAMING_TOMBSTONES: bool;
+    fn columns(&self) -> &Fields;
+    fn output_projection(&self) -> &[u32];
+    fn engine_name(&self) -> &str;
+    fn table_topic(&self) -> String;
+    fn snapshot_marker(
+        &self,
+        payload: &Row,
+        capturing: bool,
+    ) -> Result<SnapshotMarker, ConvertError>;
+    fn conversion_error(error: ConvertError) -> OperationError;
     fn data_envelopes(&self, records: &[Record]) -> usize {
-        records.len()
+        let topic = self.table_topic();
+        records
+            .iter()
+            .filter(|record| record.topic() == Some(topic.as_str()))
+            .count()
     }
     fn start_snapshot(&self) -> Result<Connector, OperationError>;
     fn start_streaming(&self, checkpoint: &Checkpoint) -> Result<Connector, OperationError>;
     fn cleanup_snapshot(&self) -> Result<(), OperationError>;
-    fn capture(
-        &self,
-        schema: SchemaRef,
-        records: &[Record],
-        progress: Self::Progress,
-    ) -> Result<Captured<Self::Progress>, OperationError>;
-    fn stream(
-        &self,
-        schema: SchemaRef,
-        records: &[Record],
-    ) -> Result<Option<Change>, OperationError>;
     fn restore_checkpoint(
         &self,
         phase: Phase,
@@ -134,8 +138,8 @@ pub(super) struct CdcRuntime<B: Source> {
     pub(super) next_step: NextStep,
     resume: Option<Checkpoint>,
     connector: Option<Connector>,
-    progress: B::Progress,
-    pending_progress: Option<B::Progress>,
+    progress: SnapshotProgress,
+    pending_progress: Option<SnapshotProgress>,
 }
 impl<B: Source> CdcRuntime<B> {
     pub(super) fn new(
@@ -156,7 +160,7 @@ impl<B: Source> CdcRuntime<B> {
             next_step: NextStep::Restore,
             resume: None,
             connector: None,
-            progress: B::Progress::default(),
+            progress: SnapshotProgress::default(),
             pending_progress: None,
         })
     }
@@ -233,7 +237,7 @@ impl<B: Source> CdcRuntime<B> {
         if envelopes > 2048
             || envelopes
                 .saturating_mul(2)
-                .saturating_mul(self.source.source_fields())
+                .saturating_mul(self.source.columns().len())
                 > 65_536
         {
             return Err(B::invalid_state(
@@ -244,15 +248,20 @@ impl<B: Source> CdcRuntime<B> {
         let remaining = MAX_CAPTURE_BYTES
             .checked_sub(checkpoint_bytes)
             .ok_or_else(|| B::invalid_state("source checkpoint exceeds capture admission"))?;
-        let (change, sealed) = if streaming {
-            (self.source.stream(self.codec.schema(), &records)?, false)
-        } else {
-            let captured = self
-                .source
-                .capture(self.codec.schema(), &records, self.progress)?;
+        let captured = cdc_convert::convert_values(
+            &self.source,
+            self.codec.schema(),
+            records
+                .iter()
+                .map(|record| (record.topic(), record.value())),
+            (!streaming).then_some(self.progress),
+        )
+        .map_err(B::conversion_error)?;
+        if !streaming {
             self.pending_progress = Some(captured.progress);
-            (captured.change, captured.sealed)
-        };
+        }
+        let change = captured.change;
+        let sealed = captured.sealed;
         // Conversion owns its Arrow buffers. Keep only the original ACK capability
         // and checkpoint while encoding or waiting for input queue capacity.
         drop(records);
@@ -378,7 +387,7 @@ impl<B: Source> SourceOperation for CdcRuntime<B> {
         match capture.kind {
             DeliveryKind::BeginCapture => {
                 self.next_step = NextStep::Capture;
-                self.progress = B::Progress::default();
+                self.progress = SnapshotProgress::default();
             }
             DeliveryKind::Reset => {
                 self.next_step = if capture.finished {
@@ -387,7 +396,7 @@ impl<B: Source> SourceOperation for CdcRuntime<B> {
                     NextStep::Reset
                 };
                 self.resume = None;
-                self.progress = B::Progress::default();
+                self.progress = SnapshotProgress::default();
             }
             DeliveryKind::Cdc {
                 delivery,

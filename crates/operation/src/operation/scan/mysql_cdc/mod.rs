@@ -1,6 +1,7 @@
 //! Single-table, fixed-Schema `MySQL` binlog scan backed by Debezium.
 
 mod connection;
+#[cfg(test)]
 mod convert;
 mod definition;
 mod error;

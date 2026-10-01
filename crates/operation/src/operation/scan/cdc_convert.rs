@@ -14,7 +14,151 @@ use dogpaddle_change::{Change, ChangeError};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 
+use super::cdc_runtime::{Captured, Source};
+
 pub(super) type Row = Map<String, Value>;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct SnapshotProgress {
+    saw_snapshot_row: bool,
+    snapshot_complete: bool,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum SnapshotMarker {
+    Snapshot,
+    Last,
+    Streaming,
+}
+
+pub(super) fn convert_values<'a, B: Source>(
+    source: &B,
+    output_schema: SchemaRef,
+    values: impl IntoIterator<Item = (Option<&'a str>, Option<&'a [u8]>)>,
+    progress: Option<SnapshotProgress>,
+) -> Result<Captured, ConvertError> {
+    let columns = source.columns();
+    let projection = source.output_projection();
+    let table_topic = source.table_topic();
+    let heartbeat_topic = format!("__debezium-heartbeat.{}", source.engine_name());
+    let capturing = progress.is_some();
+    let notification_topic =
+        capturing.then(|| format!("__dogpaddle-notification.{}", source.engine_name()));
+    let mut progress = progress.unwrap_or_default();
+    let mut sealed = false;
+    let mut rows = Vec::new();
+    let mut diffs = Vec::new();
+    for (topic, bytes) in values {
+        let notification = notification_topic
+            .as_deref()
+            .is_some_and(|name| topic == Some(name));
+        if topic != Some(table_topic.as_str())
+            && topic != Some(heartbeat_topic.as_str())
+            && !notification
+        {
+            return Err(invalid("record has an unexpected topic"));
+        }
+        let Some(bytes) = bytes else {
+            if !capturing && B::STREAMING_TOMBSTONES && topic == Some(table_topic.as_str()) {
+                continue;
+            }
+            return Err(invalid("CDC records cannot be tombstones"));
+        };
+        let mut value: Value = serde_json::from_slice(bytes)
+            .map_err(|_| invalid("record is not valid schemas-enabled Connect JSON"))?;
+        let schema = object_field(&value, "schema")?;
+        if notification {
+            apply_snapshot_notification::<B>(
+                object_field(&value, "payload")?,
+                &mut progress,
+                &mut sealed,
+            )?;
+            continue;
+        }
+        if topic == Some(heartbeat_topic.as_str()) {
+            validate_heartbeat(schema, object_field(&value, "payload")?)?;
+            continue;
+        }
+        if capturing && !B::CAPTURE_ACCEPTS_STREAMING && (sealed || progress.snapshot_complete) {
+            return Err(invalid("snapshot record arrived after snapshot completion"));
+        }
+        validate_envelope(columns, schema)?;
+        let payload = value
+            .get_mut("payload")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| invalid("missing object field payload"))?;
+        let marker = source.snapshot_marker(payload, capturing)?;
+        let before = payload
+            .remove("before")
+            .ok_or_else(|| invalid("missing before"))?;
+        let after = payload
+            .remove("after")
+            .ok_or_else(|| invalid("missing after"))?;
+        let streaming = !capturing || (B::CAPTURE_ACCEPTS_STREAMING && progress.snapshot_complete);
+        match (payload.get("op").and_then(Value::as_str), marker) {
+            (Some("r"), SnapshotMarker::Snapshot | SnapshotMarker::Last) if before.is_null() => {
+                if !capturing {
+                    return Err(invalid("snapshot record arrived while streaming"));
+                }
+                if sealed || progress.snapshot_complete {
+                    return Err(invalid("snapshot record arrived after snapshot completion"));
+                }
+                rows.push(complete_row(columns, projection, after)?);
+                diffs.push(1);
+                progress.saw_snapshot_row = true;
+                if marker == SnapshotMarker::Last {
+                    progress.snapshot_complete = true;
+                }
+            }
+            (Some("c"), SnapshotMarker::Streaming) if streaming && before.is_null() => {
+                rows.push(complete_row(columns, projection, after)?);
+                diffs.push(1);
+            }
+            (Some("u"), SnapshotMarker::Streaming) if streaming => {
+                rows.push(complete_row(columns, projection, before)?);
+                rows.push(complete_row(columns, projection, after)?);
+                diffs.extend([-1, 1]);
+            }
+            (Some("d"), SnapshotMarker::Streaming) if streaming && after.is_null() => {
+                rows.push(complete_row(columns, projection, before)?);
+                diffs.push(-1);
+            }
+            _ => {
+                return Err(invalid(
+                    "record operation or snapshot marker is invalid for the current CDC phase",
+                ));
+            }
+        }
+    }
+    Ok(Captured {
+        change: build_change(columns, projection, output_schema, &rows, diffs)?,
+        sealed,
+        progress,
+    })
+}
+
+fn apply_snapshot_notification<B: Source>(
+    payload: &Row,
+    progress: &mut SnapshotProgress,
+    sealed: &mut bool,
+) -> Result<(), ConvertError> {
+    if !validate_snapshot_notification(payload)? {
+        return Ok(());
+    }
+    if *sealed {
+        return Err(invalid("snapshot completion notification is duplicated"));
+    }
+    if progress.saw_snapshot_row && !progress.snapshot_complete {
+        return Err(invalid(
+            "snapshot completed before Debezium marked the last snapshot row",
+        ));
+    }
+    if B::CAPTURE_ACCEPTS_STREAMING {
+        progress.snapshot_complete = true;
+    }
+    *sealed = true;
+    Ok(())
+}
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum ConvertError {

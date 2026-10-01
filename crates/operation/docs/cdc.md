@@ -54,7 +54,7 @@ ACK 不确定或提交不确定要求 fail-stop/reopen；不使用回调、通�
 
 MySqlCdcScan 同样是单个具体 Scan，Definition 保存发现的非敏感单表身份、完整固定列、有序 `output_projection` 和必填 `NonZeroU64 bootstrap_spool_bytes`；完整 envelope/row image 校验、projected array 构造和零列行数语义与 PostgreSQL 相同。三个资源为 `mysql_cdc_scan.phase: Cell<u32>`、`mysql_cdc_scan.checkpoint: Cell<Vec<u8>>` 和 `mysql_cdc_scan.input: Queue<Vec<u8>>`。
 它也按 `Fresh → Capturing → Sealed → Streaming` 推进，使用 `initial_only` + `snapshot.locking.mode=minimal` 捕获 MySQL 8.4 一致初始快照，以 snapshot completed notification 的 checkpoint 封口，然后以 `recovery` 继续 binlog；沿用上述单 Queue 可见性、容量与真实 ACK 协议。
-捕获、封口、发布、背压和 ACK 与 PG 由同一个私有 CDC runtime 实现；数据库连接、记录转换和 checkpoint 身份校验仍由各具体源拥有。
+捕获、封口、发布、背压和 ACK 与 PG 由同一个私有 CDC runtime 实现；两种源共用整批记录转换，数据库连接、源 metadata 校验和 checkpoint 身份校验由具体源拥有。MySQL 的非法 operation、topic 和 tombstone 使用共享 CDC 诊断；capture 在解析 JSON 前检查 topic，同时存在多处非法时首个错误可能与此前不同。具体 MySQL 错误类别、完整行镜像要求和合法记录准入仍按本契约执行。
 Capturing 期 reopen 通过 Resetting 每笔事务 `discard_front(256)` 至多清理 256 个 input entries，逐项写 tombstone 但整批只更新一次 Queue metadata；清空 checkpoint 后重做完整快照，不复制或解码废弃 entry，也不从中间 checkpoint 恢复。
 容量是相同的 Queue 硬上限，每项计费为 8-byte private sequence 加 projected output 的实际 encoded entry bytes，空队列也不接受超限项；超限不 ACK 并要求用更大容量重建。
 部署角色应具有短时 global read lock 所需权限，但不得授予 `LOCK TABLES`，以便 global lock 失败时在长表锁 fallback 之前失败。真实系统验收入口为 `system-tests/mysql/check_cdc.py`：直接通过公共 Operation/Store 协议在快照封口及 streaming delivery 的 Store commit 后、ACK 前退出，再验证重开与有序后继事件；普通 Cargo 测试不启动 MySQL。
@@ -66,8 +66,8 @@ binlog 必须覆盖快照、sealed input 消费、下游背压与追平全期；
 
 `scan/cdc_runtime.rs` 是两种源唯一的捕获与恢复驱动。它拥有 Connector、phase/checkpoint 与唯一 input Queue。运行步骤不另行持久化；poll 的可丢弃转换进度只在真实 ACK 后发布。恢复完全依赖 phase/checkpoint/input。
 PostgreSQL 在 Capturing 恢复时先事务外清理 source-owned slot；MySQL 无需源 cleanup。之后 Resetting 每笔至多 discard 256 entries，checkpoint/phase 在最后一批一起清除。Capturing 失败后的 reopen 重新建立完整快照，不继续部分捕获。
-`postgres_cdc/runtime.rs` 和 `mysql_cdc/runtime.rs` 只实现私有源适配：启动 connector、清理快照资源、转换记录、恢复 checkpoint 及具体错误分类。具体 converter 继续返回 `Captured { change, sealed, progress }`，只有完成通知封口。
-`scan/cdc_convert.rs` 统一校验 Connect envelope、heartbeat、snapshot notification 与完整 row image，再按有序投影构造 Arrow Change；未投影列仍验证，空投影保留行数和 diff。
+`postgres_cdc/runtime.rs` 和 `mysql_cdc/runtime.rs` 实现私有源适配：提供固定列、投影和 topic，校验具体 metadata，启动 connector、清理快照资源、恢复 checkpoint 并分类错误。PG capture 接受最后一条快照行之后的 WAL；MySQL capture 只接受快照行，只有其 streaming 表 topic 允许 tombstone。
+`scan/cdc_convert.rs` 的单个记录循环服务两源 capture 和 streaming，统一校验 Connect envelope、heartbeat、snapshot notification 与完整 row image，再按有序投影构造 Arrow Change；未投影列仍验证，空投影保留行数和 diff。capture 传入唯一的 `SnapshotProgress`，streaming 不传快照进度；返回 `Captured { change, sealed, progress }`，只有完成通知封口。PG 空快照完成通知允许同一 Delivery 后续 WAL；封口 Delivery 完成 ACK 后，下一份 Delivery 使用 streaming 模式。MySQL 空完成通知只封口，不虚构已见最后一条快照行的进度。
 恢复仍保留源差异：PG 只在 Sealed/Streaming 解析可恢复 checkpoint；MySQL 在全部阶段验证 checkpoint，拒绝 Resetting 中有 input 却没有 checkpoint。唯一 input resource 取代旧 spool/published，是开发期 v1 layout 变化；旧状态直接重建，不迁移或 fallback。
 
 封口后提前 poll streaming 可能比旧搬运协议更早遇到连接、转换或 admission 错误，进而在更多 bootstrap 输入尚未计算时 fail-stop；不保证先完成整个快照计算才报告后继捕获错误。错误不能修改已封口 input；重开仍从同一持久 checkpoint 恢复。停驻的未 ACK Delivery 和 connector 缓冲沿用既有上限，不增加另一个 payload 副本。性能对照见 [Operation 性能](../PERFORMANCE.md)。

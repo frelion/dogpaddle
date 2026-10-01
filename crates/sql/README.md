@@ -102,6 +102,8 @@ SQL identity 使用固定的开发期 v1 域；开发期实现变更直接更新
 
 参数必须写成 `name => value`。值只能是单引号字符串、非负整数或 `env('NAME')`；未知、缺失、重复、位置参数和其他命名运算符都会被拒绝。所有环境变量在 `start` 访问状态前解析，错误不回显解析后的秘密。
 
+每种 endpoint 的参数定义是名称、类型、必填项和默认值的唯一来源。解析按 SQL 参数顺序检查命名形式、运算符、未知名称、重复名称和值，之后按定义顺序补默认值并检查缺失项。解析结果保留一份私有参数列表；`start` 从它读取并解析环境引用，生成现有的具体 endpoint 快照，不再另存一组待解析的端点字段。
+
 | 方向 | 函数 | 参数 |
 | --- | --- | --- |
 | Scan | `sequence` | `start` |
@@ -259,3 +261,16 @@ cargo test -p dogpaddle-sql --doc
 ### 分页 Join 的运行错误
 
 普通 JOIN 与 ASOF JOIN 都可能在较早页面已提交、结果已到达目标后，因后页表达式、歧义、解码或输出权重溢出失败。失败页回滚，先前结果保留；源 Delivery 可以在完整持久捕获后提前 ACK；计算帧的输入只在完成后释放。重启继续同一未完成输入，不重复已提交页，也不会跳过或修复确定性错误。精确事务与恢复规则见 [Flow 运行契约](../flow/docs/runtime.md)。SQL lowering 继续使用精确 `Select`，Rust 与 SQL 投影均使用同一 `Select` Definition 与执行实现。
+
+### 参数列表的冷态持有量
+
+2026-10-02 以相同固定 SQL、Rust 1.96 release、dhat 0.3.3 和公共 `SqlProgram::parse` 比较 b53beab 与 Arguments 实现。输入和三次预热不计 profile，完整 Program 持有时读 heap，drop 后四个场景都归零；不解析环境值、不启动 endpoint，也不测 CPU 或 RSS。
+
+| 固定 SQL | 原 / 新持有字节 | 累计分配变化 | peak 变化 |
+| --- | ---: | ---: | ---: |
+| `single_sequence` | 10,526 / 10,574 B | -112 B | +0 B |
+| `flat_256_sequence` | 3,126,431 / 3,138,719 B | -28,672 B | +0 B |
+| `sparse_pgcdc` | 10,924 / 11,084 B | -1,056 B | +0 B |
+| `full_pgcdc` | 11,144 / 11,304 B | -1,056 B | +0 B |
+
+每个 sequence 多保留一个 48 B 参数 Vec；稀疏和完整 PG CDC 的十项预留与 static 名称多持有 160 B。解析中的临时分配减少并不等于 Program 持有量减少；256 个 sequence 的持有量明确多 12 KiB。参数 lookup 至多十项。原、新二进制、固定 SQL/source/lock SHA、actual exit 0 与原始堆计数保存在 `/tmp/dogpaddle-cdc-arguments-performance`，该一次冷 parse profile 不代表所有查询的内存改善。

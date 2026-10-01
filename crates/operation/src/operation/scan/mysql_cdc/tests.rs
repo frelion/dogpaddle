@@ -13,10 +13,10 @@ use serde_json::{Value, json};
 
 use super::{
     MySqlCdcScanError, MySqlCdcScanSpec,
-    convert::{SnapshotProgress, convert_snapshot_values, convert_values},
+    convert::{convert_snapshot_values, convert_values},
     schema,
 };
-use crate::operation::scan::cdc_runtime::Captured;
+use crate::operation::scan::{cdc_convert::SnapshotProgress, cdc_runtime::Captured};
 
 fn column(data_type: DataType) -> Field {
     Field::new("value", data_type, true)
@@ -126,10 +126,7 @@ fn notification(kind: &str) -> Value {
     })
 }
 
-fn snapshot(
-    columns: &[Field],
-    events: &[Value],
-) -> Result<Captured<SnapshotProgress>, MySqlCdcScanError> {
+fn snapshot(columns: &[Field], events: &[Value]) -> Result<Captured, MySqlCdcScanError> {
     snapshot_after(columns, events, SnapshotProgress::default())
 }
 
@@ -137,7 +134,7 @@ fn snapshot_after(
     columns: &[Field],
     events: &[Value],
     progress: SnapshotProgress,
-) -> Result<Captured<SnapshotProgress>, MySqlCdcScanError> {
+) -> Result<Captured, MySqlCdcScanError> {
     let projection = identity_projection(columns);
     snapshot_after_projected(columns, &projection, events, progress)
 }
@@ -147,7 +144,7 @@ fn snapshot_after_projected(
     projection: &[u32],
     events: &[Value],
     progress: SnapshotProgress,
-) -> Result<Captured<SnapshotProgress>, MySqlCdcScanError> {
+) -> Result<Captured, MySqlCdcScanError> {
     let bytes = events
         .iter()
         .map(|event| serde_json::to_vec(event).unwrap())
@@ -470,6 +467,7 @@ fn mysql_cdc_snapshot_uses_explicit_completion_and_supports_empty_tables() {
     let empty = snapshot(&columns, &[notification("COMPLETED")]).unwrap();
     assert!(empty.sealed);
     assert!(empty.change.is_none());
+    assert_eq!(empty.progress, SnapshotProgress::default());
 
     assert!(
         !snapshot(&columns, &[heartbeat(), notification("STARTED")])

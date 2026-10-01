@@ -18,11 +18,27 @@ struct SnapshotOwner {
 }
 
 impl Source for SnapshotOwner {
-    type Progress = ();
     const RESET_REQUIRES_SOURCE_CLEANUP: bool = true;
 
-    fn source_fields(&self) -> usize {
-        0
+    const CAPTURE_ACCEPTS_STREAMING: bool = true;
+    const STREAMING_TOMBSTONES: bool = false;
+    fn columns(&self) -> &Fields {
+        panic!("reset must not inspect source fields")
+    }
+    fn output_projection(&self) -> &[u32] {
+        panic!("reset must not inspect projection")
+    }
+    fn engine_name(&self) -> &'static str {
+        "source"
+    }
+    fn table_topic(&self) -> String {
+        "source.test".into()
+    }
+    fn snapshot_marker(&self, _: &Row, _: bool) -> Result<SnapshotMarker, ConvertError> {
+        panic!("reset must not convert records")
+    }
+    fn conversion_error(error: ConvertError) -> OperationError {
+        error.into()
     }
     fn start_snapshot(&self) -> Result<Connector, OperationError> {
         panic!("reset must not start a connector")
@@ -39,14 +55,6 @@ impl Source for SnapshotOwner {
         } else {
             Ok(())
         }
-    }
-
-    fn capture(&self, _: SchemaRef, _: &[Record], (): ()) -> Result<Captured<()>, OperationError> {
-        panic!("reset must not convert records")
-    }
-
-    fn stream(&self, _: SchemaRef, _: &[Record]) -> Result<Option<Change>, OperationError> {
-        panic!("reset must not convert records")
     }
 
     fn restore_checkpoint(
