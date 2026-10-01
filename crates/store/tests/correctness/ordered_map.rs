@@ -67,7 +67,7 @@ fn ordered_map_survives_reopen() {
     );
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct TestKey(u64);
 
 impl StoreKey for TestKey {
@@ -228,4 +228,51 @@ fn bounded_point_read_checks_value_length_and_can_retry_without_poisoning() {
         Err(StoreError::ItemTooLarge { .. })
     ));
     assert_eq!(access.get_bounded(&7, 64).unwrap(), Some(vec![1; 64]));
+}
+
+#[test]
+fn non_clone_keys_continue_owned_pages_in_both_directions() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = Store::create(store_path(&root)).unwrap();
+    let map = create_map::<TestKey, u64>(&mut store, "map").unwrap();
+    let (mut writes, reads) = store.into_transactions().split();
+    {
+        let transaction = writes.begin();
+        let mut access = map.access(transaction.access()).unwrap();
+        for key in 1..=3 {
+            access.put(&TestKey(key), &key).unwrap();
+        }
+        transaction.commit().unwrap();
+    }
+    for (direction, expected) in [
+        (ScanDirection::Ascending, vec![1, 2, 3]),
+        (ScanDirection::Descending, vec![3, 2, 1]),
+    ] {
+        let mut continuation = None;
+        let mut actual = Vec::new();
+        loop {
+            let page = {
+                let snapshot = reads.begin();
+                map.read(snapshot.access())
+                    .unwrap()
+                    .scan(
+                        ..,
+                        direction,
+                        continuation.as_ref(),
+                        ScanLimit::new(1, 16).unwrap(),
+                    )
+                    .unwrap()
+            };
+            assert_eq!(page.entries.len(), 1);
+            let (key, value) = &page.entries[0];
+            assert_eq!(key.0, *value);
+            actual.push(key.0);
+            continuation = page.continuation;
+            if continuation.is_none() {
+                break;
+            }
+            assert!(actual.len() < 3);
+        }
+        assert_eq!(actual, expected);
+    }
 }

@@ -12,10 +12,10 @@ mod fixture;
 #[path = "ordered_map/measure.rs"]
 mod measure;
 
-use fixture::{MapFixture, StationFixture};
+use fixture::{MapFixture, StationFixture, WeightFixture};
 use measure::{
     measure_bulk_erase, measure_bulk_put, measure_bulk_remove, measure_point_get, measure_scan,
-    measure_single_put_commits, measure_station_steps,
+    measure_single_put_commits, measure_station_steps, measure_weight_scan,
 };
 
 const BENCHMARK: &str = "ordered_map";
@@ -143,6 +143,15 @@ fn benchmark(criterion: &mut Criterion, root: &RunRoot, config: Config) {
         });
     }
 
+    let weights = WeightFixture::populated(root, config.entries);
+    group.bench_function(BenchmarkId::new("weight_scan", config.entries), |bencher| {
+        bencher.iter_custom(|iterations| {
+            measure_iterations(iterations, || {
+                measure_weight_scan(&weights, config.entries, scan_limit)
+            })
+        });
+    });
+
     group.throughput(elements(config.wide_entries));
     let wide = MapFixture::populated(root, "wide", config.wide_entries, WIDE_VALUE_BYTES);
     group.bench_function(
@@ -225,7 +234,7 @@ fn write_context(root: &RunRoot, profile: PerformanceProfile, config: Config) {
             "measurement_time_ns": nanos(config.measurement_time),
             "store": {
                 "engine": "RocksDB",
-                "collection": "OrderedMap<u64, Vec<u8>>",
+                "collection": "OrderedMap<u64, Vec<u8>>; weight_scan uses OrderedMap<u64, NonZeroU64>",
                 "write_mode": "WAL enabled, sync=true"
             },
             "read_transactions": "read-only snapshots",
@@ -240,6 +249,7 @@ fn write_context(root: &RunRoot, profile: PerformanceProfile, config: Config) {
                 "ascending_scan",
                 "descending_scan",
                 "wide_scan",
+                "weight_scan",
                 "station_step",
                 "durable_hot_overwrite"
             ]

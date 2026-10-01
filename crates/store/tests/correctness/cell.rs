@@ -70,7 +70,7 @@ impl StoreValue for OwnershipObservedValue {
 }
 
 #[test]
-fn newly_written_cell_values_are_owned_for_decoding() {
+fn point_decoding_borrows_pinned_bytes_and_returns_an_owned_value() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::create(store_path(&root)).unwrap();
     let cell = create_cell::<OwnershipObservedValue>(&mut store, "cell").unwrap();
@@ -86,7 +86,10 @@ fn newly_written_cell_values_are_owned_for_decoding() {
         .unwrap();
     let decoded = access.get().unwrap().unwrap();
     assert_eq!(decoded.value, 42);
-    assert!(decoded.input_was_owned);
+    assert!(!decoded.input_was_owned);
+    transaction.commit().unwrap();
+    drop(transactions);
+    assert_eq!(decoded.value, 42);
 }
 
 #[test]

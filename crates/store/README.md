@@ -126,7 +126,7 @@ Queue 的只读 `front_bounded(max_value_bytes)` 返回当前 snapshot 的队首
 
 `Cell<T>::get_bounded(max_bytes)` 通过 pinned lookup 在复制前检查 encoded value 长度；超限返回 `ItemTooLarge`，不毒化事务。
 
-Cell 与 Map 的 `get` 复用 `get_bounded(..., usize::MAX)`；有界与无界读取共享 owned decode、snapshot 和事务中毒语义。
+Cell、Map 及其 partition view 的点读在 pinned bytes 长度准入后直接调用 `StoreValue` 解码，返回值仍完全拥有自身数据，不借用事务；固定宽度值不先分配临时字节 Vec。`get` 复用 `get_bounded(..., usize::MAX)`，有界与无界读取共享 snapshot 和事务中毒语义。
 
 ## 有序分页
 
@@ -155,7 +155,7 @@ let next = page.continuation;
 Store 在返回前完成准入、复制和完整解码；错误不会交付半页。第一项单独超过 byte limit 时返回
 `StoreError::ItemTooLarge`，调用方可以在同一事务中提高 limit 后重试。其他 codec 或存储错误会使事务中毒。
 
-分区扫描只省略 range，仍保留 direction、排他 `resume_after` 和同一 `ScanLimit`。页面不提供 visitor 或 encoded-entry projection；业务层自行遍历并处置业务错误。私有扫描先检查范围和准入再复制 payload；分区项按完整 framing + 行 key + multiplicity 计入字节预算，但准入后只复制行 key 后缀供 owned 解码。存在性与长度检查不得构造完整 owned value。
+分区扫描只省略 range，仍保留 direction、排他 `resume_after` 和同一 `ScanLimit`。页面不提供 visitor 或 encoded-entry projection；业务层自行遍历并处置业务错误。私有扫描先检查范围和完整 encoded key/value 字节准入，再从当前 iterator 借用字节直接解码成最终拥有型条目，不先构造整页原始字节 Vec。分区项按完整 framing + 行 key + value 计入字节预算，准入后只将 local key 后缀交给 key codec。只有实际存在后续匹配项时才将最后一个 key 按 canonical codec 编码、解码为独立 continuation，不要求 `K: Clone`。codec 失败丢弃整页并毒化当前事务；第一项超限仍可重试且不调用 codec。存在性与长度检查不得构造完整 owned value。
 
 ## 提交、错误与恢复
 
@@ -226,4 +226,4 @@ DOGPADDLE_PERF_PROFILE=smoke cargo bench --locked -p dogpaddle-store --bench ord
 
 ### 有界点读与分区端点
 
-`OrderedMapAccess::get_bounded` 与只读 view 的同名方法按 encoded value 长度准入，不计 caller 已持有的 lookup key；读取 pinned bytes 时先检查长度，再复制和解码。`MapPartition::first_bounded/last_bounded` 与只读 partition 同名方法按完整 partition framing、key、value 的 encoded bytes 准入，等同一项有界 scan。超限返回可重试的 `ItemTooLarge`，不毒化事务；端点零 byte limit 返回 `InvalidScanLimit`。类型化 codec 的 storage/encoding/decoding 错误仍毒化事务。这些是返回 payload 的逻辑界，不限制 `RocksDB` page cache、I/O 时间或自定义 codec 内部任意分配。
+`OrderedMapAccess::get_bounded` 与只读 view 的同名方法按 encoded value 长度准入，不计 caller 已持有的 lookup key；读取 pinned bytes 时先检查长度，再直接解码成最终拥有型值。`MapPartition::first_bounded/last_bounded` 与只读 partition 同名方法按完整 partition framing、key、value 的 encoded bytes 准入，等同一项有界 scan。超限返回可重试的 `ItemTooLarge`，不毒化事务；端点零 byte limit 返回 `InvalidScanLimit`。类型化 codec 的 storage/encoding/decoding 错误仍毒化事务。这些是返回 payload 的逻辑界，不限制 `RocksDB` page cache、I/O 时间或自定义 codec 内部任意分配。

@@ -364,7 +364,9 @@ fn read_front<T: StoreValue>(
     metadata: Metadata,
     max_value_bytes: usize,
 ) -> Result<(T, u64), StoreError> {
-    let Some(encoded) = data.get_bounded(&encode_sequence(metadata.head), max_value_bytes)? else {
+    let Some(encoded) =
+        data.get_bounded::<Vec<u8>>(&encode_sequence(metadata.head), max_value_bytes)?
+    else {
         return data.record_result(Err(StoreError::CorruptQueue {
             reason: "the front entry is missing",
         }));
@@ -380,7 +382,7 @@ fn read_front<T: StoreValue>(
 }
 
 fn read_metadata(data: &ReadDataAccess<'_>) -> Result<Metadata, StoreError> {
-    let encoded = match data.get_bounded(METADATA_KEY, METADATA_BYTES) {
+    let encoded = match data.get_bounded::<Vec<u8>>(METADATA_KEY, METADATA_BYTES) {
         Err(StoreError::ItemTooLarge { .. }) => {
             return data.record_result(Err(StoreError::CorruptQueue {
                 reason: "queue metadata exceeds its fixed width",

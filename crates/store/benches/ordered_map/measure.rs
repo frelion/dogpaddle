@@ -4,7 +4,7 @@ use dogpaddle_store::{ScanDirection, ScanLimit};
 
 use crate::{
     RANDOM_SEED, STATION_KEYS, VALUE_BYTES,
-    fixture::{MapFixture, StationFixture},
+    fixture::{MapFixture, StationFixture, WeightFixture},
 };
 
 pub(super) fn measure_bulk_put(fixture: &mut MapFixture, entries: usize) -> Duration {
@@ -299,5 +299,44 @@ pub(super) fn measure_single_put_commits(fixture: &mut MapFixture, commits: usiz
             .expect("commit count fits u64")
             .to_be_bytes()
     );
+    elapsed
+}
+
+pub(super) fn measure_weight_scan(
+    fixture: &WeightFixture,
+    entries: usize,
+    limit: ScanLimit,
+) -> Duration {
+    let started = std::time::Instant::now();
+    let (count, checksum) = {
+        let snapshot = fixture.reads.begin();
+        let map = fixture
+            .map
+            .read(snapshot.access())
+            .expect("read weight map");
+        let mut continuation = None;
+        let mut count = 0_usize;
+        let mut checksum = 0_u64;
+        loop {
+            let page = map
+                .scan(.., ScanDirection::Ascending, continuation.as_ref(), limit)
+                .expect("scan weight page");
+            for (key, value) in page.entries {
+                count += 1;
+                checksum = checksum.wrapping_add(key ^ value.get());
+            }
+            continuation = page.continuation;
+            if continuation.is_none() {
+                break;
+            }
+        }
+        (count, checksum)
+    };
+    black_box(checksum);
+    let elapsed = started.elapsed();
+    assert_eq!(count, entries);
+    let expected = (0..u64::try_from(entries).expect("entry count fits u64"))
+        .fold(0_u64, |total, key| total.wrapping_add(key ^ 7));
+    assert_eq!(checksum, expected);
     elapsed
 }

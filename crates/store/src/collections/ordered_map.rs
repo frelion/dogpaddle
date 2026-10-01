@@ -1,5 +1,4 @@
 use std::{
-    borrow::Cow,
     marker::PhantomData,
     ops::{Bound, RangeBounds},
 };
@@ -41,7 +40,10 @@ pub struct OrderedMapReadAccess<'transaction, K, V> {
 /// One fully decoded, owned page from an ordered-map scan.
 ///
 /// The page does not borrow the map or transaction. Both entries and the
-/// continuation are decoded before the scan returns successfully.
+/// continuation are decoded before the scan returns successfully. Admission precedes
+/// decoding borrowed iterator bytes directly into these owned entries. A continuation
+/// is reconstructed through the key codec only when another matching entry exists;
+/// keys need not implement `Clone`.
 #[derive(Debug, Eq, PartialEq)]
 pub struct OrderedMapPage<K, V> {
     /// Entries in the requested key order.
@@ -237,13 +239,7 @@ fn read_map_value_bounded<K: StoreKey, V: StoreValue>(
     max_bytes: usize,
 ) -> Result<Option<V>, StoreError> {
     let encoded_key = data.poison_on_error(key.encode_key())?;
-    let encoded = data.get_bounded(encoded_key.as_ref(), max_bytes)?;
-    data.poison_on_error(
-        encoded
-            .map(|encoded| V::decode_value(Cow::Owned(encoded)))
-            .transpose(),
-    )
-    .map_err(StoreError::from)
+    data.get_bounded(encoded_key.as_ref(), max_bytes)
 }
 
 fn scan_map<K: StoreKey, V: StoreValue>(
@@ -264,34 +260,12 @@ fn scan_map<K: StoreKey, V: StoreValue>(
         Bound::Unbounded => Ok(Bound::Unbounded),
     })?;
     let resume = data.poison_on_error(resume_after.map(StoreKey::encode_key).transpose())?;
-    let raw = data.scan(
+    data.scan(
         (borrow_bound(&lower), borrow_bound(&upper)),
         direction,
         resume.as_ref().map(AsRef::as_ref),
         limit,
-    )?;
-    let continuation = data.poison_on_error(
-        raw.items
-            .last()
-            .filter(|_| raw.limited)
-            .map(|(key, _)| K::decode_key(Cow::Borrowed(key)))
-            .transpose(),
-    )?;
-    let entries = data.poison_on_error(
-        raw.items
-            .into_iter()
-            .map(|(key, value)| {
-                Ok::<_, crate::CodecError>((
-                    K::decode_key(Cow::Owned(key))?,
-                    V::decode_value(Cow::Owned(value))?,
-                ))
-            })
-            .collect::<Result<Vec<_>, _>>(),
-    )?;
-    Ok(OrderedMapPage {
-        entries,
-        continuation,
-    })
+    )
 }
 
 impl<K, V> Clone for OrderedMap<K, V> {

@@ -17,7 +17,7 @@ DogPaddle 只保留能够证明当前公共语义、持久化格式、事务边�
 ## 证据所有权
 
 - Change 拥有 Schema、Change、Projection、Arrow IPC 字节格式、互操作、损坏拒绝和稳定事件顺序。
-- Store 拥有事务、能力边界、Cell/OrderedMap/Queue 布局、分区与权重操作、分页、容量、reopen 和 crash consistency。
+- Store 拥有事务、能力边界、Cell/OrderedMap/Queue 布局、分区与权重操作、分页、容量、reopen 和 crash consistency；有界读取必须证明先准入后解码、晚项 codec 失败丢弃整页并毒化、非 Clone key continuation，以及 owned page 离开事务仍有效。
 - Operation 拥有 Operation + Store：Definition、稳定 tag/payload、checked construct、运行协议、状态和算子语义。
 - Flow 拥有 Flow + Operation + Change + Store：逻辑 DAG、全图 binding、持久调用栈、分页事务、背压、fail-stop、status 和 reopen。
 - SQL 拥有 SQL + Flow + Operation：单语句 parser subset、端点参数、DataFusion coercion、LogicalPlan lowering、Program identity 和 `start` 的自动构建/恢复选择。
@@ -138,7 +138,7 @@ Change IPC 变更必须覆盖 self-contained Stream literal golden、标准 Arro
 | `buffered_sink` | Operation 自有 Criterion：SQLite durable buffer 的小批稳态 admission/drain、计入全部 admission 的多 entry 合批、独立计时 reopen + 首轮全 buffer 恢复校验、大 payload/小 event budget、受控的大 payload × multiplicity target-byte 分批，高 multiplicity/有限容量 churn，以及单个大 unit-weight entry 的多页 drain。常规 case 计时完整 admission、Prepared 持久化、sync、deliver 和 settle；恢复 case 计时 reopen/bind 与首次 drain，包含完整 buffer 校验及首批 delivery/settlement。fixture、初始化、预热、恢复样本的 durable staging/后续 drain 与目标关系 oracle 不计时，精确边界写入该次 `context.json` |
 | `asof_join` | Operation 自有 Criterion：多 partition/少版本的左侧 lookup、单一大 partition、右侧尾部小修正与历史最坏修正，以及宽 RHS winner 的历史重匹配；每次计时包含一对使关系回到初始态的完整输入、全部分页 step、预算不足后的确定性减半重试和同步 commit，fixture、seed 与结果校验不计时 |
 | `asof_join_resources` | Operation 自有进程隔离 runner：历史 lookup、RHS 历史修正、空影响区间和 NULL-order left；记录 Rust allocator heap、输出行数/正负事件、页数与重试数；关系 oracle 归 correctness |
-| `ordered_map` | Criterion；完整 owned-page 扫描，以及已知存在 key 的直接 erase 与需要存在性结果的 checked remove 配对删除 |
+| `ordered_map` | Criterion；完整 owned-page 扫描，以及已知存在 key 的直接 erase 与需要存在性结果的 checked remove 配对删除；另含固定正权重 `weight_scan`，不扩张完整矩阵 |
 | `flow_lifecycle` | Criterion |
 | `flow_runtime` | Flow 自有逐采样 `advance` latency trace；包含 Select（选列）→Select（追加列）→Filter→Select→Select（显式 Schema）、计数链和 fan-out；以相同逻辑输入与最终结果比较 |
 

@@ -2,7 +2,7 @@ use std::num::NonZeroU64;
 
 use crate::{
     DataAccess, MapPartition, MapReadPartition, OrderedMapAccess, OrderedMapReadAccess,
-    ReadDataAccess, StoreError, StoreKey, StoreValue,
+    ReadDataAccess, StoreError, StoreKey,
 };
 
 /// Multiplicity immediately before and after one checked map adjustment.
@@ -104,7 +104,7 @@ impl<K: StoreKey> MapReadPartition<'_, '_, K, NonZeroU64> {
     }
 }
 fn read_weight(data: &ReadDataAccess<'_>, key: &[u8]) -> Result<u64, StoreError> {
-    let value = match data.get_bounded(key, 8) {
+    let value = match data.get_bounded::<NonZeroU64>(key, 8) {
         Err(StoreError::ItemTooLarge { .. }) => {
             return data.poison_on_error(Err(StoreError::Codec(crate::CodecError::new(
                 "positive weight is not eight bytes",
@@ -112,13 +112,7 @@ fn read_weight(data: &ReadDataAccess<'_>, key: &[u8]) -> Result<u64, StoreError>
         }
         result => result?,
     };
-    data.poison_on_error(
-        value
-            .map(|bytes| NonZeroU64::decode_value(std::borrow::Cow::Owned(bytes)))
-            .transpose(),
-    )
-    .map(|value| value.map_or(0, NonZeroU64::get))
-    .map_err(StoreError::from)
+    Ok(value.map_or(0, NonZeroU64::get))
 }
 fn adjust_encoded(
     data: &mut DataAccess<'_>,

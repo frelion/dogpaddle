@@ -254,13 +254,7 @@ fn read_value<K: StoreKey, V: StoreValue>(
     max_bytes: usize,
 ) -> Result<Option<V>, StoreError> {
     let key = encode_key(data, prefix, key)?;
-    let value = data.get_bounded(&key, max_bytes)?;
-    data.poison_on_error(
-        value
-            .map(|bytes| V::decode_value(Cow::Owned(bytes)))
-            .transpose(),
-    )
-    .map_err(StoreError::from)
+    data.get_bounded(&key, max_bytes)
 }
 fn scan_partition<K: StoreKey, V: StoreValue>(
     data: &ReadDataAccess<'_>,
@@ -275,33 +269,11 @@ fn scan_partition<K: StoreKey, V: StoreValue>(
     let resume = resume_after
         .map(|key| encode_key(data, prefix, key))
         .transpose()?;
-    let raw = data.scan_key_suffix(
+    data.scan_key_suffix(
         (Bound::Included(prefix), Bound::Excluded(upper.as_slice())),
         direction,
         resume.as_deref(),
         limit,
         prefix,
-    )?;
-    let continuation = data.poison_on_error(
-        raw.items
-            .last()
-            .filter(|_| raw.limited)
-            .map(|(key, _)| K::decode_key(Cow::Borrowed(key)))
-            .transpose(),
-    )?;
-    let entries = data.poison_on_error(
-        raw.items
-            .into_iter()
-            .map(|(key, value)| {
-                Ok((
-                    K::decode_key(Cow::Owned(key))?,
-                    V::decode_value(Cow::Owned(value))?,
-                ))
-            })
-            .collect::<Result<Vec<_>, CodecError>>(),
-    )?;
-    Ok(OrderedMapPage {
-        entries,
-        continuation,
-    })
+    )
 }

@@ -1,19 +1,16 @@
-use std::ops::{Bound, RangeBounds};
+use std::{
+    borrow::Cow,
+    ops::{Bound, RangeBounds},
+};
 
 use rocksdb::{DBAccess, ReadOptions, SnapshotWithThreadMode};
 
 use super::{DataHandle, ReadTransaction, ReadTransactionAccess, Transaction, TransactionAccess};
-use crate::StoreError;
+use crate::{OrderedMapPage, StoreError, StoreKey, StoreValue};
 
 const DATA_DOMAIN: u8 = 2;
 
 type EncodedBound<'key> = (&'key [u8], bool);
-type EncodedEntry = (Vec<u8>, Vec<u8>);
-
-pub(crate) struct ScanBatch {
-    pub(crate) items: Vec<EncodedEntry>,
-    pub(crate) limited: bool,
-}
 
 /// Direction of an ordered scan over encoded keys.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -215,20 +212,24 @@ impl TransactionRef<'_> {
         self.record_result(result)
     }
 
-    fn get_bounded(self, key: &[u8], max_bytes: usize) -> Result<Option<Vec<u8>>, StoreError> {
+    fn get_bounded<V: StoreValue>(
+        self,
+        key: &[u8],
+        max_bytes: usize,
+    ) -> Result<Option<V>, StoreError> {
         self.ensure_healthy()?;
         let result = match self {
             Self::Read(transaction) => transaction
                 .snapshot
                 .get_pinned(key)
                 .map_err(|error| StoreError::storage("read bounded data", error))
-                .and_then(|value| copy_bounded_value(value, max_bytes)),
+                .and_then(|value| decode_bounded_value(value, max_bytes)),
             Self::Write(transaction) => {
                 let snapshot = transaction.inner.snapshot();
                 snapshot
                     .get_pinned(key)
                     .map_err(|error| StoreError::storage("read bounded data", error))
-                    .and_then(|value| copy_bounded_value(value, max_bytes))
+                    .and_then(|value| decode_bounded_value(value, max_bytes))
             }
         };
         self.record_result(result)
@@ -243,7 +244,7 @@ impl TransactionRef<'_> {
         self.record_result(result)
     }
 
-    fn scan<'key>(
+    fn scan<'key, K: StoreKey, V: StoreValue>(
         self,
         prefix: [u8; 5],
         direction: ScanDirection,
@@ -251,7 +252,7 @@ impl TransactionRef<'_> {
         upper: Option<&EncodedBound<'key>>,
         limit: ScanLimit,
         key_suffix_prefix: &[u8],
-    ) -> Result<ScanBatch, StoreError> {
+    ) -> Result<OrderedMapPage<K, V>, StoreError> {
         self.ensure_healthy()?;
         let result = match self {
             Self::Read(transaction) => scan_data(
@@ -280,10 +281,10 @@ impl TransactionRef<'_> {
     }
 }
 
-fn copy_bounded_value(
+fn decode_bounded_value<V: StoreValue>(
     value: Option<impl AsRef<[u8]>>,
     max_bytes: usize,
-) -> Result<Option<Vec<u8>>, StoreError> {
+) -> Result<Option<V>, StoreError> {
     let Some(value) = value else {
         return Ok(None);
     };
@@ -294,7 +295,9 @@ fn copy_bounded_value(
             limit: max_bytes,
         });
     }
-    Ok(Some(value.to_vec()))
+    V::decode_value(Cow::Borrowed(value))
+        .map(Some)
+        .map_err(StoreError::from)
 }
 
 impl ReadDataAccess<'_> {
@@ -318,12 +321,12 @@ impl ReadDataAccess<'_> {
         self.transaction.value_len(&physical_key(self.prefix, key))
     }
 
-    /// Reads an encoded value only when it fits the caller's owned-byte bound.
-    pub(crate) fn get_bounded(
+    /// Decodes the pinned value only after admitting its encoded length.
+    pub(crate) fn get_bounded<V: StoreValue>(
         &self,
         key: &[u8],
         max_bytes: usize,
-    ) -> Result<Option<Vec<u8>>, StoreError> {
+    ) -> Result<Option<V>, StoreError> {
         self.transaction
             .get_bounded(&physical_key(self.prefix, key), max_bytes)
     }
@@ -333,30 +336,29 @@ impl ReadDataAccess<'_> {
         self.transaction.is_physically_empty(self.prefix)
     }
 
-    /// Owns one bounded page of encoded entries in byte order.
-    pub(crate) fn scan<'range, R>(
+    /// Decodes one bounded, owned page directly from iterator bytes.
+    pub(crate) fn scan<'range, K: StoreKey, V: StoreValue, R>(
         &self,
         range: R,
         direction: ScanDirection,
         resume_after: Option<&[u8]>,
         limit: ScanLimit,
-    ) -> Result<ScanBatch, StoreError>
+    ) -> Result<OrderedMapPage<K, V>, StoreError>
     where
         R: RangeBounds<&'range [u8]>,
     {
         self.scan_key_suffix(range, direction, resume_after, limit, &[])
     }
 
-    /// Uses the full encoded key for bounds and byte admission, but owns only
-    /// the suffix after `key_prefix` for admitted entries in a prefix range.
-    pub(crate) fn scan_key_suffix<'range, R>(
+    /// Admits the full encoded key and value, then decodes the local key suffix.
+    pub(crate) fn scan_key_suffix<'range, K: StoreKey, V: StoreValue, R>(
         &self,
         range: R,
         direction: ScanDirection,
         resume_after: Option<&[u8]>,
         limit: ScanLimit,
         key_suffix_prefix: &[u8],
-    ) -> Result<ScanBatch, StoreError>
+    ) -> Result<OrderedMapPage<K, V>, StoreError>
     where
         R: RangeBounds<&'range [u8]>,
     {
@@ -400,7 +402,7 @@ fn namespace_is_empty<D: DBAccess>(
     Ok(!iterator.valid())
 }
 
-fn scan_data<D: DBAccess>(
+fn scan_data<D: DBAccess, K: StoreKey, V: StoreValue>(
     snapshot: &SnapshotWithThreadMode<'_, D>,
     prefix: [u8; 5],
     direction: ScanDirection,
@@ -408,7 +410,7 @@ fn scan_data<D: DBAccess>(
     upper: Option<&EncodedBound<'_>>,
     limit: ScanLimit,
     key_suffix_prefix: &[u8],
-) -> Result<ScanBatch, StoreError> {
+) -> Result<OrderedMapPage<K, V>, StoreError> {
     let mut read_options = ReadOptions::default();
     read_options.set_iterate_lower_bound(
         lower.map_or_else(|| prefix.to_vec(), |(key, _)| physical_key(prefix, key)),
@@ -431,8 +433,9 @@ fn scan_data<D: DBAccess>(
         ScanDirection::Ascending => iterator.seek(&seek),
         ScanDirection::Descending => iterator.seek_for_prev(&seek),
     }
-    let mut items = Vec::new();
+    let mut entries = Vec::new();
     let mut bytes = 0_usize;
+    let mut limited = false;
 
     while let Some(physical_key) = iterator.key() {
         let Some(key) = physical_key.strip_prefix(&prefix) else {
@@ -456,11 +459,9 @@ fn scan_data<D: DBAccess>(
             }
             break;
         }
-        if items.len() == limit.max_items() {
-            return Ok(ScanBatch {
-                items,
-                limited: true,
-            });
+        if entries.len() == limit.max_items() {
+            limited = true;
+            break;
         }
 
         let value = iterator.value().expect("a valid iterator has a value");
@@ -473,22 +474,23 @@ fn scan_data<D: DBAccess>(
             })?;
         let next_bytes = bytes.checked_add(item_bytes);
         if next_bytes.is_none_or(|size| size > limit.max_bytes()) {
-            if items.is_empty() {
+            if entries.is_empty() {
                 return Err(StoreError::ItemTooLarge {
                     size: item_bytes,
                     limit: limit.max_bytes(),
                 });
             }
-            return Ok(ScanBatch {
-                items,
-                limited: true,
-            });
+            limited = true;
+            break;
         }
         bytes = next_bytes.expect("bounded sum was checked above");
         let suffix = key
             .strip_prefix(key_suffix_prefix)
             .expect("the encoded scan range admits only this key prefix");
-        items.push((suffix.to_vec(), value.to_vec()));
+        entries.push((
+            K::decode_key(Cow::Borrowed(suffix))?,
+            V::decode_value(Cow::Borrowed(value))?,
+        ));
         match direction {
             ScanDirection::Ascending => iterator.next(),
             ScanDirection::Descending => iterator.prev(),
@@ -499,9 +501,17 @@ fn scan_data<D: DBAccess>(
         .status()
         .map_err(|error| StoreError::storage("scan data", error))?;
 
-    Ok(ScanBatch {
-        items,
-        limited: false,
+    let continuation = entries
+        .last()
+        .filter(|_| limited)
+        .map(|(key, _)| {
+            let encoded = key.encode_key()?;
+            K::decode_key(Cow::Borrowed(encoded.as_ref()))
+        })
+        .transpose()?;
+    Ok(OrderedMapPage {
+        entries,
+        continuation,
     })
 }
 
@@ -633,7 +643,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_scan_admits_only_matching_entries_and_preserves_continuation() {
+    fn scan_admits_only_matching_entries_and_preserves_continuation() {
         let root = tempfile::tempdir().unwrap();
         let mut store = Store::create(root.path().join("store")).unwrap();
         store
@@ -663,25 +673,25 @@ mod tests {
             ),
         ] {
             let page = data
-                .scan(range, direction, None, ScanLimit::new(1, 2).unwrap())
+                .scan::<Vec<u8>, Vec<u8>, _>(range, direction, None, ScanLimit::new(1, 2).unwrap())
                 .unwrap();
-            assert_eq!(page.items, vec![expected.clone()]);
-            assert!(!page.limited);
+            assert_eq!(page.entries, vec![expected.clone()]);
+            assert!(page.continuation.is_none());
             let page = data
-                .scan(.., direction, None, ScanLimit::new(1, 2).unwrap())
+                .scan::<Vec<u8>, Vec<u8>, _>(.., direction, None, ScanLimit::new(1, 2).unwrap())
                 .unwrap();
-            assert_eq!(page.items, vec![expected]);
-            assert!(page.limited);
+            assert_eq!(page.entries, vec![expected]);
+            assert_eq!(page.continuation.as_ref(), Some(&page.entries[0].0));
             let byte_limited = data
-                .scan(.., direction, None, ScanLimit::new(2, 2).unwrap())
+                .scan::<Vec<u8>, Vec<u8>, _>(.., direction, None, ScanLimit::new(2, 2).unwrap())
                 .unwrap();
-            assert_eq!(byte_limited.items, page.items);
-            assert!(byte_limited.limited);
+            assert_eq!(byte_limited.entries, page.entries);
+            assert_eq!(byte_limited.continuation, page.continuation);
             assert!(matches!(
-                data.scan(
+                data.scan::<Vec<u8>, Vec<u8>, _>(
                     ..,
                     direction,
-                    Some(page.items[0].0.as_slice()),
+                    Some(page.entries[0].0.as_slice()),
                     ScanLimit::new(1, 2).unwrap(),
                 ),
                 Err(StoreError::ItemTooLarge { .. })

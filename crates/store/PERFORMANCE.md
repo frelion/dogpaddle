@@ -16,12 +16,13 @@ Store 自己拥有 workload、fixture、seed、预热、正确性断言和结果
 除点查、分页和同步写入外，`bulk_remove_checked_commit` 与 `bulk_erase_known_commit` 使用相同的预填充
 map 和删除集合，区分“需要返回存在性”的 remove 与“调用方已经证明存在”的无条件 erase 成本。
 
-这个 target 只测量当前唯一的 `OrderedMap<u64, Vec<u8>>`。场景分别回答：
+主要场景使用 `OrderedMap<u64, Vec<u8>>`，另以一个正权重扫描场景覆盖固定宽度解码。场景分别回答：
 
 - `bulk_put_commit`：一个 durable transaction 中顺序写入完整 map；
 - `point_get`：一个只读 snapshot 中按固定伪随机序列读取热 key；
 - `ascending_scan` / `descending_scan`：使用真实 item/byte limit 和 continuation 扫描完整 map；
 - `wide_scan`：8 KiB value 的有界分页与完整 owned decode；
+- `weight_scan`：`OrderedMap<u64, NonZeroU64>` 的完整升序有界扫描，单独覆盖关系索引常用的固定宽度正权重解码，不复制其他场景矩阵；
 - `station_step`：同一事务更新 `Cell` 与八个 map entry，呈现一个 durable computation step；
 - `durable_hot_overwrite`：每次提交覆盖同一个 key，单独呈现 WAL + sync commit 成本。
 

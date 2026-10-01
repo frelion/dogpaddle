@@ -1,4 +1,4 @@
-use std::{borrow::Cow, marker::PhantomData};
+use std::marker::PhantomData;
 
 use crate::{
     DataAccess, DataHandle, ReadDataAccess, ReadTransactionAccess, StoreError, StoreValue,
@@ -125,7 +125,7 @@ impl<T: StoreValue> CellAccess<'_, T> {
     /// Returns an error when storage access or value decoding fails, or when
     /// the encoded value exceeds `max_bytes`.
     pub fn get_bounded(&self, max_bytes: usize) -> Result<Option<T>, StoreError> {
-        read_cell_bounded(self.data.as_read(), max_bytes)
+        self.data.as_read().get_bounded(CELL_KEY, max_bytes)
     }
 }
 
@@ -144,28 +144,15 @@ impl<T: StoreValue> CellReadAccess<'_, T> {
     /// Reads the current typed value only when its encoded length is within `max_bytes`.
     ///
     /// The length is checked through the read transaction's pinned value before
-    /// an owned payload is constructed.
+    /// decoding borrows its bytes to construct the final owned value.
     ///
     /// # Errors
     ///
     /// Returns an error when storage access or value decoding fails, or when
     /// the encoded value exceeds `max_bytes`.
     pub fn get_bounded(&self, max_bytes: usize) -> Result<Option<T>, StoreError> {
-        read_cell_bounded(&self.data, max_bytes)
+        self.data.get_bounded(CELL_KEY, max_bytes)
     }
-}
-
-fn read_cell_bounded<T: StoreValue>(
-    data: &ReadDataAccess<'_>,
-    max_bytes: usize,
-) -> Result<Option<T>, StoreError> {
-    let encoded = data.get_bounded(CELL_KEY, max_bytes)?;
-    data.poison_on_error(
-        encoded
-            .map(|bytes| T::decode_value(Cow::Owned(bytes)))
-            .transpose(),
-    )
-    .map_err(StoreError::from)
 }
 
 impl<T> Clone for Cell<T> {
