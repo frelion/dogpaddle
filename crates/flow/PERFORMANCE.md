@@ -135,3 +135,40 @@ fresh build 的中位数 95% CI：2 个 Operation 为旧 `[4.4461,4.5363]`、
 `after/dogpaddle-flow-lifecycle-run-0kNpR1`，相邻日志保留全部输出。
 完整工作区 debug/release correctness、benchmark test mode、Clippy、Rustdoc 和最终
 构建通过；独立审查覆盖 raw plan 的 owner 上限、纯 binding 前置拒绝与只读恢复。
+
+## 声明顺序构建：2026-10-01 启动对照
+
+图的声明顺序已经是合法拓扑顺序，构建和恢复现在直接沿用它。删除第二次拓扑排序、
+构建时的 encode/decode 往返与运行实例重排；持久图仍完整校验，CRC 使用已有标准实现。
+本轮不改变合法图的 ordinal、资源名和融合边界，Sink 的轮转顺序统一为声明顺序。
+
+同机 Apple M5、aarch64 Darwin 25.6、APFS、Rust 1.96.0 release，
+`flow_lifecycle` reference 使用 30 samples、2 s warmup、5 s measurement。
+baseline 为 `29d713a`，candidate 为 `9e25a27`；两份产品 source patch 均为空。
+context 的 dirty 来自未跟踪的本地历史计划，未进入编译输入。
+两个版本使用同一 benchmark，测量期间没有并行 Cargo、容器或系统验收。
+fixture 及路径、Operation 数量/ID 验证在计时外；fresh build 另外在计时外真实 reopen
+并验证，warm_reopen 计时包含实际 open。全部六个场景通过。
+
+下表为中位数及其 95% CI，单位 ms；变化为 candidate / baseline - 1。
+
+| 场景 / Operation 数 | baseline [95% CI] | candidate [95% CI] | 变化 |
+| --- | ---: | ---: | ---: |
+| fresh_durable_build / 2 | 4.5597 [4.5358, 4.6245] | 4.6525 [4.6024, 4.6700] | +2.0% |
+| fresh_durable_build / 64 | 4.8284 [4.7879, 4.8483] | 4.7152 [4.6819, 4.7340] | -2.3% |
+| fresh_durable_build / 1024 | 7.9839 [7.9393, 8.0036] | 6.9011 [6.8709, 6.9214] | -13.6% |
+| warm_reopen / 2 | 5.8708 [5.6700, 6.0975] | 5.8496 [5.6059, 6.0049] | -0.4% |
+| warm_reopen / 64 | 6.0504 [5.7961, 6.2964] | 5.9338 [5.8302, 6.1622] | -1.9% |
+| warm_reopen / 1024 | 7.6062 [7.4734, 7.7804] | 7.1188 [6.9339, 7.3406] | -6.4% |
+
+1024 个 Operation 的新建和重开均改善；小图的新建中位数增加 2.0%，区间重叠，
+保留这项结果，不宣称所有规模都提速。小图重开区间同样重叠。
+本轮同时改变排序、构建往返和 CRC，不能把收益单独归因于其中一项。
+没有测量分配、进程 RSS 或 steady-state throughput。
+
+原始 context、samples、estimates 与 benchmark/oracle 执行日志位于
+`/tmp/dogpaddle-ordered-flow-performance/`：
+`before/dogpaddle-flow-lifecycle-run-mLA0E2` 与
+`after/dogpaddle-flow-lifecycle-run-AzGT3B`；相邻 revision 与 product patch 记录保留版本证据。
+当前组合通过完整工作区 debug/release correctness、benchmark test mode、Clippy、Rustdoc
+及 workspace build；独立审查覆盖声明顺序、1024-node/port 准入、只读恢复和资源绑定。
