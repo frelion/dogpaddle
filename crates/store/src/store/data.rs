@@ -595,12 +595,12 @@ fn within_upper(key: &[u8], upper: Option<&EncodedBound<'_>>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{OrderedMap, Store};
+    use crate::{OrderedMap, StoreSetup};
 
     #[test]
     fn pinned_lengths_and_presence_observe_snapshots_and_pending_mutations() {
         let root = tempfile::tempdir().unwrap();
-        let mut store = Store::create(root.path().join("store")).unwrap();
+        let mut store = StoreSetup::new();
         store
             .create_data::<OrderedMap<Vec<u8>, Vec<u8>>>("data")
             .unwrap();
@@ -608,7 +608,10 @@ mod tests {
             store_token: store.token,
             data_id: 0,
         };
-        let (mut writes, reads) = store.into_transactions().split();
+        let (mut writes, reads) = store
+            .commit(root.path().join("store"), |_| Ok(()))
+            .unwrap()
+            .split();
 
         let transaction = writes.begin();
         let mut data = handle.access(transaction.access()).unwrap();
@@ -645,7 +648,7 @@ mod tests {
     #[test]
     fn scan_admits_only_matching_entries_and_preserves_continuation() {
         let root = tempfile::tempdir().unwrap();
-        let mut store = Store::create(root.path().join("store")).unwrap();
+        let mut store = StoreSetup::new();
         store
             .create_data::<OrderedMap<Vec<u8>, Vec<u8>>>("data")
             .unwrap();
@@ -653,7 +656,7 @@ mod tests {
             store_token: store.token,
             data_id: 0,
         };
-        let mut writes = store.into_transactions();
+        let mut writes = store.commit(root.path().join("store"), |_| Ok(())).unwrap();
         let transaction = writes.begin();
         let mut data = handle.access(transaction.access()).unwrap();
         data.put(b"a", b"x").unwrap();

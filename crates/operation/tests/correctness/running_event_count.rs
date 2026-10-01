@@ -74,8 +74,10 @@ fn runtime_rejects_missing_invalid_port_and_foreign_store() {
     drop(transactions);
 
     let foreign_root = tempfile::tempdir().unwrap();
-    let foreign = Store::create(foreign_root.path().join("foreign")).unwrap();
-    let mut foreign_transactions = foreign.into_transactions();
+    let foreign = StoreSetup::new();
+    let mut foreign_transactions = foreign
+        .commit(foreign_root.path().join("foreign"), |_| Ok(()))
+        .unwrap();
     let error =
         rollback_input(&operation, step_input(&input), &mut foreign_transactions).unwrap_err();
     assert!(matches!(
@@ -162,11 +164,18 @@ fn running_event_count_trace_is_rebatch_invariant_and_overflow_is_atomic() {
     );
 
     let fixture = TestStore::new();
-    let mut store = Store::create(fixture.path()).unwrap();
-    let state = store
+    let mut store = StoreSetup::new();
+    store
         .create_data::<Cell<u64>>("operation/running_event_count.count")
         .unwrap();
     let definition = RunningEventCountDefinition::new();
+
+    let input = value_change(&[1, 1]);
+    drop(store.commit(fixture.path(), |_| Ok(())).unwrap());
+    let store = Store::open(fixture.path()).unwrap();
+    let state = store
+        .open_data::<Cell<u64>>("operation/running_event_count.count")
+        .unwrap();
     let (operation, _) = OperationDefinition::from(definition)
         .construct(
             &[value_schema()],
@@ -175,7 +184,6 @@ fn running_event_count_trace_is_rebatch_invariant_and_overflow_is_atomic() {
         )
         .unwrap()
         .into_parts();
-    let input = value_change(&[1, 1]);
     let mut transactions = store.into_transactions();
     {
         let transaction = transactions.begin();
@@ -203,11 +211,11 @@ fn running_event_count_trace_is_rebatch_invariant_and_overflow_is_atomic() {
 fn running_event_count_preserves_persisted_bytes_when_state_codec_is_wrong() {
     for persisted in ["not-a-u64".to_owned(), "bad".to_owned()] {
         let fixture = TestStore::new();
-        let mut store = Store::create(fixture.path()).unwrap();
+        let mut store = StoreSetup::new();
         let raw = store
             .create_data::<Cell<String>>("operation/running_event_count.count")
             .unwrap();
-        let mut transactions = store.into_transactions();
+        let mut transactions = store.commit(fixture.path(), |_| Ok(())).unwrap();
         {
             let transaction = transactions.begin();
             raw.access(transaction.access())

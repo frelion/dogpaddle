@@ -27,19 +27,17 @@ commit：两个修改一起可见；丢弃事务：两个修改一起回滚
 ```rust,no_run
 use std::path::Path;
 
-use dogpaddle_store::{Cell, OrderedMap, Store};
+use dogpaddle_store::{Cell, OrderedMap, Store, StoreSetup};
 
 fn initialize(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let mut store = Store::create(path)?;
-    let checkpoint = store.create_data::<Cell<u64>>("checkpoint")?;
-    let users = store.create_data::<OrderedMap<u64, String>>("users")?;
-    let mut transactions = store.into_transactions();
-
-    let transaction = transactions.begin();
-    let access = transaction.access();
-    checkpoint.access(access)?.set(&1)?;
-    users.access(access)?.put(&42, &"Shiba".to_owned())?;
-    transaction.commit()?;
+    let mut setup = StoreSetup::new();
+    let checkpoint = setup.create_data::<Cell<u64>>("checkpoint")?;
+    let users = setup.create_data::<OrderedMap<u64, String>>("users")?;
+    let transactions = setup.commit(path, |access| {
+        checkpoint.access(access)?.set(&1)?;
+        users.access(access)?.put(&42, &"Shiba".to_owned())
+    })?;
+    drop(transactions);
     Ok(())
 }
 
@@ -65,13 +63,16 @@ Store 刻意把生命周期分成两段：
 
 | 阶段 | 做什么 | 主要类型 |
 | --- | --- | --- |
-| setup | 创建或打开具名资源，固定资源类型和名字 | `Store`、`StoreSetup` |
+| setup | 在 draft 声明新资源，或从已有 catalog 取得 handle | `StoreSetup`、`Store` |
 | runtime | 读取和更新已经声明的资源 | `Transactions`、`ReadTransactions` |
 
-普通使用可以调用 `Store::create` / `Store::open`，再逐个 `create_data` / `open_data`。需要一次发布完整资源集合时，
-先用 `StoreSetup::new()` 建立纯内存 draft；资源声明只分配最终 Store token、catalog namespace 和 typed handle，
-不会创建路径。最后由 `StoreSetup::commit(path, initialize)` 创建数据库，并把 marker、完整 catalog、初始状态和
-owner Definition 放进同一笔同步事务。
+新建只有一条路径：`StoreSetup::new()` 建立纯内存 draft，`create_data` 声明完整资源集合，
+`commit(path, initialize)` 一次创建数据库并原子发布 marker、完整 catalog 和初值，直接返回 `Transactions`。
+没有初值时传入 `|_| Ok(())`。声明只分配最终 Store token、catalog namespace 和 typed handle，
+不会创建路径；namespace ID 由已成功声明的资源数派生，仍检查 u32 范围。
+`Store::open` 只查找已有资源，不能追加 catalog；需要不同资源集合时使用新的状态路径。
+公开初始化不再允许声明资源期间读取业务状态，也不提供发布后增加资源的协议。
+已有 catalog 继续验证名称、kind 与 ID 唯一性；稀疏 namespace ID 仍合法，不要求连续编号。
 
 `StoreSetup` 不是普通 `Store`：它不能读取或打开资源，也不能直接进入 runtime。`commit` 无论成功、初始化失败，
 还是遇到结果不确定的底层提交错误，都会消费这个 setup owner；不能在失败后继续追加资源。丢弃未 commit 的 draft

@@ -3,7 +3,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use dogpaddle_store::Store;
+use dogpaddle_store::{Store, StoreSetup};
 
 use super::*;
 
@@ -80,7 +80,7 @@ impl Source for SnapshotOwner {
     }
 }
 
-fn bind(store: &mut Store, capacity: u64) -> CdcRuntime<SnapshotOwner> {
+fn bind(store: &mut StoreSetup, capacity: u64) -> CdcRuntime<SnapshotOwner> {
     CdcRuntime::new(
         SnapshotOwner::default(),
         Arc::new(arrow_schema::Schema::empty()),
@@ -122,9 +122,12 @@ fn assert_state(
 #[test]
 fn failed_cleanup_and_rolled_back_reset_preserve_capture_and_checkpoint() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(root.path().join("state")).unwrap();
+    let mut store = StoreSetup::new();
     let mut runtime = bind(&mut store, 4096);
-    let (mut writes, reads) = store.into_transactions().split();
+    let (mut writes, reads) = store
+        .commit(root.path().join("state"), |_| Ok(()))
+        .unwrap()
+        .split();
     {
         let txn = writes.begin();
         runtime
@@ -218,10 +221,13 @@ fn failed_cleanup_and_rolled_back_reset_preserve_capture_and_checkpoint() {
 #[test]
 fn unsealed_input_is_hidden_until_the_seal_transaction_commits() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(root.path().join("state")).unwrap();
+    let mut store = StoreSetup::new();
     let runtime = bind(&mut store, 4096);
     let encoded = vec![8];
-    let (mut writes, reads) = store.into_transactions().split();
+    let (mut writes, reads) = store
+        .commit(root.path().join("state"), |_| Ok(()))
+        .unwrap()
+        .split();
     {
         let txn = writes.begin();
         assert!(
@@ -304,7 +310,7 @@ fn unsealed_input_is_hidden_until_the_seal_transaction_commits() {
 fn sealed_input_front_survives_rolled_back_consumption_and_reopen() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("state");
-    let mut store = Store::create(&path).unwrap();
+    let mut store = StoreSetup::new();
     let runtime = bind(&mut store, 4096);
     let batch = arrow_array::RecordBatch::try_new_with_options(
         runtime.codec.schema(),
@@ -314,7 +320,7 @@ fn sealed_input_front_survives_rolled_back_consumption_and_reopen() {
     .unwrap();
     let change = Change::try_new(batch, arrow_array::Int64Array::from(vec![1])).unwrap();
     let encoded = runtime.codec.encode(&change).unwrap();
-    let (mut writes, reads) = store.into_transactions().split();
+    let (mut writes, reads) = store.commit(&path, |_| Ok(())).unwrap().split();
     {
         let txn = writes.begin();
         assert!(
@@ -400,9 +406,12 @@ fn fill_to_streaming_quota(runtime: &CdcRuntime<SnapshotOwner>, access: Transact
 #[test]
 fn oversized_sealed_backlog_blocks_data_and_heartbeats_without_writes() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(root.path().join("state")).unwrap();
+    let mut store = StoreSetup::new();
     let mut runtime = bind(&mut store, STREAMING_BYTES + 4096);
-    let (mut writes, reads) = store.into_transactions().split();
+    let (mut writes, reads) = store
+        .commit(root.path().join("state"), |_| Ok(()))
+        .unwrap()
+        .split();
     {
         let txn = writes.begin();
         assert!(
@@ -465,9 +474,12 @@ fn oversized_sealed_backlog_blocks_data_and_heartbeats_without_writes() {
 #[test]
 fn streaming_quota_boundary_and_first_phase_transition_roll_back_together() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(root.path().join("state")).unwrap();
+    let mut store = StoreSetup::new();
     let runtime = bind(&mut store, STREAMING_BYTES);
-    let (mut writes, reads) = store.into_transactions().split();
+    let (mut writes, reads) = store
+        .commit(root.path().join("state"), |_| Ok(()))
+        .unwrap()
+        .split();
     {
         let txn = writes.begin();
         fill_to_streaming_quota(&runtime, txn.access());
@@ -566,9 +578,12 @@ fn streaming_quota_boundary_and_first_phase_transition_roll_back_together() {
 #[test]
 fn reset_discards_only_a_bounded_batch_and_clears_checkpoint_with_the_last_entry() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(root.path().join("state")).unwrap();
+    let mut store = StoreSetup::new();
     let mut runtime = bind(&mut store, 4096);
-    let (mut writes, reads) = store.into_transactions().split();
+    let (mut writes, reads) = store
+        .commit(root.path().join("state"), |_| Ok(()))
+        .unwrap()
+        .split();
     {
         let txn = writes.begin();
         let mut input = runtime.input.access(txn.access()).unwrap();
@@ -632,9 +647,12 @@ fn reset_discards_only_a_bounded_batch_and_clears_checkpoint_with_the_last_entry
 #[test]
 fn restore_uses_the_streaming_quota_instead_of_the_smaller_bootstrap_quota() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(root.path().join("state")).unwrap();
+    let mut store = StoreSetup::new();
     let mut runtime = bind(&mut store, 4096);
-    let (mut writes, reads) = store.into_transactions().split();
+    let (mut writes, reads) = store
+        .commit(root.path().join("state"), |_| Ok(()))
+        .unwrap()
+        .split();
     {
         let txn = writes.begin();
         assert!(
@@ -686,9 +704,12 @@ fn restore_uses_the_streaming_quota_instead_of_the_smaller_bootstrap_quota() {
 #[test]
 fn early_stream_start_failure_preserves_sealed_input_and_checkpoint() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(root.path().join("state")).unwrap();
+    let mut store = StoreSetup::new();
     let mut runtime = bind(&mut store, 4096);
-    let (mut writes, reads) = store.into_transactions().split();
+    let (mut writes, reads) = store
+        .commit(root.path().join("state"), |_| Ok(()))
+        .unwrap()
+        .split();
     {
         let txn = writes.begin();
         assert!(

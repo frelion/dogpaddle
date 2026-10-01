@@ -1,7 +1,7 @@
 use std::num::NonZeroU64;
 
 use dogpaddle_perf_context::RunRoot;
-use dogpaddle_store::{Cell, OrderedMap, ReadTransactions, Store, Transactions};
+use dogpaddle_store::{Cell, OrderedMap, ReadTransactions, StoreSetup, Transactions};
 use tempfile::TempDir;
 
 use crate::{STATION_KEYS, VALUE_BYTES};
@@ -26,11 +26,14 @@ pub(super) struct StationFixture {
 impl MapFixture {
     pub(super) fn empty(root: &RunRoot, scenario: &str) -> Self {
         let sample = root.sample(scenario);
-        let mut store = Store::create(sample.path().join("store")).expect("create benchmark store");
+        let mut store = StoreSetup::new();
         let map = store
             .create_data::<StateMap>("map")
             .expect("create benchmark map");
-        let (writes, reads) = store.into_transactions().split();
+        let (writes, reads) = store
+            .commit(sample.path().join("store"), |_| Ok(()))
+            .unwrap()
+            .split();
         Self {
             writes,
             reads,
@@ -65,14 +68,17 @@ impl MapFixture {
 impl StationFixture {
     pub(super) fn populated(root: &RunRoot) -> Self {
         let sample = root.sample("station");
-        let mut store = Store::create(sample.path().join("store")).expect("create station store");
+        let mut store = StoreSetup::new();
         let step = store
             .create_data::<Cell<u64>>("step")
             .expect("create station step");
         let map = store
             .create_data::<StateMap>("map")
             .expect("create station map");
-        let (mut writes, reads) = store.into_transactions().split();
+        let (mut writes, reads) = store
+            .commit(sample.path().join("store"), |_| Ok(()))
+            .unwrap()
+            .split();
         let transaction = writes.begin();
         step.access(transaction.access())
             .expect("access station step")
@@ -107,11 +113,14 @@ pub(super) struct WeightFixture {
 impl WeightFixture {
     pub(super) fn populated(root: &RunRoot, entries: usize) -> Self {
         let sample = root.sample("weights");
-        let mut store = Store::create(sample.path().join("store")).expect("create weight store");
+        let mut store = StoreSetup::new();
         let map = store
             .create_data::<OrderedMap<u64, NonZeroU64>>("weights")
             .expect("create weight map");
-        let (mut writes, reads) = store.into_transactions().split();
+        let (mut writes, reads) = store
+            .commit(sample.path().join("store"), |_| Ok(()))
+            .unwrap()
+            .split();
         {
             let transaction = writes.begin();
             let mut access = map

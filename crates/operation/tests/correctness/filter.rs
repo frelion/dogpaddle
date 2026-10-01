@@ -14,7 +14,7 @@ use dogpaddle_operation::{
         transform::{FilterDefinition, FilterError},
     },
 };
-use dogpaddle_store::Store;
+use dogpaddle_store::{Store, StoreSetup};
 
 use super::support::{
     TestStore, assert_literal_definition, change, change_with_field_name, construct_checked,
@@ -80,8 +80,8 @@ fn literal_definition_reconstructs_predicate_binding_and_runtime() {
     let change = Change::try_new(records, Int64Array::from(vec![1, -1, 2])).unwrap();
     let operation = stateless_operation(&decoded, Arc::clone(&input));
     let root = TestStore::new();
-    let store = Store::create(root.path()).unwrap();
-    let mut transactions = store.into_transactions();
+    let store = StoreSetup::new();
+    let mut transactions = store.commit(root.path(), |_| Ok(())).unwrap();
     let Some(filtered) = run_input(&operation, step_input(&change), &mut transactions).unwrap()
     else {
         panic!("decoded complex Filter did not emit its expected rows");
@@ -125,8 +125,8 @@ fn runtime_rejects_invalid_port_and_schema_drift() {
         input.schema(),
     );
     let root = TestStore::new();
-    let store = Store::create(root.path()).unwrap();
-    let mut transactions = store.into_transactions();
+    let store = StoreSetup::new();
+    let mut transactions = store.commit(root.path(), |_| Ok(())).unwrap();
     let error = rollback_input(
         &operation,
         OperationInput {
@@ -193,8 +193,8 @@ fn filter_keeps_only_true_rows_with_the_same_order_records_and_diffs() {
         Arc::clone(&schema),
     );
     let fixture = TestStore::new();
-    let store = Store::create(fixture.path()).unwrap();
-    let mut transactions = store.into_transactions();
+    let store = StoreSetup::new();
+    let mut transactions = store.commit(fixture.path(), |_| Ok(())).unwrap();
     let Some(output) = run_input(&operation, step_input(&input), &mut transactions).unwrap() else {
         panic!("Filter did not complete with a partial output Change");
     };
@@ -284,8 +284,8 @@ fn filter_partially_selects_null_binary_and_struct_columns() {
         Arc::clone(&schema),
     );
     let fixture = TestStore::new();
-    let store = Store::create(fixture.path()).unwrap();
-    let mut transactions = store.into_transactions();
+    let store = StoreSetup::new();
+    let mut transactions = store.commit(fixture.path(), |_| Ok(())).unwrap();
     let Some(output) = run_input(&operation, step_input(&input), &mut transactions).unwrap() else {
         panic!("Filter did not produce its partial heterogeneous output");
     };
@@ -318,8 +318,8 @@ fn filter_partially_selects_null_binary_and_struct_columns() {
 fn filter_all_true_is_zero_copy_and_all_false_or_null_completes_without_output() {
     let input = change(&[1, -1, 2]);
     let fixture = TestStore::new();
-    let store = Store::create(fixture.path()).unwrap();
-    let mut transactions = store.into_transactions();
+    let store = StoreSetup::new();
+    let mut transactions = store.commit(fixture.path(), |_| Ok(())).unwrap();
     let all_true = stateless_operation(
         &FilterDefinition::try_new(lit(true)).unwrap(),
         input.schema(),

@@ -303,9 +303,9 @@ mod tests {
 
     #[test]
     fn bounded_state_read_admits_logical_statistics_before_decoding() {
-        use dogpaddle_store::{OrderedMap, Store, StoreError};
+        use dogpaddle_store::{OrderedMap, StoreError, StoreSetup};
         let root = tempfile::tempdir().unwrap();
-        let mut store = Store::create(root.path().join("store")).unwrap();
+        let mut store = StoreSetup::new();
         let groups = store
             .create_data::<OrderedMap<Vec<u8>, GroupState>>("groups")
             .unwrap();
@@ -317,7 +317,7 @@ mod tests {
         };
         let encoded = state.encode_value().unwrap().as_ref().to_vec();
         assert_eq!(encoded.len(), state.logical_bytes() + 1);
-        let mut transactions = store.into_transactions();
+        let mut transactions = store.commit(root.path().join("store"), |_| Ok(())).unwrap();
         {
             let transaction = transactions.begin();
             groups

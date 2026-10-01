@@ -1,12 +1,12 @@
 use crate::support::{create_byte_map, create_map, store_path};
-use dogpaddle_store::{ScanDirection, ScanLimit, Store, StoreError};
+use dogpaddle_store::{ScanDirection, ScanLimit, StoreError, StoreSetup};
 
 #[test]
 fn owned_page_survives_writes_commit_and_store_close() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
+    let mut store = StoreSetup::new();
     let map = create_map::<u64, Vec<u8>>(&mut store, "map").unwrap();
-    let mut writes = store.into_transactions();
+    let mut writes = store.commit(store_path(&root), |_| Ok(())).unwrap();
     let page = {
         let transaction = writes.begin();
         let mut access = map.access(transaction.access()).unwrap();
@@ -41,9 +41,9 @@ fn owned_page_survives_writes_commit_and_store_close() {
 #[test]
 fn later_pages_observe_source_updates_after_an_owned_page() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
+    let mut store = StoreSetup::new();
     let map = create_map::<u64, u64>(&mut store, "map").unwrap();
-    let mut writes = store.into_transactions();
+    let mut writes = store.commit(store_path(&root), |_| Ok(())).unwrap();
     let transaction = writes.begin();
     let mut access = map.access(transaction.access()).unwrap();
     for key in 1..=3 {
@@ -76,9 +76,9 @@ fn later_pages_observe_source_updates_after_an_owned_page() {
 #[test]
 fn owned_read_page_survives_snapshot_and_store_close() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
+    let mut store = StoreSetup::new();
     let map = create_map::<u64, String>(&mut store, "map").unwrap();
-    let (mut writes, reads) = store.into_transactions().split();
+    let (mut writes, reads) = store.commit(store_path(&root), |_| Ok(())).unwrap().split();
     let transaction = writes.begin();
     map.access(transaction.access())
         .unwrap()
@@ -116,9 +116,9 @@ fn byte_map_binary_keys_page_in_both_directions() {
     ];
 
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
+    let mut store = StoreSetup::new();
     let data = create_byte_map(&mut store, "data").unwrap();
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(store_path(&root), |_| Ok(())).unwrap();
     {
         let transaction = transactions.begin();
         let mut access = data.access(transaction.access()).unwrap();

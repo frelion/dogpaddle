@@ -204,8 +204,8 @@ pub fn roundtripped_output<D: Clone + Into<OperationDefinition>>(
     );
     let operation = stateless_operation(&decoded, input.schema());
     let fixture = TestStore::new();
-    let store = Store::create(fixture.path()).unwrap();
-    let mut transactions = store.into_transactions();
+    let store = StoreSetup::new();
+    let mut transactions = store.commit(fixture.path(), |_| Ok(())).unwrap();
     let Some(output) = run_input(&operation, step_input(input), &mut transactions).unwrap() else {
         panic!("round-tripped stateless Operation did not complete with output");
     };

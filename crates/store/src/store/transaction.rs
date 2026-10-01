@@ -396,10 +396,6 @@ pub(super) fn begin_write_transaction(
     database.transaction_opt(&write_options, &transaction_options)
 }
 
-pub(super) fn durable_write_options() -> WriteOptions {
-    write_options(true)
-}
-
 fn write_options(sync: bool) -> WriteOptions {
     let mut options = WriteOptions::default();
     options.set_sync(sync);

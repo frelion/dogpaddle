@@ -116,7 +116,8 @@ fn literal_definition_has_variant_exact_schema_and_one_weight_multiset() {
     );
 
     let empty = TestStore::new();
-    let store = Store::create(empty.path()).unwrap();
+    drop(StoreSetup::new().commit(empty.path(), |_| Ok(())).unwrap());
+    let store = Store::open(empty.path()).unwrap();
     let result = OperationDefinition::from(definition).construct(
         &[schema()],
         &mut store.data_scope().scoped("operation"),

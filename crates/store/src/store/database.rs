@@ -34,39 +34,6 @@ type Catalog = BTreeMap<String, (u32, DataKind)>;
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 impl Store {
-    /// Creates an empty store at a new path.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the path is occupied or `RocksDB` cannot be
-    /// initialized. Initialization failure may leave a partial directory for
-    /// the caller to inspect.
-    pub fn create(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let path = path.as_ref();
-        fs::create_dir(path).map_err(|error| {
-            if error.kind() == ErrorKind::AlreadyExists {
-                StoreError::PathExists(path.to_path_buf())
-            } else {
-                StoreError::storage("create store directory", error)
-            }
-        })?;
-
-        let database = open_database(path, true)?;
-        database
-            .put_opt(
-                STORE_MARKER_KEY,
-                STORE_MARKER,
-                &super::transaction::durable_write_options(),
-            )
-            .map_err(|error| StoreError::storage("write store marker", error))?;
-        Ok(Self {
-            database,
-            token: fresh_token(),
-            catalog: BTreeMap::new(),
-            next_data_id: 0,
-        })
-    }
-
     /// Opens an existing store.
     ///
     /// # Errors
@@ -84,46 +51,13 @@ impl Store {
         if marker != STORE_MARKER {
             return Err(StoreError::InvalidStore);
         }
-        let (catalog, next_data_id) = read_catalog(&snapshot)?;
+        let catalog = read_catalog(&snapshot)?;
         drop(snapshot);
         Ok(Self {
             database,
             token: fresh_token(),
             catalog,
-            next_data_id,
         })
-    }
-
-    /// Creates one named typed data object.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for an empty or duplicate name, exhausted namespace
-    /// identifiers, or a storage failure. After a storage failure, the caller
-    /// must discard this setup owner because the catalog write outcome may be
-    /// indeterminate.
-    pub fn create_data<D: StoreData>(&mut self, name: &str) -> Result<D, StoreError> {
-        let handle = self.create_handle(name, data_class::kind::<D>())?;
-        Ok(data_class::from_handle(handle))
-    }
-
-    fn create_handle(&mut self, name: &str, kind: DataKind) -> Result<DataHandle, StoreError> {
-        let data_id = create_binding(
-            &mut self.catalog,
-            &mut self.next_data_id,
-            name,
-            kind,
-            |data_id| {
-                self.database
-                    .put_opt(
-                        catalog_key(name),
-                        encode_binding(data_id, kind),
-                        &super::transaction::durable_write_options(),
-                    )
-                    .map_err(|error| StoreError::storage("write data catalog", error))
-            },
-        )?;
-        Ok(self.handle(data_id))
     }
 
     /// Opens one named typed data object.
@@ -175,28 +109,6 @@ impl Store {
     }
 }
 
-fn create_binding(
-    catalog: &mut Catalog,
-    next_data_id: &mut u64,
-    name: &str,
-    kind: DataKind,
-    persist: impl FnOnce(u32) -> Result<(), StoreError>,
-) -> Result<u32, StoreError> {
-    validate_name(name)?;
-    if catalog.contains_key(name) {
-        return Err(StoreError::DataAlreadyExists(name.to_owned()));
-    }
-    let data_id = u32::try_from(*next_data_id).map_err(|_| StoreError::DataIdExhausted {
-        name: name.to_owned(),
-    })?;
-    // Namespace identifiers are monotonic within both a draft and an open Store.
-    // Callers never reuse an identifier after this reservation succeeds.
-    *next_data_id += 1;
-    persist(data_id)?;
-    catalog.insert(name.to_owned(), (data_id, kind));
-    Ok(data_id)
-}
-
 impl StoreSetup {
     /// Creates an empty in-memory Store draft.
     ///
@@ -206,7 +118,6 @@ impl StoreSetup {
         Self {
             token: fresh_token(),
             catalog: BTreeMap::new(),
-            next_data_id: 0,
         }
     }
 
@@ -218,13 +129,15 @@ impl StoreSetup {
     /// identifiers.
     pub fn create_data<D: StoreData>(&mut self, name: &str) -> Result<D, StoreError> {
         let kind = data_class::kind::<D>();
-        let data_id = create_binding(
-            &mut self.catalog,
-            &mut self.next_data_id,
-            name,
-            kind,
-            |_| Ok(()),
-        )?;
+        validate_name(name)?;
+        if self.catalog.contains_key(name) {
+            return Err(StoreError::DataAlreadyExists(name.to_owned()));
+        }
+        let data_id =
+            u32::try_from(self.catalog.len()).map_err(|_| StoreError::DataIdExhausted {
+                name: name.to_owned(),
+            })?;
+        self.catalog.insert(name.to_owned(), (data_id, kind));
         Ok(data_class::from_handle(DataHandle {
             store_token: self.token,
             data_id,
@@ -370,12 +283,9 @@ fn validate_store_path(path: &Path) -> Result<(), StoreError> {
     }
 }
 
-fn read_catalog(
-    snapshot: &SnapshotWithThreadMode<'_, Database>,
-) -> Result<(Catalog, u64), StoreError> {
+fn read_catalog(snapshot: &SnapshotWithThreadMode<'_, Database>) -> Result<Catalog, StoreError> {
     let mut catalog = BTreeMap::new();
     let mut data_ids = HashSet::new();
-    let mut next_data_id = 0_u64;
     let mut options = ReadOptions::default();
     options.set_iterate_upper_bound([CATALOG_DOMAIN + 1]);
     for item in snapshot.iterator_opt(
@@ -392,10 +302,9 @@ fn read_catalog(
         if !data_ids.insert(data_id) {
             return Err(StoreError::InvalidStore);
         }
-        next_data_id = next_data_id.max(u64::from(data_id) + 1);
         catalog.insert(name.to_owned(), (data_id, kind));
     }
-    Ok((catalog, next_data_id))
+    Ok(catalog)
 }
 
 fn fresh_token() -> u64 {
@@ -445,45 +354,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scoped_declaration_reports_full_name_when_identifiers_are_exhausted() {
+    fn opening_accepts_sparse_catalog_ids_without_allocating_another_namespace() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("store");
         let mut setup = StoreSetup::new();
-        setup.next_data_id = u64::from(u32::MAX) + 1;
-        let error = setup
-            .data_scope()
-            .scoped("owner")
-            .data::<crate::Cell<u64>>("count");
-        assert!(
-            matches!(error, Err(StoreError::DataIdExhausted { name }) if name == "owner/count")
-        );
-        assert!(setup.catalog.is_empty());
-        assert_eq!(setup.next_data_id, u64::from(u32::MAX) + 1);
+        setup.create_data::<crate::Cell<u64>>("first").unwrap();
+        drop(setup.commit(&path, |_| Ok(())).unwrap());
+        let database = open_database(&path, false).unwrap();
+        database
+            .put(
+                catalog_key("last"),
+                encode_binding(u32::MAX, DataKind::Cell),
+            )
+            .unwrap();
+        drop(database);
+        let store = Store::open(&path).unwrap();
+        let first = store.open_data::<crate::Cell<u64>>("first").unwrap();
+        let last = store.open_data::<crate::Cell<u64>>("last").unwrap();
+        let snapshot = store.read_transaction();
+        assert_eq!(first.read(snapshot.access()).unwrap().get().unwrap(), None);
+        assert_eq!(last.read(snapshot.access()).unwrap().get().unwrap(), None);
     }
 
-    #[test]
-    fn failed_catalog_write_reserves_the_attempted_namespace() {
-        let mut catalog = Catalog::new();
-        let mut next_data_id = 0;
-        let failure = create_binding(
-            &mut catalog,
-            &mut next_data_id,
-            "uncertain",
-            DataKind::Cell,
-            |_| Err(StoreError::storage("injected catalog write", "failure")),
-        );
-        assert!(matches!(failure, Err(StoreError::Storage { .. })));
-
-        let next = create_binding(
-            &mut catalog,
-            &mut next_data_id,
-            "next",
-            DataKind::Cell,
-            |_| Ok(()),
-        )
-        .unwrap();
-        assert_eq!(next, 1);
-        assert_eq!(next_data_id, 2);
-        assert_eq!(catalog.get("next"), Some(&(1, DataKind::Cell)));
-    }
     #[test]
     fn catalog_has_three_kinds_and_rejects_retired_collection_tags() {
         for (kind, tag) in [

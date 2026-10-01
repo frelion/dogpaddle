@@ -4,7 +4,7 @@ use std::{hint::black_box, time::Duration};
 
 use criterion::{BenchmarkId, Criterion, Throughput};
 use dogpaddle_perf_context::{HostEnvironment, PerformanceProfile, RunRoot, require_release_build};
-use dogpaddle_store::{Cell, Store, Transactions};
+use dogpaddle_store::{Cell, StoreSetup, Transactions};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -29,13 +29,14 @@ struct Config {
 impl Fixture {
     fn populated(root: &RunRoot) -> Self {
         let sample = root.sample("cell");
-        let mut store =
-            Store::create(sample.path().join("store")).expect("create cell benchmark store");
+        let mut store = StoreSetup::new();
         let cell = store
             .create_data::<Cell<u64>>("cell")
             .expect("create benchmark cell");
         let mut fixture = Self {
-            transactions: store.into_transactions(),
+            transactions: store
+                .commit(sample.path().join("store"), |_| Ok(()))
+                .unwrap(),
             cell,
             _root: sample,
         };

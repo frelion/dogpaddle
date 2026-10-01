@@ -10,7 +10,7 @@ use dogpaddle_operation::{
         transform::{FilterDefinition, SelectDefinition, SelectField, UnionAllDefinition},
     },
 };
-use dogpaddle_store::{Store, StoreSetup};
+use dogpaddle_store::StoreSetup;
 
 use super::support::{TestStore, run_input, stateless_operation, step_input};
 
@@ -190,8 +190,8 @@ fn filter_trace(
     let schema = predicate_change(&values[..1], &keep[..1], &diffs[..1]).schema();
     let operation = stateless_operation(&FilterDefinition::try_new(col("keep")).unwrap(), schema);
     let fixture = TestStore::new();
-    let store = Store::create(fixture.path()).unwrap();
-    let mut transactions = store.into_transactions();
+    let store = StoreSetup::new();
+    let mut transactions = store.commit(fixture.path(), |_| Ok(())).unwrap();
     let mut output = Vec::new();
     let mut start = 0;
     for &rows in batches {
@@ -234,8 +234,8 @@ fn extend_trace(values: &[u64], diffs: &[i64], batches: &[usize]) -> Vec<(u64, O
         Arc::clone(&schema),
     );
     let fixture = TestStore::new();
-    let store = Store::create(fixture.path()).unwrap();
-    let mut transactions = store.into_transactions();
+    let store = StoreSetup::new();
+    let mut transactions = store.commit(fixture.path(), |_| Ok(())).unwrap();
     let mut output = Vec::new();
     let mut start = 0;
     for &rows in batches {

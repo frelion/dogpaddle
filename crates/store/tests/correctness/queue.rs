@@ -1,6 +1,6 @@
 use std::{borrow::Cow, num::NonZeroU64};
 
-use dogpaddle_store::{Cell, CodecError, Queue, Store, StoreError, StoreValue};
+use dogpaddle_store::{Cell, CodecError, Queue, Store, StoreError, StoreSetup, StoreValue};
 
 use crate::support::store_path;
 
@@ -8,9 +8,9 @@ use crate::support::store_path;
 fn queue_is_fifo_and_survives_reopen() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);
-    let mut store = Store::create(&path).unwrap();
+    let mut store = StoreSetup::new();
     let queue = store.create_data::<Queue<Vec<u8>>>("queue").unwrap();
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(&path, |_| Ok(())).unwrap();
 
     let transaction = transactions.begin();
     let mut queue = queue.access(transaction.access()).unwrap();
@@ -48,9 +48,9 @@ fn queue_is_fifo_and_survives_reopen() {
 #[test]
 fn capacity_is_hard_even_for_an_empty_queue_and_counts_the_private_key() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
+    let mut store = StoreSetup::new();
     let queue = store.create_data::<Queue<Vec<u8>>>("queue").unwrap();
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(store_path(&root), |_| Ok(())).unwrap();
     let value = vec![0; 100];
 
     let transaction = transactions.begin();
@@ -89,10 +89,10 @@ fn capacity_is_hard_even_for_an_empty_queue_and_counts_the_private_key() {
 fn bounded_discard_counts_bytes_and_rolls_back_with_other_state() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);
-    let mut store = Store::create(&path).unwrap();
+    let mut store = StoreSetup::new();
     let queue = store.create_data::<Queue<Vec<u8>>>("queue").unwrap();
     let cell = store.create_data::<Cell<u64>>("cell").unwrap();
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(&path, |_| Ok(())).unwrap();
     let capacity = NonZeroU64::new(40).unwrap();
 
     {
@@ -143,10 +143,10 @@ fn bounded_discard_counts_bytes_and_rolls_back_with_other_state() {
 #[test]
 fn pop_and_other_state_roll_back_together() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
+    let mut store = StoreSetup::new();
     let queue = store.create_data::<Queue<u64>>("queue").unwrap();
     let cell = store.create_data::<Cell<u64>>("cell").unwrap();
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(store_path(&root), |_| Ok(())).unwrap();
 
     let transaction = transactions.begin();
     let mut access = queue.access(transaction.access()).unwrap();
@@ -197,13 +197,21 @@ impl StoreValue for BrokenValue {
 #[test]
 fn codec_failures_poison_and_roll_back_the_whole_transaction() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
-    let raw = store.create_data::<Queue<Vec<u8>>>("queue").unwrap();
-    let broken = store.open_data::<Queue<BrokenValue>>("queue").unwrap();
-    let broken_encode = store
+    let mut store = StoreSetup::new();
+    store.create_data::<Queue<Vec<u8>>>("queue").unwrap();
+
+    store
         .create_data::<Queue<BrokenValue>>("broken_encode")
         .unwrap();
-    let safe = store.create_data::<Cell<u64>>("safe").unwrap();
+    store.create_data::<Cell<u64>>("safe").unwrap();
+    drop(store.commit(store_path(&root), |_| Ok(())).unwrap());
+    let store = Store::open(store_path(&root)).unwrap();
+    let raw = store.open_data::<Queue<Vec<u8>>>("queue").unwrap();
+    let broken_encode = store
+        .open_data::<Queue<BrokenValue>>("broken_encode")
+        .unwrap();
+    let safe = store.open_data::<Cell<u64>>("safe").unwrap();
+    let broken = store.open_data::<Queue<BrokenValue>>("queue").unwrap();
     let mut transactions = store.into_transactions();
 
     let transaction = transactions.begin();
@@ -268,8 +276,10 @@ fn codec_failures_poison_and_roll_back_the_whole_transaction() {
 #[test]
 fn queue_has_its_own_persistent_collection_kind() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
+    let mut store = StoreSetup::new();
     store.create_data::<Queue<Vec<u8>>>("queue").unwrap();
+    drop(store.commit(store_path(&root), |_| Ok(())).unwrap());
+    let store = Store::open(store_path(&root)).unwrap();
 
     assert!(matches!(
         store.open_data::<Cell<Vec<u8>>>("queue"),
@@ -284,9 +294,9 @@ fn queue_has_its_own_persistent_collection_kind() {
 #[test]
 fn bounded_front_checks_length_before_removal_and_allows_same_transaction_retry() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
+    let mut store = StoreSetup::new();
     let queue = store.create_data::<Queue<Vec<u8>>>("queue").unwrap();
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(store_path(&root), |_| Ok(())).unwrap();
     let txn = transactions.begin();
     let mut access = queue.access(txn.access()).unwrap();
     assert!(
@@ -310,9 +320,9 @@ fn bounded_front_checks_length_before_removal_and_allows_same_transaction_retry(
 fn read_front_is_bounded_and_keeps_its_snapshot_across_consumption() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);
-    let mut store = Store::create(&path).unwrap();
+    let mut store = StoreSetup::new();
     let queue = store.create_data::<Queue<Vec<u8>>>("queue").unwrap();
-    let (mut writes, reads) = store.into_transactions().split();
+    let (mut writes, reads) = store.commit(&path, |_| Ok(())).unwrap().split();
     let capacity = NonZeroU64::new(100).unwrap();
     {
         let transaction = writes.begin();
@@ -387,8 +397,12 @@ fn read_front_is_bounded_and_keeps_its_snapshot_across_consumption() {
 #[test]
 fn read_front_codec_failure_poisons_only_its_snapshot() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
-    let queue = store.create_data::<Queue<Vec<u8>>>("queue").unwrap();
+    let mut store = StoreSetup::new();
+    store.create_data::<Queue<Vec<u8>>>("queue").unwrap();
+
+    drop(store.commit(store_path(&root), |_| Ok(())).unwrap());
+    let store = Store::open(store_path(&root)).unwrap();
+    let queue = store.open_data::<Queue<Vec<u8>>>("queue").unwrap();
     let broken = store.open_data::<Queue<BrokenValue>>("queue").unwrap();
     let (mut writes, reads) = store.into_transactions().split();
     {

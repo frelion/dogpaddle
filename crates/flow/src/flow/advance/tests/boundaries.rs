@@ -1,3 +1,5 @@
+use dogpaddle_store::StoreSetup;
+
 use super::*;
 
 #[test]
@@ -299,8 +301,11 @@ fn a_rejected_commit_fail_stops_all_future_source_and_stack_work() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
     let mut flow = counted_flow(&path);
-    let mut foreign = Store::create(root.path().join("foreign")).unwrap();
+    let mut foreign = StoreSetup::new();
     let foreign_cell: Cell<u64> = foreign.create_data("control").unwrap();
+    let _foreign_transactions = foreign
+        .commit(root.path().join("foreign"), |_| Ok(()))
+        .unwrap();
     {
         let mut batch = flow.transactions.durability_batch();
         let transaction = batch.begin();

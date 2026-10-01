@@ -15,7 +15,7 @@ use dogpaddle_operation::{
         transform::{SelectDefinition, SelectSchemaError},
     },
 };
-use dogpaddle_store::Store;
+use dogpaddle_store::{Store, StoreSetup};
 
 use super::super::support::{
     TestStore, assert_literal_definition, change, change_with_field_name, construct_checked,
@@ -60,8 +60,8 @@ fn literal_definition_reconstructs_ordered_fields_binding_and_runtime() {
     let input = Change::try_new(records, Int64Array::from(vec![1, -1, 2])).unwrap();
     let operation = stateless_operation(&decoded, Arc::clone(&schema));
     let root = TestStore::new();
-    let store = Store::create(root.path()).unwrap();
-    let mut transactions = store.into_transactions();
+    let store = StoreSetup::new();
+    let mut transactions = store.commit(root.path(), |_| Ok(())).unwrap();
     let Some(selected) = run_input(&operation, step_input(&input), &mut transactions).unwrap()
     else {
         panic!("decoded Select did not emit its expected fields");
@@ -232,8 +232,8 @@ fn runtime_rejects_invalid_ports() {
         input.schema(),
     );
     let root = TestStore::new();
-    let store = Store::create(root.path()).unwrap();
-    let mut transactions = store.into_transactions();
+    let store = StoreSetup::new();
+    let mut transactions = store.commit(root.path(), |_| Ok(())).unwrap();
     let error = rollback_input(
         &operation,
         OperationInput {
@@ -269,8 +269,8 @@ fn select_evaluates_ordered_expressions_and_shares_direct_columns_and_diffs() {
             .unwrap();
     let operation = stateless_operation(&definition, Arc::clone(&schema));
     let fixture = TestStore::new();
-    let store = Store::create(fixture.path()).unwrap();
-    let mut transactions = store.into_transactions();
+    let store = StoreSetup::new();
+    let mut transactions = store.commit(fixture.path(), |_| Ok(())).unwrap();
     let Some(output) = run_input(&operation, step_input(&input), &mut transactions).unwrap() else {
         panic!("Select did not complete with one output Change");
     };
@@ -299,8 +299,8 @@ fn empty_select_preserves_input_row_count_and_diffs_and_rejects_schema_drift() {
     let definition = SelectDefinition::try_new(std::iter::empty::<(&str, Expr)>()).unwrap();
     let operation = stateless_operation(&definition, input.schema());
     let fixture = TestStore::new();
-    let store = Store::create(fixture.path()).unwrap();
-    let mut transactions = store.into_transactions();
+    let store = StoreSetup::new();
+    let mut transactions = store.commit(fixture.path(), |_| Ok(())).unwrap();
     let Some(output) = run_input(&operation, step_input(&input), &mut transactions).unwrap() else {
         panic!("empty Select did not complete with one output Change");
     };
@@ -328,7 +328,9 @@ fn projection_reports_the_failing_field_after_checking_the_complete_schema() {
         SelectDefinition::try_new([("first", col("input")), ("second", failing)]).unwrap();
     let operation = stateless_operation(&definition, input.schema());
     let fixture = TestStore::new();
-    let mut transactions = Store::create(fixture.path()).unwrap().into_transactions();
+    let mut transactions = StoreSetup::new()
+        .commit(fixture.path(), |_| Ok(()))
+        .unwrap();
     let drifted = change_with_field_name("other", &[1, -1]);
     let error = rollback_input(&operation, step_input(&drifted), &mut transactions).unwrap_err();
     assert!(matches!(

@@ -3,7 +3,7 @@ use std::path::Path;
 use dogpaddle_change::{Change, SchemaBoundChangeCodec};
 use dogpaddle_flow::FlowFactory;
 use dogpaddle_operation::operation::{scan::SequenceScanDefinition, sink::DiscardDefinition};
-use dogpaddle_store::{Cell, Store};
+use dogpaddle_store::{Cell, Store, StoreSetup};
 
 pub(super) fn encode_output_entry(change: &Change) -> Vec<u8> {
     SchemaBoundChangeCodec::try_new(change.schema())
@@ -36,9 +36,9 @@ pub(super) fn read_published_definition(path: &Path) -> Vec<u8> {
 }
 
 pub(super) fn publish_definition(path: &Path, encoded: &[u8]) {
-    let mut store = Store::create(path).unwrap();
+    let mut store = StoreSetup::new();
     let definition: Cell<Vec<u8>> = store.create_data("flow/definition").unwrap();
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(path, |_| Ok(())).unwrap();
     let transaction = transactions.begin();
     definition
         .access(transaction.access())

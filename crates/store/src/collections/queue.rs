@@ -446,15 +446,15 @@ impl<T> Clone for Queue<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Cell, Store};
+    use crate::{Cell, StoreSetup};
 
     #[test]
     fn oversized_metadata_rejects_before_copy_and_poisons_prior_writes() {
         let root = tempfile::tempdir().unwrap();
-        let mut store = Store::create(root.path().join("store")).unwrap();
+        let mut store = StoreSetup::new();
         let queue = store.create_data::<Queue<Vec<u8>>>("queue").unwrap();
         let safe = store.create_data::<Cell<u64>>("safe").unwrap();
-        let mut transactions = store.into_transactions();
+        let mut transactions = store.commit(root.path().join("store"), |_| Ok(())).unwrap();
         {
             let transaction = transactions.begin();
             queue
@@ -489,10 +489,10 @@ mod tests {
     #[test]
     fn persisted_empty_metadata_poisons_and_rolls_back_other_writes() {
         let root = tempfile::tempdir().unwrap();
-        let mut store = Store::create(root.path().join("store")).unwrap();
+        let mut store = StoreSetup::new();
         let queue = store.create_data::<Queue<Vec<u8>>>("queue").unwrap();
         let safe = store.create_data::<Cell<u64>>("safe").unwrap();
-        let mut transactions = store.into_transactions();
+        let mut transactions = store.commit(root.path().join("store"), |_| Ok(())).unwrap();
 
         let transaction = transactions.begin();
         queue
@@ -534,10 +534,10 @@ mod tests {
     #[test]
     fn discard_rejects_missing_next_entry_and_rolls_back_erase() {
         let root = tempfile::tempdir().unwrap();
-        let mut store = Store::create(root.path().join("store")).unwrap();
+        let mut store = StoreSetup::new();
         let queue = store.create_data::<Queue<Vec<u8>>>("queue").unwrap();
         let safe = store.create_data::<Cell<u64>>("safe").unwrap();
-        let mut transactions = store.into_transactions();
+        let mut transactions = store.commit(root.path().join("store"), |_| Ok(())).unwrap();
         let capacity = NonZeroU64::new(100).unwrap();
 
         let transaction = transactions.begin();
@@ -606,9 +606,9 @@ mod tests {
     #[test]
     fn discard_rejects_last_entry_with_extra_namespace_data() {
         let root = tempfile::tempdir().unwrap();
-        let mut store = Store::create(root.path().join("store")).unwrap();
+        let mut store = StoreSetup::new();
         let queue = store.create_data::<Queue<Vec<u8>>>("queue").unwrap();
-        let mut transactions = store.into_transactions();
+        let mut transactions = store.commit(root.path().join("store"), |_| Ok(())).unwrap();
 
         let transaction = transactions.begin();
         assert!(
@@ -660,10 +660,10 @@ mod tests {
     #[test]
     fn missing_persisted_entry_poisons_and_rolls_back_other_writes() {
         let root = tempfile::tempdir().unwrap();
-        let mut store = Store::create(root.path().join("store")).unwrap();
+        let mut store = StoreSetup::new();
         let queue = store.create_data::<Queue<Vec<u8>>>("queue").unwrap();
         let safe = store.create_data::<Cell<u64>>("safe").unwrap();
-        let mut transactions = store.into_transactions();
+        let mut transactions = store.commit(root.path().join("store"), |_| Ok(())).unwrap();
 
         let transaction = transactions.begin();
         assert!(

@@ -1,10 +1,10 @@
 use std::borrow::Cow;
 
-use dogpaddle_store::{Cell, CodecError, Store, StoreError, StoreValue};
+use dogpaddle_store::{Cell, CodecError, Store, StoreError, StoreSetup, StoreValue};
 
 use crate::support::{TestValue, store_path};
 
-fn create_cell<T: StoreValue>(store: &mut Store, name: &str) -> Result<Cell<T>, StoreError> {
+fn create_cell<T: StoreValue>(store: &mut StoreSetup, name: &str) -> Result<Cell<T>, StoreError> {
     store.create_data(name)
 }
 
@@ -16,9 +16,9 @@ fn open_cell<T: StoreValue>(store: &Store, name: &str) -> Result<Cell<T>, StoreE
 fn cell_state_transitions_and_custom_codec_survive_reopen() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);
-    let mut store = Store::create(&path).unwrap();
+    let mut store = StoreSetup::new();
     let cell = create_cell::<TestValue>(&mut store, "cell").unwrap();
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(&path, |_| Ok(())).unwrap();
 
     let transaction = transactions.begin();
     let mut access = cell.access(transaction.access()).unwrap();
@@ -72,9 +72,9 @@ impl StoreValue for OwnershipObservedValue {
 #[test]
 fn point_decoding_borrows_pinned_bytes_and_returns_an_owned_value() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
+    let mut store = StoreSetup::new();
     let cell = create_cell::<OwnershipObservedValue>(&mut store, "cell").unwrap();
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(store_path(&root), |_| Ok(())).unwrap();
 
     let transaction = transactions.begin();
     let mut access = cell.access(transaction.access()).unwrap();
@@ -95,9 +95,9 @@ fn point_decoding_borrows_pinned_bytes_and_returns_an_owned_value() {
 #[test]
 fn byte_cell_bounded_read_is_retryable_in_the_same_transaction() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
+    let mut store = StoreSetup::new();
     let cell = create_cell::<Vec<u8>>(&mut store, "cell").unwrap();
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(store_path(&root), |_| Ok(())).unwrap();
 
     {
         let transaction = transactions.begin();
@@ -134,10 +134,10 @@ impl StoreValue for BrokenValue {
 #[test]
 fn encoding_failure_poison_rolls_back_prior_writes() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
+    let mut store = StoreSetup::new();
     let safe = create_cell::<u64>(&mut store, "safe").unwrap();
     let broken = create_cell::<BrokenValue>(&mut store, "broken").unwrap();
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(store_path(&root), |_| Ok(())).unwrap();
 
     let transaction = transactions.begin();
     safe.access(transaction.access()).unwrap().set(&99).unwrap();
@@ -163,9 +163,18 @@ fn encoding_failure_poison_rolls_back_prior_writes() {
 #[test]
 fn decoding_failure_poison_rolls_back_prior_writes() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
-    let safe = create_cell::<u64>(&mut store, "safe").unwrap();
-    let broken_data = create_cell::<Vec<u8>>(&mut store, "broken").unwrap();
+    let mut store = StoreSetup::new();
+    create_cell::<u64>(&mut store, "safe").unwrap();
+    create_cell::<Vec<u8>>(&mut store, "broken").unwrap();
+
+    drop(store.commit(store_path(&root), |_| Ok(())).unwrap());
+    let store = Store::open(store_path(&root)).unwrap();
+    let safe = store
+        .open_data::<dogpaddle_store::Cell<u64>>("safe")
+        .unwrap();
+    let broken_data = store
+        .open_data::<dogpaddle_store::Cell<Vec<u8>>>("broken")
+        .unwrap();
     let broken = open_cell::<BrokenValue>(&store, "broken").unwrap();
     let mut transactions = store.into_transactions();
 
@@ -206,9 +215,9 @@ fn decoding_failure_poison_rolls_back_prior_writes() {
 #[test]
 fn typed_bounded_cell_reads_check_fixed_width_and_allow_retry() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
+    let mut store = StoreSetup::new();
     let cell = create_cell::<u64>(&mut store, "cell").unwrap();
-    let (mut writes, reads) = store.into_transactions().split();
+    let (mut writes, reads) = store.commit(store_path(&root), |_| Ok(())).unwrap().split();
     {
         let transaction = writes.begin();
         let mut access = cell.access(transaction.access()).unwrap();

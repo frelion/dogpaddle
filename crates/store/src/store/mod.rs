@@ -26,16 +26,25 @@ pub struct DataHandle {
     data_id: u32,
 }
 
-/// Owns one durable store during named data object setup.
+/// Owns an existing durable store while binding its declared resources.
 ///
-/// Setup code may create or open data objects and borrow a short-lived
+/// Binding code may open data objects and borrow a short-lived
 /// read-only snapshot with [`Store::read_transaction`]. Entering runtime still
 /// consumes this value with [`Store::into_transactions`].
+///
+/// New resources must be declared with [`StoreSetup`] before the database is
+/// published. Existing catalogs cannot be extended.
+///
+/// ```compile_fail
+/// use dogpaddle_store::{Cell, Store};
+/// fn add_resource(store: &mut Store) {
+///     store.create_data::<Cell<u64>>("new").unwrap();
+/// }
+/// ```
 pub struct Store {
     database: Database,
     token: u64,
     catalog: BTreeMap<String, (u32, DataKind)>,
-    next_data_id: u64,
 }
 
 /// Owns an in-memory draft of a new Store's complete typed resource set.
@@ -63,7 +72,6 @@ pub struct Store {
 pub struct StoreSetup {
     token: u64,
     catalog: BTreeMap<String, (u32, DataKind)>,
-    next_data_id: u64,
 }
 
 /// A short-lived capability for declaring or looking up typed Store data.
@@ -84,8 +92,9 @@ enum DataScopeMode<'owner> {
 
 /// Uniquely owns the runtime capability to begin Store write transactions.
 ///
-/// This value is obtained by consuming [`Store`]. It does not expose the
-/// catalog or allow data objects to be created or opened. The capability is
+/// This value is obtained from [`StoreSetup::commit`] or by consuming an
+/// existing [`Store`]. It does not expose the catalog or allow data objects
+/// to be created or opened. The capability is
 /// intentionally not cloneable, so one runtime coordinator remains the sole
 /// owner of transaction boundaries for this Store. It can be moved between
 /// threads while idle. Its owner may consume it with [`Transactions::split`]

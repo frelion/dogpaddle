@@ -6,7 +6,8 @@ mod scans;
 use std::borrow::Cow;
 
 use dogpaddle_store::{
-    CodecError, OrderedMap, ScanDirection, ScanLimit, Store, StoreError, StoreKey, StoreValue,
+    CodecError, OrderedMap, ScanDirection, ScanLimit, Store, StoreError, StoreKey, StoreSetup,
+    StoreValue,
 };
 
 use crate::support::{TestValue, create_byte_map, create_map, store_path};
@@ -21,9 +22,9 @@ fn open_map<K: StoreKey, V: StoreValue>(
 #[test]
 fn ordered_map_point_operations_are_exact() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
+    let mut store = StoreSetup::new();
     let map = create_map::<u64, String>(&mut store, "map").unwrap();
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(store_path(&root), |_| Ok(())).unwrap();
 
     let transaction = transactions.begin();
     let mut access = map.access(transaction.access()).unwrap();
@@ -46,9 +47,9 @@ fn ordered_map_point_operations_are_exact() {
 fn ordered_map_survives_reopen() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);
-    let mut store = Store::create(&path).unwrap();
+    let mut store = StoreSetup::new();
     let map = create_map::<u64, TestValue>(&mut store, "map").unwrap();
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(&path, |_| Ok(())).unwrap();
     let transaction = transactions.begin();
     map.access(transaction.access())
         .unwrap()
@@ -96,9 +97,9 @@ impl StoreKey for SliceKey {
 #[test]
 fn ordered_map_accepts_external_key_and_value_codecs() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
+    let mut store = StoreSetup::new();
     let map = create_map::<TestKey, TestValue>(&mut store, "map").unwrap();
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(store_path(&root), |_| Ok(())).unwrap();
 
     let transaction = transactions.begin();
     map.access(transaction.access())
@@ -120,9 +121,9 @@ fn ordered_map_accepts_external_key_and_value_codecs() {
 #[test]
 fn slice_backed_key_codecs_support_points_ranges_and_continuations() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
+    let mut store = StoreSetup::new();
     let map = create_map::<SliceKey, u64>(&mut store, "map").unwrap();
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(store_path(&root), |_| Ok(())).unwrap();
 
     let keys = [
         SliceKey(b"a".to_vec()),
@@ -165,10 +166,10 @@ fn slice_backed_key_codecs_support_points_ranges_and_continuations() {
 #[test]
 fn data_objects_isolate_identical_keys() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
+    let mut store = StoreSetup::new();
     let left = create_byte_map(&mut store, "left").unwrap();
     let right = create_byte_map(&mut store, "right").unwrap();
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(store_path(&root), |_| Ok(())).unwrap();
 
     {
         let transaction = transactions.begin();
@@ -200,9 +201,9 @@ fn data_objects_isolate_identical_keys() {
 fn bounded_point_read_checks_value_length_and_can_retry_without_poisoning() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);
-    let mut store = Store::create(&path).unwrap();
+    let mut store = StoreSetup::new();
     let map = create_map::<u64, Vec<u8>>(&mut store, "map").unwrap();
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(&path, |_| Ok(())).unwrap();
     {
         let transaction = transactions.begin();
         let mut access = map.access(transaction.access()).unwrap();
@@ -233,9 +234,9 @@ fn bounded_point_read_checks_value_length_and_can_retry_without_poisoning() {
 #[test]
 fn non_clone_keys_continue_owned_pages_in_both_directions() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
+    let mut store = StoreSetup::new();
     let map = create_map::<TestKey, u64>(&mut store, "map").unwrap();
-    let (mut writes, reads) = store.into_transactions().split();
+    let (mut writes, reads) = store.commit(store_path(&root), |_| Ok(())).unwrap().split();
     {
         let transaction = writes.begin();
         let mut access = map.access(transaction.access()).unwrap();

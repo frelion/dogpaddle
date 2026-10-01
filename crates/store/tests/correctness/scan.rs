@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, ops::Bound};
 
-use dogpaddle_store::{OrderedMapAccess, ScanDirection, ScanLimit, Store, StoreError};
+use dogpaddle_store::{OrderedMapAccess, ScanDirection, ScanLimit, StoreError, StoreSetup};
 
 use crate::support::{create_map, store_path};
 
@@ -94,9 +94,9 @@ fn every_range_direction_and_page_size_matches_a_btree_model() {
         .collect::<BTreeMap<_, _>>();
 
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
+    let mut store = StoreSetup::new();
     let map = create_map::<i64, String>(&mut store, "map").unwrap();
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(store_path(&root), |_| Ok(())).unwrap();
     {
         let transaction = transactions.begin();
         let mut access = map.access(transaction.access()).unwrap();
@@ -127,9 +127,9 @@ fn every_range_direction_and_page_size_matches_a_btree_model() {
 #[test]
 fn byte_limits_and_continuations_are_exact() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
+    let mut store = StoreSetup::new();
     let map = create_map::<i64, String>(&mut store, "map").unwrap();
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(store_path(&root), |_| Ok(())).unwrap();
     {
         let transaction = transactions.begin();
         let mut access = map.access(transaction.access()).unwrap();
@@ -178,9 +178,9 @@ fn byte_limits_and_continuations_are_exact() {
 #[test]
 fn continuation_outside_the_range_returns_no_items() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
+    let mut store = StoreSetup::new();
     let map = create_map::<i64, i64>(&mut store, "map").unwrap();
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(store_path(&root), |_| Ok(())).unwrap();
     {
         let transaction = transactions.begin();
         let mut access = map.access(transaction.access()).unwrap();
@@ -213,10 +213,10 @@ fn continuation_outside_the_range_returns_no_items() {
 #[test]
 fn an_exact_page_stops_at_the_neighboring_namespace() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
+    let mut store = StoreSetup::new();
     let first = create_map::<i64, i64>(&mut store, "first").unwrap();
     let second = create_map::<i64, i64>(&mut store, "second").unwrap();
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(store_path(&root), |_| Ok(())).unwrap();
     {
         let transaction = transactions.begin();
         first

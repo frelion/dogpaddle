@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
 use dogpaddle_store::{
-    CodecError, ScanDirection, ScanLimit, Store, StoreError, StoreKey, StoreValue,
+    CodecError, ScanDirection, ScanLimit, Store, StoreError, StoreKey, StoreSetup, StoreValue,
 };
 
 use crate::support::{create_map, store_path};
@@ -34,10 +34,10 @@ impl StoreValue for BrokenKey {
 #[test]
 fn key_codec_errors_poison_the_transaction() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
+    let mut store = StoreSetup::new();
     let safe = create_map::<u64, u64>(&mut store, "safe").unwrap();
     let broken = create_map::<BrokenKey, BrokenKey>(&mut store, "broken").unwrap();
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(store_path(&root), |_| Ok(())).unwrap();
 
     let transaction = transactions.begin();
     safe.access(transaction.access())
@@ -64,10 +64,19 @@ fn key_codec_errors_poison_the_transaction() {
 fn failed_page_decode_poisons_and_rolls_back_prior_writes() {
     for write_in_scan_transaction in [false, true] {
         let root = tempfile::tempdir().unwrap();
-        let mut store = Store::create(store_path(&root)).unwrap();
-        let raw = create_map::<u64, Vec<u8>>(&mut store, "map").unwrap();
+        let mut store = StoreSetup::new();
+        create_map::<u64, Vec<u8>>(&mut store, "map").unwrap();
+
+        create_map::<u64, u64>(&mut store, "marker").unwrap();
+        drop(store.commit(store_path(&root), |_| Ok(())).unwrap());
+        let store = Store::open(store_path(&root)).unwrap();
+        let raw = store
+            .open_data::<dogpaddle_store::OrderedMap<u64, Vec<u8>>>("map")
+            .unwrap();
+        let marker = store
+            .open_data::<dogpaddle_store::OrderedMap<u64, u64>>("marker")
+            .unwrap();
         let typed = open_map::<u64, u64>(&store, "map").unwrap();
-        let marker = create_map::<u64, u64>(&mut store, "marker").unwrap();
         let mut writes = store.into_transactions();
         if !write_in_scan_transaction {
             let transaction = writes.begin();
@@ -136,8 +145,14 @@ impl StoreKey for UndecodableKey {
 #[test]
 fn a_later_malformed_key_discards_the_whole_page_and_poisons() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
-    let raw = create_map::<u64, u64>(&mut store, "map").unwrap();
+    let mut store = StoreSetup::new();
+    create_map::<u64, u64>(&mut store, "map").unwrap();
+
+    drop(store.commit(store_path(&root), |_| Ok(())).unwrap());
+    let store = Store::open(store_path(&root)).unwrap();
+    let raw = store
+        .open_data::<dogpaddle_store::OrderedMap<u64, u64>>("map")
+        .unwrap();
     let malformed = open_map::<UndecodableKey, u64>(&store, "map").unwrap();
     let mut transactions = store.into_transactions();
     {
@@ -166,8 +181,14 @@ fn a_later_malformed_key_discards_the_whole_page_and_poisons() {
 #[test]
 fn admission_precedes_value_decode_for_points_and_later_scan_entries() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
-    let raw = create_map::<u64, Vec<u8>>(&mut store, "map").unwrap();
+    let mut store = StoreSetup::new();
+    create_map::<u64, Vec<u8>>(&mut store, "map").unwrap();
+
+    drop(store.commit(store_path(&root), |_| Ok(())).unwrap());
+    let store = Store::open(store_path(&root)).unwrap();
+    let raw = store
+        .open_data::<dogpaddle_store::OrderedMap<u64, Vec<u8>>>("map")
+        .unwrap();
     let typed = open_map::<u64, u64>(&store, "map").unwrap();
     let (mut writes, reads) = store.into_transactions().split();
     {

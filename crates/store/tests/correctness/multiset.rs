@@ -1,4 +1,6 @@
-use dogpaddle_store::{OrderedMap, PartitionKey, ScanDirection, ScanLimit, Store, StoreError};
+use dogpaddle_store::{
+    OrderedMap, PartitionKey, ScanDirection, ScanLimit, Store, StoreError, StoreSetup,
+};
 use std::num::NonZeroU64;
 
 use crate::support::store_path;
@@ -7,11 +9,11 @@ use crate::support::store_path;
 fn ordered_multiset_adjusts_exactly_and_survives_reopen() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);
-    let mut store = Store::create(&path).unwrap();
+    let mut store = StoreSetup::new();
     let multiset = store
         .create_data::<OrderedMap<Vec<u8>, NonZeroU64>>("values")
         .unwrap();
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(&path, |_| Ok(())).unwrap();
     let absent = b"absent".to_vec();
     let retained = b"retained".to_vec();
     let removed = b"removed".to_vec();
@@ -52,11 +54,11 @@ fn ordered_multiset_adjusts_exactly_and_survives_reopen() {
 fn ordered_multiset_replaces_a_full_u64_weight_and_removes_zero() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);
-    let mut store = Store::create(&path).unwrap();
+    let mut store = StoreSetup::new();
     let multiset = store
         .create_data::<OrderedMap<Vec<u8>, NonZeroU64>>("values")
         .unwrap();
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(&path, |_| Ok(())).unwrap();
     let key = b"row".to_vec();
 
     {
@@ -101,11 +103,11 @@ fn ordered_multiset_replaces_a_full_u64_weight_and_removes_zero() {
 #[test]
 fn invalid_multiplicity_adjustments_poison_and_roll_back_the_transaction() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
+    let mut store = StoreSetup::new();
     let multiset = store
         .create_data::<OrderedMap<Vec<u8>, NonZeroU64>>("values")
         .unwrap();
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(store_path(&root), |_| Ok(())).unwrap();
     let maximum = b"maximum".to_vec();
     let prior = b"prior".to_vec();
 
@@ -162,11 +164,11 @@ fn invalid_multiplicity_adjustments_poison_and_roll_back_the_transaction() {
 fn partitioned_multiset_orders_binary_keys_and_survives_reopen() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);
-    let mut store = Store::create(&path).unwrap();
+    let mut store = StoreSetup::new();
     let multiset = store
         .create_data::<OrderedMap<PartitionKey<Vec<u8>, Vec<u8>>, NonZeroU64>>("values")
         .unwrap();
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(&path, |_| Ok(())).unwrap();
     let partition_key = b"a".to_vec();
     let keys = [
         Vec::new(),
@@ -246,11 +248,11 @@ fn partitioned_multiset_orders_binary_keys_and_survives_reopen() {
 fn partitioned_multiset_replaces_weight_without_changing_other_partitions() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);
-    let mut store = Store::create(&path).unwrap();
+    let mut store = StoreSetup::new();
     let multiset = store
         .create_data::<OrderedMap<PartitionKey<Vec<u8>, Vec<u8>>, NonZeroU64>>("values")
         .unwrap();
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(&path, |_| Ok(())).unwrap();
     let first = b"first".to_vec();
     let second = b"second".to_vec();
     let key = b"key".to_vec();
@@ -335,14 +337,15 @@ fn partitioned_multiset_replaces_weight_without_changing_other_partitions() {
 fn empty_partition_has_no_bounds_or_scan_entries_across_reopen() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);
-    let mut store = Store::create(&path).unwrap();
+    let mut store = StoreSetup::new();
     let multiset = store
         .create_data::<OrderedMap<PartitionKey<Vec<u8>, Vec<u8>>, NonZeroU64>>("values")
         .unwrap();
     let empty_partition = Vec::new();
+    let (_, reads) = store.commit(&path, |_| Ok(())).unwrap().split();
 
     {
-        let transaction = store.read_transaction();
+        let transaction = reads.begin();
         let values = multiset.read(transaction.access()).unwrap();
         let empty = values.partition(&empty_partition).unwrap();
         assert_eq!(empty.first_bounded(usize::MAX).unwrap(), None);
@@ -359,7 +362,7 @@ fn empty_partition_has_no_bounds_or_scan_entries_across_reopen() {
                 .is_empty()
         );
     }
-    drop(store);
+    drop(reads);
 
     let store = Store::open(path).unwrap();
     let multiset = store
@@ -380,11 +383,11 @@ fn empty_partition_has_no_bounds_or_scan_entries_across_reopen() {
 #[test]
 fn partitioned_multiset_pages_resume_in_both_directions() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
+    let mut store = StoreSetup::new();
     let multiset = store
         .create_data::<OrderedMap<PartitionKey<Vec<u8>, Vec<u8>>, NonZeroU64>>("values")
         .unwrap();
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(store_path(&root), |_| Ok(())).unwrap();
     let partition_key = b"partition".to_vec();
     let keys = (0_u8..5).map(|key| vec![key]).collect::<Vec<_>>();
 
@@ -426,11 +429,11 @@ fn partitioned_multiset_pages_resume_in_both_directions() {
 #[test]
 fn partitioned_multiset_byte_limit_can_be_retried() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
+    let mut store = StoreSetup::new();
     let multiset = store
         .create_data::<OrderedMap<PartitionKey<Vec<u8>, Vec<u8>>, NonZeroU64>>("values")
         .unwrap();
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(store_path(&root), |_| Ok(())).unwrap();
     let partition_key = b"partition".to_vec();
     let key = vec![7; 128];
 
@@ -462,11 +465,11 @@ fn partitioned_multiset_byte_limit_can_be_retried() {
 #[test]
 fn wide_partition_scan_charges_framed_keys_and_resumes_on_owned_row_keys() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
+    let mut store = StoreSetup::new();
     let multiset = store
         .create_data::<OrderedMap<PartitionKey<Vec<u8>, Vec<u8>>, NonZeroU64>>("values")
         .unwrap();
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(store_path(&root), |_| Ok(())).unwrap();
     let partition_key = vec![0x11; 256];
     let adjacent_partition = vec![0x12; 256];
     let keys = [vec![0x31; 8 * 1024], vec![0x32; 8 * 1024]];
@@ -544,11 +547,11 @@ fn wide_partition_scan_charges_framed_keys_and_resumes_on_owned_row_keys() {
 fn partitioned_multiset_isolates_framed_partition_keys_across_reopen() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);
-    let mut store = Store::create(&path).unwrap();
+    let mut store = StoreSetup::new();
     let multiset = store
         .create_data::<OrderedMap<PartitionKey<Vec<u8>, Vec<u8>>, NonZeroU64>>("values")
         .unwrap();
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(&path, |_| Ok(())).unwrap();
     let first_partition = b"a".to_vec();
     let adjacent_partition = b"a\0".to_vec();
     let prefix_partition = b"ab".to_vec();
@@ -611,14 +614,14 @@ fn partitioned_multiset_isolates_framed_partition_keys_across_reopen() {
 fn weights_and_partitions_use_the_ordered_map_catalog_kind() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);
-    let mut store = Store::create(&path).unwrap();
+    let mut store = StoreSetup::new();
     store
         .create_data::<OrderedMap<Vec<u8>, NonZeroU64>>("ordered")
         .unwrap();
     store
         .create_data::<OrderedMap<PartitionKey<Vec<u8>, Vec<u8>>, NonZeroU64>>("partitioned")
         .unwrap();
-    drop(store);
+    drop(store.commit(&path, |_| Ok(())).unwrap());
     let store = Store::open(path).unwrap();
     assert!(
         store
@@ -636,11 +639,11 @@ fn weights_and_partitions_use_the_ordered_map_catalog_kind() {
 fn bounded_partition_endpoints_admit_framed_bytes_and_retry_after_reopen() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);
-    let mut store = Store::create(&path).unwrap();
+    let mut store = StoreSetup::new();
     let values = store
         .create_data::<OrderedMap<PartitionKey<Vec<u8>, Vec<u8>>, NonZeroU64>>("values")
         .unwrap();
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(&path, |_| Ok(())).unwrap();
     {
         let transaction = transactions.begin();
         let mut access = values.access(transaction.access()).unwrap();
@@ -684,11 +687,11 @@ fn malformed_weight_poisoning_rolls_back_prior_writes_without_copying_oversized_
     for bytes in [vec![0; 8], vec![1; 9], vec![1; 64 * 1024]] {
         let root = tempfile::tempdir().unwrap();
         let path = store_path(&root);
-        let mut store = Store::create(&path).unwrap();
+        let mut store = StoreSetup::new();
         let raw = store
             .create_data::<OrderedMap<Vec<u8>, Vec<u8>>>("weights")
             .unwrap();
-        let mut transactions = store.into_transactions();
+        let mut transactions = store.commit(&path, |_| Ok(())).unwrap();
         let transaction = transactions.begin();
         raw.access(transaction.access())
             .unwrap()
@@ -728,11 +731,11 @@ fn malformed_weight_poisoning_rolls_back_prior_writes_without_copying_oversized_
 #[test]
 fn partition_view_reads_and_writes_generic_values_using_the_same_map() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
+    let mut store = StoreSetup::new();
     let map = store
         .create_data::<OrderedMap<PartitionKey<Vec<u8>, u64>, String>>("map")
         .unwrap();
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(store_path(&root), |_| Ok(())).unwrap();
     let transaction = transactions.begin();
     let mut access = map.access(transaction.access()).unwrap();
     access

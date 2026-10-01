@@ -6,7 +6,7 @@ use dogpaddle_operation::operation::{
     AtomicOperation, BudgetExceeded, Operation, OperationError, OperationInput, Progress, Resume,
     StepBudget,
 };
-use dogpaddle_store::{Cell, Store, StoreValue, TransactionAccess};
+use dogpaddle_store::{Cell, Store, StoreSetup, StoreValue, TransactionAccess};
 
 use super::support::{TestStore, value_schema};
 
@@ -41,10 +41,10 @@ fn input() -> Change {
 #[test]
 fn caller_owned_resume_and_state_rollback_together_and_reopen_between_pages() {
     let root = TestStore::new();
-    let mut store = Store::create(root.path()).unwrap();
+    let mut store = StoreSetup::new();
     let count = store.create_data::<Cell<u64>>("count").unwrap();
     let operation = Operation::Atomic(Box::new(Counter { count }));
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(root.path(), |_| Ok(())).unwrap();
     let input = input();
     let offered = OperationInput {
         port: 0,

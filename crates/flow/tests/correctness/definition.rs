@@ -5,7 +5,7 @@ use dogpaddle_flow::{FlowError, FlowFactory};
 use dogpaddle_operation::operation::{
     scan::SequenceScanDefinition, sink::DiscardDefinition, transform::RunningEventCountDefinition,
 };
-use dogpaddle_store::{Cell, OrderedMap, Queue, Store, StoreError};
+use dogpaddle_store::{Cell, OrderedMap, Queue, Store, StoreError, StoreSetup};
 
 use super::support::{
     build_scan_sink_and_read_definition, fixture_bytes, read_published_definition,
@@ -126,7 +126,7 @@ fn open_classifies_each_required_source_resource_fault() {
 }
 
 fn publish_faulty_resources(path: &Path, definition: &[u8], fault: ResourceFault) {
-    let mut store = Store::create(path).unwrap();
+    let mut store = StoreSetup::new();
     let published: Cell<Vec<u8>> = store.create_data("flow/definition").unwrap();
     match fault {
         ResourceFault::MissingOutput => {}
@@ -146,7 +146,7 @@ fn publish_faulty_resources(path: &Path, definition: &[u8], fault: ResourceFault
             .create_data::<Cell<u64>>("operation/00000000/sequence_scan.position")
             .unwrap();
     }
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(path, |_| Ok(())).unwrap();
     let transaction = transactions.begin();
     published
         .access(transaction.access())
@@ -160,11 +160,11 @@ fn publish_faulty_resources(path: &Path, definition: &[u8], fault: ResourceFault
 fn open_rejects_an_unpublished_build() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
-    let mut store = Store::create(&path).unwrap();
+    let mut store = StoreSetup::new();
     store
         .create_data::<Cell<Vec<u8>>>("flow/definition")
         .unwrap();
-    drop(store);
+    drop(store.commit(&path, |_| Ok(())).unwrap());
     assert!(matches!(
         FlowFactory::new(path).open(),
         Err(FlowError::IncompleteBuild)

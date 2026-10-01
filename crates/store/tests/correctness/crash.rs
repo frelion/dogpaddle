@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dogpaddle_store::{Queue, Store, TransactionAccess};
+use dogpaddle_store::{Queue, Store, StoreSetup, TransactionAccess};
 
 use crate::support::{create_byte_map, open_byte_map, store_path};
 
@@ -17,10 +17,11 @@ const WORKER_SCENARIO: &str = "DOGPADDLE_CRASH_SCENARIO";
 const WORKER_STORE: &str = "DOGPADDLE_CRASH_STORE";
 
 fn prepare(path: &Path) {
-    let mut store = Store::create(path).unwrap();
+    let mut store = StoreSetup::new();
     create_byte_map(&mut store, "first").unwrap();
     create_byte_map(&mut store, "second").unwrap();
     store.create_data::<Queue<Vec<u8>>>("log").unwrap();
+    drop(store.commit(path, |_| Ok(())).unwrap());
 }
 
 fn run_worker(path: &Path, scenario: &str) -> ExitStatus {

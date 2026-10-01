@@ -8,10 +8,10 @@ use crate::support::{ByteMap, create_byte_map, open_byte_map, store_path};
 fn typed_open_rejects_a_different_collection_kind() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);
-    let mut store = Store::create(&path).unwrap();
+    let mut store = StoreSetup::new();
     store.create_data::<Cell<u64>>("cell").unwrap();
     create_byte_map(&mut store, "map").unwrap();
-    drop(store);
+    drop(store.commit(&path, |_| Ok(())).unwrap());
 
     let store = Store::open(path).unwrap();
     assert!(matches!(
@@ -45,7 +45,7 @@ fn creation_requires_an_unused_path_without_deleting_its_contents() {
     fs::write(&keep, "keep").unwrap();
 
     assert!(matches!(
-        Store::create(&path),
+        StoreSetup::new().commit(&path, |_| Ok(())),
         Err(StoreError::PathExists(_))
     ));
     assert_eq!(fs::read_to_string(keep).unwrap(), "keep");
@@ -70,8 +70,7 @@ fn opening_rejects_missing_and_partial_directories() {
 
 #[test]
 fn data_names_are_validated_and_unique_across_collection_kinds() {
-    let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
+    let mut store = StoreSetup::new();
 
     for name in [String::new(), "bad\0name".to_owned(), "x".repeat(256)] {
         assert!(matches!(
@@ -91,11 +90,11 @@ fn data_names_are_validated_and_unique_across_collection_kinds() {
 fn catalog_reopens_named_collections_with_isolated_data() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);
-    let mut store = Store::create(&path).unwrap();
+    let mut store = StoreSetup::new();
     let left = create_byte_map(&mut store, "left").unwrap();
     let right = create_byte_map(&mut store, "right").unwrap();
     let marker = store.create_data::<Cell<u64>>("marker").unwrap();
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(&path, |_| Ok(())).unwrap();
 
     let transaction = transactions.begin();
     left.access(transaction.access())
@@ -321,27 +320,6 @@ fn scoped_names_are_validated_only_when_data_is_requested() {
     assert!(matches!(root.scoped(&prefix).data::<Cell<u64>>("x"),
         Err(StoreError::InvalidName { name, .. }) if name == expected));
     root.data::<Cell<u64>>("valid").unwrap();
-}
-
-#[test]
-fn reopening_after_more_catalog_entries_keeps_existing_bindings() {
-    let root = tempfile::tempdir().unwrap();
-    let path = store_path(&root);
-    let mut store = Store::create(&path).unwrap();
-    create_byte_map(&mut store, "first").unwrap();
-    drop(store);
-
-    let mut store = Store::open(&path).unwrap();
-    create_byte_map(&mut store, "second").unwrap();
-    drop(store);
-
-    let store = Store::open(path).unwrap();
-    store
-        .open_data::<OrderedMap<Vec<u8>, Vec<u8>>>("first")
-        .unwrap();
-    store
-        .open_data::<OrderedMap<Vec<u8>, Vec<u8>>>("second")
-        .unwrap();
 }
 
 #[cfg(unix)]

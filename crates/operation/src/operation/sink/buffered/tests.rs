@@ -5,7 +5,7 @@ use crate::operation::{OperationError, SinkOperation};
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_change::{Change, SchemaBoundChangeCodec};
-use dogpaddle_store::{Cell, OrderedMap, Store};
+use dogpaddle_store::{Cell, OrderedMap, Store, StoreSetup};
 use std::sync::Arc;
 
 struct EndpointTarget;
@@ -195,7 +195,7 @@ fn control_rejects_reversed_offsets_and_empty_head_disagreement() {
 #[test]
 fn recovery_rejects_a_retained_original_entry_that_exceeded_admission_capacity() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(root.path().join("store")).unwrap();
+    let mut store = StoreSetup::new();
     let control = store.create_data::<Cell<Vec<u8>>>(super::CONTROL).unwrap();
     let buffer = store
         .create_data::<OrderedMap<u64, Vec<u8>>>(super::BUFFER)
@@ -212,7 +212,10 @@ fn recovery_rejects_a_retained_original_entry_that_exceeded_admission_capacity()
         tail: 1_048_578,
         retained_bytes: u64::try_from(encoded.len()).unwrap() + 8,
     };
-    let (mut writes, reads) = store.into_transactions().split();
+    let (mut writes, reads) = store
+        .commit(root.path().join("store"), |_| Ok(()))
+        .unwrap()
+        .split();
     {
         let transaction = writes.begin();
         buffer
@@ -259,7 +262,7 @@ fn maximum_control_length_is_the_exact_bounded_negative_id_layout() {
 fn last_event_offset_settles_and_reopens_then_rejects_all_further_events_without_writes() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("store");
-    let mut store = Store::create(&path).unwrap();
+    let mut store = StoreSetup::new();
     let control = store.create_data::<Cell<Vec<u8>>>(super::CONTROL).unwrap();
     let buffer = store
         .create_data::<OrderedMap<u64, Vec<u8>>>(super::BUFFER)
@@ -271,7 +274,7 @@ fn last_event_offset_settles_and_reopens_then_rejects_all_further_events_without
         tail: u64::MAX - 1,
         retained_bytes: 0,
     };
-    let (mut writes, reads) = store.into_transactions().split();
+    let (mut writes, reads) = store.commit(&path, |_| Ok(())).unwrap().split();
     {
         let transaction = writes.begin();
         control

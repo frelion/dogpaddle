@@ -7,7 +7,7 @@ use dogpaddle_operation::{
     OperationBindError, ProjectionError, ScalarValue, col, lit,
     operation::{OperationInput, transform::SelectDefinition},
 };
-use dogpaddle_store::Store;
+use dogpaddle_store::StoreSetup;
 
 use super::support::{
     TestStore, change, change_with_field_name, construct_checked, project_input_schema,
@@ -80,8 +80,8 @@ fn runtime_rejects_invalid_port_and_schema_drift() {
         input.schema(),
     );
     let root = TestStore::new();
-    let store = Store::create(root.path()).unwrap();
-    let mut transactions = store.into_transactions();
+    let store = StoreSetup::new();
+    let mut transactions = store.commit(root.path(), |_| Ok(())).unwrap();
     let error = rollback_input(
         &operation,
         OperationInput {
@@ -127,8 +127,8 @@ fn extend_appends_one_derived_column_and_shares_every_input_buffer() {
         Arc::clone(&schema),
     );
     let fixture = TestStore::new();
-    let store = Store::create(fixture.path()).unwrap();
-    let mut transactions = store.into_transactions();
+    let store = StoreSetup::new();
+    let mut transactions = store.commit(fixture.path(), |_| Ok(())).unwrap();
     let Some(output) = run_input(&operation, step_input(&input), &mut transactions).unwrap() else {
         panic!("Extend did not complete with one output Change");
     };

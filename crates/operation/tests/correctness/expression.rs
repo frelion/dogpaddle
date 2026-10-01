@@ -20,7 +20,7 @@ use dogpaddle_operation::{
     },
     try_cast,
 };
-use dogpaddle_store::Store;
+use dogpaddle_store::StoreSetup;
 
 use super::support::{
     TestStore, construct_checked, project_input_schema, roundtripped_output, run_input,
@@ -520,8 +520,8 @@ fn boolean_expression_operators_follow_complete_kleene_truth_tables() {
     .unwrap();
     let input = Change::try_new(records, Int64Array::from(vec![1; 9])).unwrap();
     let fixture = TestStore::new();
-    let store = Store::create(fixture.path()).unwrap();
-    let mut transactions = store.into_transactions();
+    let store = StoreSetup::new();
+    let mut transactions = store.commit(fixture.path(), |_| Ok(())).unwrap();
     for (name, expression, expected) in kleene_cases() {
         let operation = stateless_operation(
             &SelectDefinition::try_extend(&schema, [(name, expression)]).unwrap(),
@@ -563,8 +563,8 @@ fn equality_operators_cover_representative_scalar_types_and_propagate_null() {
     .unwrap();
     let input = Change::try_new(records, Int64Array::from(vec![1, 1, 1])).unwrap();
     let fixture = TestStore::new();
-    let store = Store::create(fixture.path()).unwrap();
-    let mut transactions = store.into_transactions();
+    let store = StoreSetup::new();
+    let mut transactions = store.commit(fixture.path(), |_| Ok(())).unwrap();
     let operands = [
         ("boolean", ScalarValue::Boolean(Some(true))),
         ("signed", ScalarValue::Int64(Some(-2))),
@@ -650,8 +650,8 @@ fn datafusion_arithmetic_comparison_and_casts_execute_vectorized() {
     .unwrap();
     let input = Change::try_new(records, Int64Array::from(vec![1, -1])).unwrap();
     let fixture = TestStore::new();
-    let store = Store::create(fixture.path()).unwrap();
-    let mut transactions = store.into_transactions();
+    let store = StoreSetup::new();
+    let mut transactions = store.commit(fixture.path(), |_| Ok(())).unwrap();
     let predicate = (cast(col("value"), DataType::Int64) + lit(1_i64)).gt(lit(8_i64));
     let operation = stateless_operation(
         &SelectDefinition::try_extend(&schema, [("greater", predicate)]).unwrap(),

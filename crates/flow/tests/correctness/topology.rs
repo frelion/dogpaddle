@@ -6,7 +6,7 @@ use dogpaddle_flow::{
 use dogpaddle_operation::operation::{
     scan::SequenceScanDefinition, sink::DiscardDefinition, transform::RunningEventCountDefinition,
 };
-use dogpaddle_store::{Cell, Store, StoreError};
+use dogpaddle_store::{Cell, Store, StoreError, StoreSetup};
 
 #[derive(Clone, Copy, Debug)]
 enum InvalidCase {
@@ -112,9 +112,9 @@ fn foreign_scan(root: &Path) -> OperationRef {
 fn build_rejects_an_occupied_path_without_mutating_it() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("flow");
-    let mut store = Store::create(&path).unwrap();
+    let mut store = StoreSetup::new();
     let sentinel: Cell<u64> = store.create_data("sentinel").unwrap();
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(&path, |_| Ok(())).unwrap();
     let transaction = transactions.begin();
     sentinel
         .access(transaction.access())

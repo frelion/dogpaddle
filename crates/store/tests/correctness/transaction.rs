@@ -1,5 +1,5 @@
 use dogpaddle_store::{
-    Cell, ScanDirection, ScanLimit, Store, StoreError, TransactionAccess, Transactions,
+    Cell, ScanDirection, ScanLimit, Store, StoreError, StoreSetup, TransactionAccess, Transactions,
 };
 
 use crate::support::{ByteMap, create_byte_map, open_byte_map, store_path};
@@ -23,10 +23,10 @@ fn setup_snapshot_reads_an_opened_cell_without_consuming_the_store() {
     let path = store_path(&root);
 
     {
-        let mut store = Store::create(&path).unwrap();
+        let mut store = StoreSetup::new();
         let definition = store.create_data::<Cell<u64>>("definition").unwrap();
         let state = store.create_data::<Cell<u64>>("state").unwrap();
-        let mut transactions = store.into_transactions();
+        let mut transactions = store.commit(&path, |_| Ok(())).unwrap();
         let transaction = transactions.begin();
         definition
             .access(transaction.access())
@@ -66,9 +66,9 @@ fn setup_snapshot_reads_an_opened_cell_without_consuming_the_store() {
 #[test]
 fn read_snapshot_coexists_with_the_unique_writer_and_remains_stable() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
+    let mut store = StoreSetup::new();
     let cell = store.create_data::<Cell<u64>>("cell").unwrap();
-    let (mut writes, reads) = store.into_transactions().split();
+    let (mut writes, reads) = store.commit(store_path(&root), |_| Ok(())).unwrap().split();
 
     {
         let transaction = writes.begin();
@@ -111,9 +111,9 @@ fn shared_read_capability_begins_snapshots_on_independent_threads() {
     use std::sync::Barrier;
 
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
+    let mut store = StoreSetup::new();
     let cell = store.create_data::<Cell<u64>>("cell").unwrap();
-    let (mut writes, reads) = store.into_transactions().split();
+    let (mut writes, reads) = store.commit(store_path(&root), |_| Ok(())).unwrap().split();
 
     {
         let transaction = writes.begin();
@@ -146,12 +146,18 @@ fn shared_read_capability_begins_snapshots_on_independent_threads() {
 #[test]
 fn wrong_store_poison_stops_a_read_snapshot() {
     let root = tempfile::tempdir().unwrap();
-    let mut first_store = Store::create(root.path().join("first")).unwrap();
+    let mut first_store = StoreSetup::new();
     let first = first_store.create_data::<Cell<u64>>("cell").unwrap();
-    let (_, first_reads) = first_store.into_transactions().split();
+    let (_, first_reads) = first_store
+        .commit(root.path().join("first"), |_| Ok(()))
+        .unwrap()
+        .split();
 
-    let mut second_store = Store::create(root.path().join("second")).unwrap();
+    let mut second_store = StoreSetup::new();
     let second = second_store.create_data::<Cell<u64>>("cell").unwrap();
+    let _second_transactions = second_store
+        .commit(root.path().join("second"), |_| Ok(()))
+        .unwrap();
 
     let transaction = first_reads.begin();
     let access = transaction.access();
@@ -165,8 +171,14 @@ fn wrong_store_poison_stops_a_read_snapshot() {
 #[test]
 fn read_scan_decode_error_poisons_the_snapshot() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
-    let raw = create_byte_map(&mut store, "data").unwrap();
+    let mut store = StoreSetup::new();
+    create_byte_map(&mut store, "data").unwrap();
+
+    drop(store.commit(store_path(&root), |_| Ok(())).unwrap());
+    let store = Store::open(store_path(&root)).unwrap();
+    let raw = store
+        .open_data::<dogpaddle_store::OrderedMap<Vec<u8>, Vec<u8>>>("data")
+        .unwrap();
     let typed = store
         .open_data::<dogpaddle_store::OrderedMap<Vec<u8>, u64>>("data")
         .unwrap();
@@ -197,8 +209,12 @@ fn read_scan_decode_error_poisons_the_snapshot() {
 #[test]
 fn read_decode_error_poisons_the_snapshot() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
-    let raw = store.create_data::<Cell<Vec<u8>>>("cell").unwrap();
+    let mut store = StoreSetup::new();
+    store.create_data::<Cell<Vec<u8>>>("cell").unwrap();
+
+    drop(store.commit(store_path(&root), |_| Ok(())).unwrap());
+    let store = Store::open(store_path(&root)).unwrap();
+    let raw = store.open_data::<Cell<Vec<u8>>>("cell").unwrap();
     let typed = store.open_data::<Cell<u64>>("cell").unwrap();
     let (mut writes, reads) = store.into_transactions().split();
 
@@ -227,10 +243,10 @@ fn read_decode_error_poisons_the_snapshot() {
 fn commit_and_drop_are_atomic_across_collections() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);
-    let mut store = Store::create(&path).unwrap();
+    let mut store = StoreSetup::new();
     let first = create_byte_map(&mut store, "first").unwrap();
     let second = create_byte_map(&mut store, "second").unwrap();
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(&path, |_| Ok(())).unwrap();
 
     {
         let transaction = transactions.begin();
@@ -290,9 +306,9 @@ fn commit_and_drop_are_atomic_across_collections() {
 fn durability_batch_tracks_write_commits_and_shares_one_explicit_barrier() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);
-    let mut store = Store::create(&path).unwrap();
+    let mut store = StoreSetup::new();
     let cell = store.create_data::<Cell<u64>>("cell").unwrap();
-    let (mut writes, reads) = store.into_transactions().split();
+    let (mut writes, reads) = store.commit(&path, |_| Ok(())).unwrap().split();
 
     let mut batch = writes.durability_batch();
     batch.begin().commit().unwrap();
@@ -339,12 +355,17 @@ fn durability_batch_tracks_write_commits_and_shares_one_explicit_barrier() {
 #[test]
 fn wrong_store_poison_rolls_back_prior_writes() {
     let root = tempfile::tempdir().unwrap();
-    let mut first_store = Store::create(root.path().join("first")).unwrap();
+    let mut first_store = StoreSetup::new();
     let first = create_byte_map(&mut first_store, "data").unwrap();
-    let mut first_transactions = first_store.into_transactions();
+    let mut first_transactions = first_store
+        .commit(root.path().join("first"), |_| Ok(()))
+        .unwrap();
 
-    let mut second_store = Store::create(root.path().join("second")).unwrap();
+    let mut second_store = StoreSetup::new();
     let second = create_byte_map(&mut second_store, "data").unwrap();
+    let _second_transactions = second_store
+        .commit(root.path().join("second"), |_| Ok(()))
+        .unwrap();
 
     let transaction = first_transactions.begin();
     let access = transaction.access();
@@ -377,9 +398,9 @@ fn wrong_store_poison_rolls_back_prior_writes() {
 fn data_objects_from_a_previous_open_are_rejected() {
     let root = tempfile::tempdir().unwrap();
     let path = store_path(&root);
-    let mut store = Store::create(&path).unwrap();
+    let mut store = StoreSetup::new();
     let stale = create_byte_map(&mut store, "data").unwrap();
-    drop(store);
+    drop(store.commit(&path, |_| Ok(())).unwrap());
 
     let store = Store::open(&path).unwrap();
     let current = open_byte_map(&store, "data").unwrap();
@@ -398,9 +419,9 @@ fn data_objects_from_a_previous_open_are_rejected() {
 #[test]
 fn scan_admission_errors_are_soft() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
+    let mut store = StoreSetup::new();
     let data = create_byte_map(&mut store, "data").unwrap();
-    let mut transactions = store.into_transactions();
+    let mut transactions = store.commit(store_path(&root), |_| Ok(())).unwrap();
 
     let transaction = transactions.begin();
     data.access(transaction.access())
@@ -441,9 +462,9 @@ fn unique_transaction_capability_can_move_to_another_thread() {
     require_send::<Transactions>();
 
     let root = tempfile::tempdir().unwrap();
-    let mut store = Store::create(store_path(&root)).unwrap();
+    let mut store = StoreSetup::new();
     let data = create_byte_map(&mut store, "data").unwrap();
-    let transactions = store.into_transactions();
+    let transactions = store.commit(store_path(&root), |_| Ok(())).unwrap();
 
     let (mut transactions, data) = std::thread::spawn(move || {
         let mut transactions = transactions;

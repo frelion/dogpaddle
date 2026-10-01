@@ -14,7 +14,7 @@ use dogpaddle_operation::{
         },
     },
 };
-use dogpaddle_store::Store;
+use dogpaddle_store::StoreSetup;
 
 use super::support::{TestStore, stateless_operation};
 
@@ -87,8 +87,8 @@ fn atomic_runtime_applies_a_complete_change_directly() {
     };
 
     let fixture = TestStore::new();
-    let store = Store::create(fixture.path()).unwrap();
-    let mut transactions = store.into_transactions();
+    let store = StoreSetup::new();
+    let mut transactions = store.commit(fixture.path(), |_| Ok(())).unwrap();
     let transaction = transactions.begin();
     let output = AtomicOperation::apply(
         operation.as_ref(),
