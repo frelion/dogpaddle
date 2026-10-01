@@ -1,27 +1,18 @@
-use std::{collections::HashMap, io::Cursor, ops::Range, sync::Arc};
+use std::{ops::Range, sync::Arc};
 
 use arrow_array::{
     ArrayRef, BinaryArray, Date32Array, Decimal128Array, Int64Array, ListArray, RecordBatch,
     StringArray, StructArray, TimestampNanosecondArray, UInt64Array, types::Int64Type,
 };
 use arrow_ipc::{
-    BodyCompression, BodyCompressionArgs, Buffer as IpcBuffer, Endianness, FieldNode,
-    Message as IpcMessage, MessageArgs, MessageHeader, MetadataVersion,
-    RecordBatch as IpcRecordBatch, RecordBatchArgs, Schema as IpcSchema, SchemaArgs,
-    reader::StreamReader,
-    writer::{IpcWriteOptions, StreamWriter},
+    BodyCompression, BodyCompressionArgs, Buffer as IpcBuffer, FieldNode, Message as IpcMessage,
+    MessageArgs, MessageHeader, MetadataVersion, RecordBatch as IpcRecordBatch, RecordBatchArgs,
 };
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema};
 use flatbuffers::FlatBufferBuilder;
 
-use super::{
-    super::{CodecError, batch::BatchLayout, decode_change, decode_change_projected, stream},
-    DECODE_PANIC_MESSAGE,
-};
-use crate::{Change, ChangeProjection};
-
-pub(super) const KIND_KEY: &str = "dogpaddle.kind";
-pub(super) const VERSION_KEY: &str = "dogpaddle.change.version";
+use super::super::{CodecError, SchemaBoundChangeCodec, stream};
+use crate::Change;
 
 pub(super) fn simple_change(diffs: &[i64]) -> Change {
     let values = (0..u64::try_from(diffs.len()).unwrap()).collect::<Vec<_>>();
@@ -87,49 +78,6 @@ pub(super) fn extended_fixed_width_change() -> Change {
     Change::try_new(records, Int64Array::from(vec![1, -1])).unwrap()
 }
 
-pub(super) fn assert_change_eq(actual: &Change, expected: &Change) {
-    assert_eq!(actual.records(), expected.records());
-    assert_eq!(actual.diffs(), expected.diffs());
-}
-
-pub(super) fn marked_metadata() -> HashMap<String, String> {
-    HashMap::from([
-        (KIND_KEY.to_owned(), "change".to_owned()),
-        (VERSION_KEY.to_owned(), "1".to_owned()),
-    ])
-}
-
-pub(super) fn unit_physical_schema(metadata: HashMap<String, String>) -> SchemaRef {
-    Arc::new(Schema::new_with_metadata(
-        vec![Field::new("$dogpaddle.diff", DataType::Int64, false)],
-        metadata,
-    ))
-}
-
-pub(super) fn unit_physical_batch(schema: SchemaRef, diffs: Int64Array) -> RecordBatch {
-    RecordBatch::try_new(schema, vec![Arc::new(diffs)]).unwrap()
-}
-
-pub(super) fn encode_stream(schema: &Schema, batches: &[RecordBatch]) -> Vec<u8> {
-    encode_stream_with_options(
-        schema,
-        batches,
-        IpcWriteOptions::try_new(8, false, MetadataVersion::V5).unwrap(),
-    )
-}
-
-pub(super) fn encode_stream_with_options(
-    schema: &Schema,
-    batches: &[RecordBatch],
-    options: IpcWriteOptions,
-) -> Vec<u8> {
-    let mut writer = StreamWriter::try_new_with_options(Vec::new(), schema, options).unwrap();
-    for batch in batches {
-        writer.write(batch).unwrap();
-    }
-    writer.into_inner().unwrap()
-}
-
 pub(super) fn frame_ipc_message(metadata: &[u8], body: &[u8]) -> Vec<u8> {
     let metadata_len = metadata.len().next_multiple_of(8);
     let mut framed = Vec::with_capacity(8 + metadata_len + body.len());
@@ -142,8 +90,7 @@ pub(super) fn frame_ipc_message(metadata: &[u8], body: &[u8]) -> Vec<u8> {
 }
 
 pub(super) fn replace_batch_message(encoded: &[u8], metadata: &[u8], body: &[u8]) -> Vec<u8> {
-    let reader = StreamReader::try_new(Cursor::new(encoded), None).unwrap();
-    let batch_offset = usize::try_from(reader.get_ref().position()).unwrap();
+    let batch_offset = 40;
     let mut replaced = encoded[..batch_offset].to_vec();
     replaced.extend_from_slice(&frame_ipc_message(metadata, body));
     replaced.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0]);
@@ -203,49 +150,94 @@ pub(super) fn ipc_batch_metadata(
     builder.finished_data().to_vec()
 }
 
-pub(super) fn big_endian_schema_stream() -> Vec<u8> {
-    let mut builder = FlatBufferBuilder::new();
-    let fields = builder.create_vector::<flatbuffers::WIPOffset<arrow_ipc::Field<'_>>>(&[]);
-    let schema = IpcSchema::create(
-        &mut builder,
-        &SchemaArgs {
-            endianness: Endianness::Big,
-            fields: Some(fields),
-            ..SchemaArgs::default()
-        },
-    );
-    let message = IpcMessage::create(
-        &mut builder,
-        &MessageArgs {
-            version: MetadataVersion::V5,
-            header_type: MessageHeader::Schema,
-            header: Some(schema.as_union_value()),
-            ..MessageArgs::default()
-        },
-    );
-    builder.finish(message, None);
-    let mut encoded = frame_ipc_message(builder.finished_data(), &[]);
-    encoded.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0]);
-    encoded
+pub(super) struct FieldLayout {
+    pub(super) nodes: Range<usize>,
+    pub(super) buffers: Range<usize>,
 }
 
-pub(super) fn parsed_layout(encoded: &[u8]) -> (stream::ParsedChange<'_>, BatchLayout) {
-    let parsed = stream::parse(encoded).unwrap();
-    let layout = BatchLayout::parse(&parsed).unwrap();
-    (parsed, layout)
+pub(super) struct TestLayout {
+    pub(super) nodes: Vec<FieldNode>,
+    pub(super) buffers: Vec<Range<usize>>,
+    fields: Vec<FieldLayout>,
+}
+
+// Only locates fixture fields for corruption; it deliberately does not validate them.
+fn layout_counts(data_type: &DataType) -> (usize, usize) {
+    match data_type {
+        DataType::Null => (1, 0),
+        DataType::Utf8 | DataType::Binary => (1, 3),
+        DataType::List(child) => {
+            let (nodes, buffers) = layout_counts(child.data_type());
+            (nodes + 1, buffers + 2)
+        }
+        DataType::Struct(children) => children.iter().fold((1, 1), |(nodes, buffers), field| {
+            let child = layout_counts(field.data_type());
+            (nodes + child.0, buffers + child.1)
+        }),
+        _ => (1, 2),
+    }
+}
+
+pub(super) fn parsed_layout<'a>(
+    encoded: &'a [u8],
+    codec: &SchemaBoundChangeCodec,
+) -> (stream::ParsedChange<'a>, TestLayout) {
+    let schema = codec.schema();
+    let parsed =
+        stream::parse_record_batch(encoded, 40, stream::physical_schema(&schema), schema).unwrap();
+    let mut cursor = (0, 0);
+    let fields = parsed
+        .physical_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let counts = layout_counts(field.data_type());
+            let field = FieldLayout {
+                nodes: cursor.0..cursor.0 + counts.0,
+                buffers: cursor.1..cursor.1 + counts.1,
+            };
+            cursor.0 += counts.0;
+            cursor.1 += counts.1;
+            field
+        })
+        .collect();
+    let nodes = parsed.batch.nodes().unwrap().iter().copied().collect();
+    let buffers = parsed
+        .batch
+        .buffers()
+        .unwrap()
+        .iter()
+        .map(|buffer| {
+            let start = usize::try_from(buffer.offset()).unwrap();
+            start..start + usize::try_from(buffer.length()).unwrap()
+        })
+        .collect();
+    (
+        parsed,
+        TestLayout {
+            nodes,
+            buffers,
+            fields,
+        },
+    )
 }
 
 pub(super) fn field_layout<'layout>(
     parsed: &stream::ParsedChange<'_>,
-    layout: &'layout BatchLayout,
+    layout: &'layout TestLayout,
     name: &str,
-) -> &'layout super::super::batch::FieldLayout {
+) -> &'layout FieldLayout {
     let index = parsed.physical_schema.index_of(name).unwrap();
     &layout.fields[index]
 }
 
-pub(super) fn field_buffer_range(encoded: &[u8], name: &str, own_buffer: usize) -> Range<usize> {
-    let (parsed, layout) = parsed_layout(encoded);
+pub(super) fn field_buffer_range(
+    encoded: &[u8],
+    codec: &SchemaBoundChangeCodec,
+    name: &str,
+    own_buffer: usize,
+) -> Range<usize> {
+    let (parsed, layout) = parsed_layout(encoded, codec);
     let field = field_layout(&parsed, &layout, name);
     let relative = layout.buffers[field.buffers.start + own_buffer].clone();
     let body_start = parsed.body.as_ptr() as usize - encoded.as_ptr() as usize;
@@ -254,14 +246,15 @@ pub(super) fn field_buffer_range(encoded: &[u8], name: &str, own_buffer: usize) 
 
 pub(super) fn corrupt_layout(
     encoded: &[u8],
+    codec: &SchemaBoundChangeCodec,
     edit: impl FnOnce(
         &stream::ParsedChange<'_>,
-        &BatchLayout,
+        &TestLayout,
         &mut [FieldNode],
         &mut [IpcBuffer],
     ) -> usize,
 ) -> Vec<u8> {
-    let (parsed, layout) = parsed_layout(encoded);
+    let (parsed, layout) = parsed_layout(encoded, codec);
     let mut nodes = layout.nodes.clone();
     let mut buffers = parsed
         .batch
@@ -280,9 +273,9 @@ pub(super) fn corrupt_layout(
     )
 }
 
-pub(super) fn assert_both_invalid_encoding(encoded: &[u8], projection: &ChangeProjection) {
-    assert_invalid_encoding_without_decoder_panic(decode_change(encoded));
-    assert_invalid_encoding_without_decoder_panic(decode_change_projected(encoded, projection));
+pub(super) fn assert_both_invalid_encoding(encoded: &[u8], codec: &SchemaBoundChangeCodec) {
+    assert_invalid_encoding_without_decoder_panic(codec.decode(encoded));
+    assert_invalid_encoding_without_decoder_panic(codec.decode_owned(encoded.to_vec()));
 }
 
 pub(super) fn assert_arrow_error(result: &Result<Change, CodecError>) {
@@ -295,7 +288,10 @@ pub(super) fn assert_arrow_error(result: &Result<Change, CodecError>) {
 pub(super) fn assert_invalid_encoding_without_decoder_panic(result: Result<Change, CodecError>) {
     match result {
         Err(CodecError::InvalidEncoding { message }) => {
-            assert_ne!(message, DECODE_PANIC_MESSAGE, "decoder panic was caught");
+            assert_ne!(
+                message, "Arrow IPC decoding panicked",
+                "decoder panic was caught"
+            );
         }
         other => panic!("expected InvalidEncoding, found {other:?}"),
     }

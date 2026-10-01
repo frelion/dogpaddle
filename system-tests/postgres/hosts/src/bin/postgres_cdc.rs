@@ -14,7 +14,7 @@ use std::{
 };
 
 use arrow_array::{Int32Array, Int64Array, StringArray};
-use dogpaddle_change::{SchemaBoundChangeCodec, decode_change, encode_change};
+use dogpaddle_change::SchemaBoundChangeCodec;
 use dogpaddle_flow::{Flow, FlowFactory};
 use dogpaddle_operation::{
     RuntimeResource, decode_definition, encode_definition,
@@ -314,7 +314,7 @@ impl DirectScan {
                 .unwrap_or(0);
             self.output
                 .access(transaction.access())?
-                .put(&tail, &encode_change(&change)?)?;
+                .put(&tail, &self.codec.encode(&change)?)?;
             self.output_tail
                 .access(transaction.access())?
                 .set(&tail.checked_add(1).ok_or("gate output tail exhausted")?)?;
@@ -375,7 +375,7 @@ impl DirectScan {
             return Err("gate output exceeded the bounded diagnostic scan".into());
         }
         for (_, encoded) in page.entries {
-            let change = decode_change(&encoded)?;
+            let change = self.codec.decode(&encoded)?;
             let columns = change.records().columns();
             let ids = columns[0]
                 .as_any()

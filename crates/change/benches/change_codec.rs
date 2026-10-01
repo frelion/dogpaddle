@@ -7,10 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dogpaddle_change::{
-    Change, ChangeProjection, SchemaBoundChangeCodec, decode_change, decode_change_projected,
-    encode_change,
-};
+use dogpaddle_change::{Change, SchemaBoundChangeCodec};
 use dogpaddle_perf_context::{HostEnvironment, PerformanceProfile, RunRoot, require_release_build};
 use serde_json::{Value, json};
 
@@ -22,15 +19,7 @@ const BENCHMARK: &str = "change_codec";
 const RECORD_SCHEMA: &str = "dogpaddle.change-codec.v1";
 const SMOKE_ROWS: &[usize] = &[4];
 const REFERENCE_ROWS: &[usize] = &[1, 64, 1_024, 16_384];
-const SCENARIOS: &[&str] = &[
-    "encode",
-    "encode_schema_bound",
-    "decode_full",
-    "decode_full_schema_bound",
-    "decode_diff_only",
-    "decode_narrow",
-    "decode_identity",
-];
+const SCENARIOS: &[&str] = &["encode_schema_bound", "decode_full_schema_bound"];
 
 struct Config {
     rows: &'static [usize],
@@ -71,11 +60,8 @@ impl Config {
 
 #[derive(Clone, Copy)]
 enum CodecMode<'fixture> {
-    Encode(&'fixture Change),
     EncodeSchemaBound(&'fixture SchemaBoundChangeCodec, &'fixture Change),
-    DecodeFull(&'fixture [u8]),
     DecodeFullSchemaBound(&'fixture SchemaBoundChangeCodec, &'fixture [u8]),
-    DecodeProjected(&'fixture [u8], &'fixture ChangeProjection),
 }
 
 struct CodecCase<'fixture> {
@@ -93,16 +79,11 @@ struct Timed {
 impl CodecMode<'_> {
     fn measure(self, iterations: usize) -> Timed {
         match self {
-            Self::Encode(change) => measure_encode(change, iterations),
             Self::EncodeSchemaBound(codec, change) => {
                 measure_encode_schema_bound(codec, change, iterations)
             }
-            Self::DecodeFull(encoded) => measure_decode(encoded, iterations),
             Self::DecodeFullSchemaBound(codec, encoded) => {
                 measure_decode_schema_bound(codec, encoded, iterations)
-            }
-            Self::DecodeProjected(encoded, projection) => {
-                measure_decode_projected(encoded, projection, iterations)
             }
         }
     }
@@ -138,7 +119,7 @@ fn main() {
                 "execution": "single_thread",
                 "cache": "warm",
                 "validation": "outside_timing",
-                "sample_order": "seven_way_rotating_first",
+                "sample_order": "two_way_rotating_first",
             },
         }),
     );
@@ -173,38 +154,18 @@ fn main() {
 fn benchmark_fixture(config: &Config, fixture: &Fixture, output: &mut impl Write) -> usize {
     let rows = fixture.change.num_rows();
     let iterations = config.iterations(rows);
-    let encoded = encode_change(&fixture.change).expect("encode valid benchmark fixture");
     let schema = fixture.change.schema();
     let bound_codec = SchemaBoundChangeCodec::try_new(Arc::clone(&schema))
         .expect("bind valid benchmark fixture Schema");
     let bound_encoded = bound_codec
         .encode(&fixture.change)
         .expect("encode valid schema-bound benchmark fixture");
-    let saved_bytes = encoded
-        .len()
-        .checked_sub(bound_encoded.len())
-        .expect("schema-bound fixture encoding is no larger than its self-contained encoding");
-    let saved_basis_points = saved_bytes
-        .checked_mul(10_000)
-        .expect("benchmark encoded byte ratio fits usize")
-        / encoded.len();
-    let diff_only = ChangeProjection::try_new(Arc::clone(&schema), [])
-        .expect("construct diff-only benchmark projection");
-    let narrow =
-        ChangeProjection::try_new(Arc::clone(&schema), fixture.narrow_fields.iter().copied())
-            .expect("construct narrow benchmark projection");
-    let identity = ChangeProjection::try_new(Arc::clone(&schema), 0..schema.fields().len())
-        .expect("construct identity benchmark projection");
-
-    validate_fixture(
-        fixture,
-        &encoded,
-        &bound_codec,
-        &bound_encoded,
-        &diff_only,
-        &narrow,
-        &identity,
-    );
+    let decoded = bound_codec
+        .decode(&bound_encoded)
+        .expect("decode valid benchmark fixture");
+    assert_eq!(decoded.records(), fixture.change.records());
+    assert_eq!(decoded.diffs(), fixture.change.diffs());
+    drop(decoded);
     emit(
         output,
         &json!({
@@ -213,22 +174,13 @@ fn benchmark_fixture(config: &Config, fixture: &Fixture, output: &mut impl Write
             "workload": fixture.name,
             "rows_per_change": rows,
             "operations_per_measurement": iterations,
-            "self_contained_bytes_per_change": encoded.len(),
             "schema_bound_bytes_per_change": bound_encoded.len(),
-            "schema_bound_saved_bytes_per_change": saved_bytes,
-            "schema_bound_saved_basis_points": saved_basis_points,
-            "narrow_fields": fixture.narrow_fields,
         }),
     );
 
     let modes = [
-        CodecMode::Encode(&fixture.change),
         CodecMode::EncodeSchemaBound(&bound_codec, &fixture.change),
-        CodecMode::DecodeFull(&encoded),
         CodecMode::DecodeFullSchemaBound(&bound_codec, &bound_encoded),
-        CodecMode::DecodeProjected(&encoded, &diff_only),
-        CodecMode::DecodeProjected(&encoded, &narrow),
-        CodecMode::DecodeProjected(&encoded, &identity),
     ];
     let cases = SCENARIOS
         .iter()
@@ -276,43 +228,6 @@ fn benchmark_fixture(config: &Config, fixture: &Fixture, output: &mut impl Write
     config.samples
 }
 
-fn validate_fixture(
-    fixture: &Fixture,
-    encoded: &[u8],
-    bound_codec: &SchemaBoundChangeCodec,
-    bound_encoded: &[u8],
-    diff_only: &ChangeProjection,
-    narrow: &ChangeProjection,
-    identity: &ChangeProjection,
-) {
-    let decoded = decode_change(encoded).expect("decode valid benchmark fixture");
-    assert_eq!(decoded.records(), fixture.change.records());
-    assert_eq!(decoded.diffs(), fixture.change.diffs());
-    let decoded = bound_codec
-        .decode(bound_encoded)
-        .expect("decode valid schema-bound benchmark fixture");
-    assert_eq!(decoded.records(), fixture.change.records());
-    assert_eq!(decoded.diffs(), fixture.change.diffs());
-    for projection in [diff_only, narrow, identity] {
-        let decoded = decode_change_projected(encoded, projection)
-            .expect("selectively decode valid benchmark fixture");
-        let expected = fixture
-            .change
-            .try_project(projection)
-            .expect("project valid benchmark fixture");
-        assert_eq!(decoded.records(), expected.records());
-        assert_eq!(decoded.diffs(), expected.diffs());
-    }
-}
-
-fn measure_encode(change: &Change, iterations: usize) -> Timed {
-    timed(iterations, || {
-        let encoded = encode_change(black_box(change)).expect("encode valid benchmark Change");
-        black_box(encoded.as_slice());
-        u64::try_from(encoded.len()).expect("encoded length fits in u64")
-    })
-}
-
 fn measure_encode_schema_bound(
     codec: &SchemaBoundChangeCodec,
     change: &Change,
@@ -327,14 +242,6 @@ fn measure_encode_schema_bound(
     })
 }
 
-fn measure_decode(encoded: &[u8], iterations: usize) -> Timed {
-    timed(iterations, || {
-        let decoded = decode_change(black_box(encoded)).expect("decode valid benchmark Change");
-        black_box(decoded.records());
-        decoded_checksum(&decoded)
-    })
-}
-
 fn measure_decode_schema_bound(
     codec: &SchemaBoundChangeCodec,
     encoded: &[u8],
@@ -344,19 +251,6 @@ fn measure_decode_schema_bound(
         let decoded = codec
             .decode(black_box(encoded))
             .expect("decode valid schema-bound benchmark Change");
-        black_box(decoded.records());
-        decoded_checksum(&decoded)
-    })
-}
-
-fn measure_decode_projected(
-    encoded: &[u8],
-    projection: &ChangeProjection,
-    iterations: usize,
-) -> Timed {
-    timed(iterations, || {
-        let decoded = decode_change_projected(black_box(encoded), projection)
-            .expect("selectively decode valid benchmark Change");
         black_box(decoded.records());
         decoded_checksum(&decoded)
     })

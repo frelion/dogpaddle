@@ -137,7 +137,7 @@ impl SchemaBoundChangeCodec {
         ensure_little_endian_target()?;
         catch_unwind(AssertUnwindSafe(|| {
             let parsed = self.parse(encoded)?;
-            batch::decode(&parsed, None)
+            batch::decode(&parsed)
         }))
         .map_err(|_| CodecError::invalid("Arrow IPC decoding panicked"))?
     }

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io::Cursor, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
@@ -8,16 +8,14 @@ use arrow_array::{
     UInt16Array, UInt32Array, UInt64Array, new_null_array, types::Date32Type,
 };
 use arrow_buffer::NullBuffer;
-use arrow_ipc::{
-    MetadataVersion,
-    reader::StreamReader,
-    writer::{IpcWriteOptions, StreamWriter},
+use arrow_ipc::MetadataVersion;
+use arrow_ipc::writer::{
+    DictionaryTracker, IpcDataGenerator, IpcWriteContext, IpcWriteOptions, write_message,
 };
 use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_change::{
     Change, ChangeError, ChangeProjection, CodecError, MAX_NESTING_DEPTH, MAX_SCHEMA_FIELDS,
-    MAX_SCHEMA_METADATA_ENTRIES, MAX_SCHEMA_TEXT_BYTES, SchemaBoundChangeCodec, decode_change,
-    decode_change_owned, decode_change_projected, encode_change, encode_change_bounded,
+    MAX_SCHEMA_METADATA_ENTRIES, MAX_SCHEMA_TEXT_BYTES, SchemaBoundChangeCodec,
 };
 
 use super::support::{assert_change_eq, fixture_hex, hex, representative_change};
@@ -77,49 +75,7 @@ fn temporal_decimal_change() -> Change {
 }
 
 #[test]
-fn complete_round_trip_preserves_order_and_is_a_standard_marked_arrow_stream() {
-    let change = representative_change();
-    let encoded = encode_change(&change).unwrap();
-    assert_eq!(
-        encode_change_bounded(&change, encoded.len()).unwrap(),
-        encoded
-    );
-    assert!(matches!(
-        encode_change_bounded(&change, encoded.len() - 1),
-        Err(CodecError::EncodedSizeLimitExceeded { max_bytes })
-            if max_bytes == encoded.len() - 1
-    ));
-    assert_change_eq(&decode_change(&encoded).unwrap(), &change);
-    assert_change_eq(&decode_change_owned(encoded.clone()).unwrap(), &change);
-
-    let mut reader = StreamReader::try_new(Cursor::new(&encoded), None).unwrap();
-    let schema = reader.schema();
-    assert_eq!(schema.field(0).name(), "$dogpaddle.diff");
-    assert_eq!(schema.field(0).data_type(), &DataType::Int64);
-    assert!(!schema.field(0).is_nullable());
-    assert_eq!(
-        schema.metadata().get(KIND_KEY).map(String::as_str),
-        Some("change")
-    );
-    assert_eq!(
-        schema.metadata().get(VERSION_KEY).map(String::as_str),
-        Some("1")
-    );
-    let physical = reader.next().unwrap().unwrap();
-    assert_eq!(physical.num_columns(), change.records().num_columns() + 1);
-    assert_eq!(
-        physical
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap(),
-        change.diffs()
-    );
-    assert!(reader.next().is_none());
-}
-
-#[test]
-fn schema_bound_round_trip_omits_the_repeated_schema_and_keeps_a_stable_entry() {
+fn schema_bound_round_trip_keeps_a_stable_entry() {
     let options = RecordBatchOptions::new().with_row_count(Some(1));
     let records =
         RecordBatch::try_new_with_options(Arc::new(Schema::empty()), vec![], &options).unwrap();
@@ -127,7 +83,6 @@ fn schema_bound_round_trip_omits_the_repeated_schema_and_keeps_a_stable_entry() 
     let codec = SchemaBoundChangeCodec::try_new(change.schema()).unwrap();
 
     let encoded = codec.encode(&change).unwrap();
-    assert!(encoded.len() < encode_change(&change).unwrap().len());
     assert_eq!(
         codec.encode_bounded(&change, encoded.len()).unwrap(),
         encoded
@@ -187,6 +142,55 @@ fn schema_bound_codec_rejects_schema_drift_with_the_same_physical_layout() {
         renamed_codec.decode(&encoded),
         Err(CodecError::SchemaMismatch)
     ));
+}
+
+#[test]
+fn bound_fingerprint_covers_nullability_and_nested_metadata() {
+    let child = Field::new("child", DataType::UInt64, true);
+    let field = Field::new("object", DataType::Struct(vec![child.clone()].into()), true);
+    let schema = Arc::new(Schema::new(vec![field.clone()]));
+    let change = Change::try_new(
+        RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![new_null_array(field.data_type(), 1)],
+        )
+        .unwrap(),
+        Int64Array::from(vec![1]),
+    )
+    .unwrap();
+    let codec = SchemaBoundChangeCodec::try_new(schema).unwrap();
+    let encoded = codec.encode(&change).unwrap();
+    let metadata = HashMap::from([("meaning".to_owned(), "changed".to_owned())]);
+    let drifted = [
+        Schema::new(vec![field.clone().with_nullable(false)]),
+        Schema::new(vec![field.clone().with_metadata(metadata.clone())]),
+        Schema::new(vec![field.clone()]).with_metadata(metadata.clone()),
+        Schema::new(vec![Field::new(
+            "object",
+            DataType::Struct(vec![child.clone().with_metadata(metadata)].into()),
+            true,
+        )]),
+        Schema::new(vec![Field::new(
+            "object",
+            DataType::Struct(vec![child.with_nullable(false)].into()),
+            true,
+        )]),
+    ];
+    for schema in drifted {
+        let other = SchemaBoundChangeCodec::try_new(Arc::new(schema)).unwrap();
+        assert!(matches!(
+            other.decode(&encoded),
+            Err(CodecError::SchemaMismatch)
+        ));
+        assert!(matches!(
+            other.decode_owned(encoded.clone()),
+            Err(CodecError::SchemaMismatch)
+        ));
+        assert!(matches!(
+            other.encode(&change),
+            Err(CodecError::SchemaMismatch)
+        ));
+    }
 }
 
 #[test]
@@ -256,7 +260,7 @@ fn schema_bound_owned_decode_reuses_an_aligned_primitive_entry_allocation() {
 }
 
 #[test]
-fn bounded_encoder_reports_schema_header_overflow_as_a_size_limit() {
+fn bounded_encoder_reports_prefix_overflow_as_a_size_limit() {
     let schema = Arc::new(Schema::new(vec![Field::new(
         "nothing",
         DataType::Null,
@@ -264,9 +268,10 @@ fn bounded_encoder_reports_schema_header_overflow_as_a_size_limit() {
     )]));
     let records = RecordBatch::try_new(schema, vec![new_null_array(&DataType::Null, 1)]).unwrap();
     let change = Change::try_new(records, Int64Array::from(vec![1])).unwrap();
+    let codec = SchemaBoundChangeCodec::try_new(change.schema()).unwrap();
     for max_bytes in [16, 32] {
         assert!(matches!(
-            encode_change_bounded(&change, max_bytes),
+            codec.encode_bounded(&change, max_bytes),
             Err(CodecError::EncodedSizeLimitExceeded { max_bytes: actual }) if actual == max_bytes
         ));
     }
@@ -285,10 +290,13 @@ fn non_nullable_null_type_round_trips_as_an_always_null_column() {
     )
     .unwrap();
     let change = Change::try_new(records, Int64Array::from(vec![1, -1])).unwrap();
-    let encoded = encode_change(&change).unwrap();
+    let codec = SchemaBoundChangeCodec::try_new(change.schema()).unwrap();
+    let encoded = codec.encode(&change).unwrap();
 
-    let decoded = decode_change(&encoded).unwrap();
-    let bounded = decode_change(&encode_change_bounded(&change, encoded.len()).unwrap()).unwrap();
+    let decoded = codec.decode(&encoded).unwrap();
+    let bounded = codec
+        .decode(&codec.encode_bounded(&change, encoded.len()).unwrap())
+        .unwrap();
 
     assert_change_eq(&decoded, &change);
     assert_change_eq(&bounded, &change);
@@ -307,9 +315,10 @@ fn bounded_encoder_accounts_for_synthesized_validity_buffers() {
     let records =
         RecordBatch::try_new(schema, vec![Arc::new(BooleanArray::from(vec![true; rows]))]).unwrap();
     let change = Change::try_new(records, Int64Array::from(vec![1; rows])).unwrap();
-    let encoded = encode_change(&change).unwrap();
+    let codec = SchemaBoundChangeCodec::try_new(change.schema()).unwrap();
+    let encoded = codec.encode(&change).unwrap();
     assert_eq!(
-        encode_change_bounded(&change, encoded.len()).unwrap(),
+        codec.encode_bounded(&change, encoded.len()).unwrap(),
         encoded
     );
 }
@@ -324,7 +333,8 @@ fn maximum_schema_text_round_trips_at_the_public_boundary() {
     )]));
     let records = RecordBatch::try_new(schema, vec![new_null_array(&DataType::Null, 1)]).unwrap();
     let change = Change::try_new(records, Int64Array::from(vec![1])).unwrap();
-    let decoded = decode_change(&encode_change(&change).unwrap()).unwrap();
+    let codec = SchemaBoundChangeCodec::try_new(change.schema()).unwrap();
+    let decoded = codec.decode(&codec.encode(&change).unwrap()).unwrap();
     assert_eq!(decoded.records().schema_ref().field(0).name(), &field_name);
 }
 
@@ -343,7 +353,8 @@ fn maximum_schema_field_and_metadata_counts_round_trip_together() {
     )
     .unwrap();
     let change = Change::try_new(records, Int64Array::from(vec![1])).unwrap();
-    let decoded = decode_change(&encode_change(&change).unwrap()).unwrap();
+    let codec = SchemaBoundChangeCodec::try_new(change.schema()).unwrap();
+    let decoded = codec.decode(&codec.encode(&change).unwrap()).unwrap();
     assert_eq!(decoded.records().num_columns(), MAX_SCHEMA_FIELDS);
     assert_eq!(
         decoded.records().schema_ref().metadata().len(),
@@ -352,89 +363,38 @@ fn maximum_schema_field_and_metadata_counts_round_trip_together() {
 }
 
 #[test]
-fn owned_decode_reuses_an_aligned_primitive_ipc_allocation() {
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "value",
-        DataType::UInt64,
-        false,
-    )]));
-    let records =
-        RecordBatch::try_new(schema, vec![Arc::new(UInt64Array::from(vec![7, 11, 13]))]).unwrap();
-    let change = Change::try_new(records, Int64Array::from(vec![1, -1, 1])).unwrap();
-    let encoded = encode_change(&change).unwrap();
-    let allocation = encoded.as_ptr() as usize..encoded.as_ptr() as usize + encoded.len();
-
-    // An IPC body is eight-byte aligned relative to the allocation. A platform
-    // allocator may legally return a less-aligned Vec<u8>; Arrow's decoder
-    // copies only in that fallback case.
-    if allocation.start.is_multiple_of(align_of::<u64>()) {
-        let decoded = decode_change_owned(encoded).unwrap();
-        let values = decoded.records().column(0).to_data();
-        let values = &values.buffers()[0];
-        let values_range = values.as_ptr() as usize..values.as_ptr() as usize + values.len();
-        assert!(allocation.start <= values_range.start);
-        assert!(values_range.end <= allocation.end);
-    }
-}
-
-#[test]
-fn zero_column_change_stream_has_stable_golden_bytes() {
-    let options = RecordBatchOptions::new().with_row_count(Some(1));
-    let records =
-        RecordBatch::try_new_with_options(Arc::new(Schema::empty()), vec![], &options).unwrap();
-    let change = Change::try_new(records, Int64Array::from(vec![-1])).unwrap();
-    let expected = fixture_hex(include_str!("../fixtures/v1/zero_columns.hex"));
-
-    let encoded = encode_change(&change).unwrap();
-    assert_eq!(hex(&encoded), expected);
-}
-
-#[test]
-fn sliced_representative_change_stream_has_stable_golden_bytes() {
+fn sliced_representative_change_round_trips_with_owned_buffers() {
     let source = representative_change();
     let change = source.try_slice(1, 2).unwrap();
-    let expected = fixture_hex(include_str!(
-        "../fixtures/v1/sliced_representative_change.hex"
-    ));
-
-    let encoded = encode_change(&change).unwrap();
-    assert_eq!(hex(&encoded), expected);
+    let codec = SchemaBoundChangeCodec::try_new(change.schema()).unwrap();
+    let encoded = codec.encode(&change).unwrap();
+    assert_eq!(
+        hex(&encoded[40..]),
+        fixture_hex(include_str!(
+            "../fixtures/v1/sliced_representative_batch.hex"
+        ))
+    );
+    assert_change_eq(&codec.decode(&encoded).unwrap(), &change);
+    assert_change_eq(&codec.decode_owned(encoded).unwrap(), &change);
 }
 
 #[test]
-fn temporal_and_decimal_stream_has_stable_bytes_and_standard_arrow_interop() {
+fn temporal_and_decimal_types_round_trip_with_exact_values() {
     let change = temporal_decimal_change();
-    let encoded = encode_change(&change).unwrap();
-    let expected = fixture_hex(include_str!(
-        "../fixtures/v1/temporal_and_decimal_change.hex"
-    ));
-    assert_eq!(hex(&encoded), expected);
-    assert_change_eq(&decode_change(&encoded).unwrap(), &change);
-
-    for selection in [
-        vec![],
-        vec![0],
-        vec![1, 2, 3, 4],
-        vec![5, 6],
-        (0..7).collect(),
-    ] {
-        let projection = ChangeProjection::try_new(change.schema(), selection).unwrap();
-        assert_change_eq(
-            &decode_change_projected(&encoded, &projection).unwrap(),
-            &change.try_project(&projection).unwrap(),
-        );
-    }
-
-    let mut reader = StreamReader::try_new(Cursor::new(&encoded), None).unwrap();
-    let physical = reader.next().unwrap().unwrap();
-    for (index, expected) in change.records().columns().iter().enumerate() {
-        assert_eq!(physical.column(index + 1).to_data(), expected.to_data());
-    }
-    assert!(reader.next().is_none());
+    let codec = SchemaBoundChangeCodec::try_new(change.schema()).unwrap();
+    let encoded = codec.encode(&change).unwrap();
+    assert_eq!(
+        hex(&encoded[40..]),
+        fixture_hex(include_str!(
+            "../fixtures/v1/temporal_and_decimal_batch.hex"
+        ))
+    );
+    assert_change_eq(&codec.decode(&encoded).unwrap(), &change);
+    assert_change_eq(&codec.decode_owned(encoded).unwrap(), &change);
 }
 
 #[test]
-fn decimal128_value_overflow_is_rejected_by_full_and_selected_but_not_unselected_decode() {
+fn decimal128_value_overflow_is_rejected_by_borrowed_and_owned_decode() {
     let amount = Field::new("amount", DataType::Decimal128(2, -1), true);
     let tail = Field::new("tail", DataType::UInt64, false);
     let logical_schema = Arc::new(Schema::new(vec![amount.clone(), tail.clone()]));
@@ -461,34 +421,38 @@ fn decimal128_value_overflow_is_rejected_by_full_and_selected_but_not_unselected
         ],
     )
     .unwrap();
+    let codec = SchemaBoundChangeCodec::try_new(logical_schema).unwrap();
+    // Keep the independently encoded malformed physical values: Change construction rejects them.
+    let valid = Decimal128Array::from(vec![Some(99), Some(99), None])
+        .with_precision_and_scale(2, -1)
+        .unwrap();
+    let valid = Change::try_new(
+        RecordBatch::try_new(
+            codec.schema(),
+            vec![Arc::new(valid), Arc::new(UInt64Array::from(vec![7, 8, 9]))],
+        )
+        .unwrap(),
+        Int64Array::from(vec![1, -1, 2]),
+    )
+    .unwrap();
+    let mut encoded = codec.encode(&valid).unwrap()[..40].to_vec();
     let options = IpcWriteOptions::try_new(8, false, MetadataVersion::V5).unwrap();
-    let mut writer =
-        StreamWriter::try_new_with_options(Vec::new(), &physical_schema, options).unwrap();
-    writer.write(&batch).unwrap();
-    let encoded = writer.into_inner().unwrap();
-
-    assert_decimal_value_error(&decode_change(&encoded));
-    let select_amount = ChangeProjection::try_new(Arc::clone(&logical_schema), [0]).unwrap();
-    assert_decimal_value_error(&decode_change_projected(&encoded, &select_amount));
-
-    let select_tail = ChangeProjection::try_new(logical_schema, [1]).unwrap();
-    let decoded = decode_change_projected(&encoded, &select_tail).unwrap();
-    assert_eq!(decoded.diffs().values(), &[1, -1, 2]);
-    assert_eq!(decoded.schema().field(0).name(), "tail");
-    assert_eq!(
-        decoded
-            .records()
-            .column(0)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap()
-            .values(),
-        &[7, 8, 9]
-    );
+    let (_, physical) = IpcDataGenerator {}
+        .encode(
+            &batch,
+            &mut DictionaryTracker::new(true),
+            &options,
+            &mut IpcWriteContext::default(),
+        )
+        .unwrap();
+    write_message(&mut encoded, physical, &options).unwrap();
+    encoded.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0]);
+    assert_decimal_value_error(&codec.decode(&encoded));
+    assert_decimal_value_error(&codec.decode_owned(encoded));
 }
 
 #[test]
-fn metadata_insertion_order_does_not_change_stream_bytes() {
+fn metadata_insertion_order_does_not_change_bound_bytes() {
     let encode = |metadata| {
         let schema = Arc::new(Schema::new_with_metadata(
             vec![Field::new("value", DataType::UInt64, false)],
@@ -496,7 +460,13 @@ fn metadata_insertion_order_does_not_change_stream_bytes() {
         ));
         let records =
             RecordBatch::try_new(schema, vec![Arc::new(UInt64Array::from(vec![7]))]).unwrap();
-        encode_change(&Change::try_new(records, Int64Array::from(vec![1])).unwrap()).unwrap()
+        {
+            let change = Change::try_new(records, Int64Array::from(vec![1])).unwrap();
+            SchemaBoundChangeCodec::try_new(change.schema())
+                .unwrap()
+                .encode(&change)
+                .unwrap()
+        }
     };
     let entries = [
         ("alpha", "1"),
@@ -569,7 +539,8 @@ fn every_supported_scalar_layout_round_trips() {
         .collect::<Vec<_>>();
     let records = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
     let change = Change::try_new(records, Int64Array::from(vec![1, -1, 2, -2, 3, -3])).unwrap();
-    let decoded = decode_change(&encode_change(&change).unwrap()).unwrap();
+    let codec = SchemaBoundChangeCodec::try_new(change.schema()).unwrap();
+    let decoded = codec.decode(&codec.encode(&change).unwrap()).unwrap();
 
     assert_change_eq(&decoded, &change);
     let float32 = decoded
@@ -633,12 +604,17 @@ fn validity_and_boolean_bitmaps_round_trip_across_a_byte_boundary() {
                 .collect::<Vec<_>>(),
         );
         let change = Change::try_new(records, diffs).unwrap();
-        let encoded = encode_change(&change).unwrap();
-        assert_change_eq(&decode_change(&encoded).unwrap(), &change);
+        let codec = SchemaBoundChangeCodec::try_new(change.schema()).unwrap();
+        let encoded = codec.encode(&change).unwrap();
+        assert_change_eq(&codec.decode(&encoded).unwrap(), &change);
         for selection in [vec![0], vec![1]] {
             let projection = ChangeProjection::try_new(change.schema(), selection).unwrap();
             assert_change_eq(
-                &decode_change_projected(&encoded, &projection).unwrap(),
+                &codec
+                    .decode(&encoded)
+                    .unwrap()
+                    .try_project(&projection)
+                    .unwrap(),
                 &change.try_project(&projection).unwrap(),
             );
         }
@@ -646,7 +622,7 @@ fn validity_and_boolean_bitmaps_round_trip_across_a_byte_boundary() {
 }
 
 #[test]
-fn maximum_mixed_nesting_preserves_nested_metadata_in_full_and_projected_decodes() {
+fn maximum_mixed_nesting_preserves_nested_metadata_in_full_decode_and_memory_projection() {
     let mut mixed = DataType::Int64;
     for depth in 0..MAX_NESTING_DEPTH {
         let child = |name| {
@@ -679,11 +655,16 @@ fn maximum_mixed_nesting_preserves_nested_metadata_in_full_and_projected_decodes
     )
     .unwrap();
     let change = Change::try_new(records, Int64Array::from(vec![1])).unwrap();
-    let encoded = encode_change(&change).unwrap();
-    let decoded = decode_change(&encoded).unwrap();
+    let codec = SchemaBoundChangeCodec::try_new(change.schema()).unwrap();
+    let encoded = codec.encode(&change).unwrap();
+    let decoded = codec.decode(&encoded).unwrap();
     assert_change_eq(&decoded, &change);
     let projection = ChangeProjection::try_new(change.schema(), [0]).unwrap();
-    let projected = decode_change_projected(&encoded, &projection).unwrap();
+    let projected = codec
+        .decode(&encoded)
+        .unwrap()
+        .try_project(&projection)
+        .unwrap();
     assert_change_eq(&projected, &change.try_project(&projection).unwrap());
 
     for decoded in [&decoded, &projected] {
@@ -729,13 +710,18 @@ fn temporal_and_decimal_types_round_trip_inside_complete_nested_subtrees() {
     ]));
     let records = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
     let change = Change::try_new(records, Int64Array::from(vec![1, -1, 1])).unwrap();
-    let encoded = encode_change(&change).unwrap();
+    let codec = SchemaBoundChangeCodec::try_new(change.schema()).unwrap();
+    let encoded = codec.encode(&change).unwrap();
 
-    assert_change_eq(&decode_change(&encoded).unwrap(), &change);
+    assert_change_eq(&codec.decode(&encoded).unwrap(), &change);
     for selection in [vec![0], vec![1]] {
         let projection = ChangeProjection::try_new(Arc::clone(&schema), selection).unwrap();
         assert_change_eq(
-            &decode_change_projected(&encoded, &projection).unwrap(),
+            &codec
+                .decode(&encoded)
+                .unwrap()
+                .try_project(&projection)
+                .unwrap(),
             &change.try_project(&projection).unwrap(),
         );
     }
@@ -747,20 +733,26 @@ fn zero_logical_columns_keep_their_non_zero_row_count() {
     let records =
         RecordBatch::try_new_with_options(Arc::new(Schema::empty()), vec![], &options).unwrap();
     let change = Change::try_new(records, Int64Array::from(vec![-1, 1])).unwrap();
-    let encoded = encode_change(&change).unwrap();
-    assert_change_eq(&decode_change(&encoded).unwrap(), &change);
+    let codec = SchemaBoundChangeCodec::try_new(change.schema()).unwrap();
+    let encoded = codec.encode(&change).unwrap();
+    assert_change_eq(&codec.decode(&encoded).unwrap(), &change);
 
     let projection = ChangeProjection::try_new(Arc::new(Schema::empty()), []).unwrap();
     assert_change_eq(
-        &decode_change_projected(&encoded, &projection).unwrap(),
+        &codec
+            .decode(&encoded)
+            .unwrap()
+            .try_project(&projection)
+            .unwrap(),
         &change,
     );
 }
 
 #[test]
-fn projected_decode_matches_in_memory_projection_for_every_top_level_layout() {
+fn decoded_changes_keep_memory_projection_for_every_top_level_layout() {
     let change = representative_change();
-    let encoded = encode_change(&change).unwrap();
+    let codec = SchemaBoundChangeCodec::try_new(change.schema()).unwrap();
+    let encoded = codec.encode(&change).unwrap();
     let field_count = change.schema().fields().len();
     let mut selections = vec![vec![], vec![0, 2, 4, 6]];
     selections.extend((0..field_count).map(|index| vec![index]));
@@ -769,7 +761,11 @@ fn projected_decode_matches_in_memory_projection_for_every_top_level_layout() {
     for selection in selections {
         let projection = ChangeProjection::try_new(change.schema(), selection).unwrap();
         let expected = change.try_project(&projection).unwrap();
-        let actual = decode_change_projected(&encoded, &projection).unwrap();
+        let actual = codec
+            .decode(&encoded)
+            .unwrap()
+            .try_project(&projection)
+            .unwrap();
         assert_change_eq(&actual, &expected);
         assert_eq!(actual.schema(), projection.output_schema());
     }
@@ -790,16 +786,21 @@ fn nullable_struct_parent_masks_nulls_in_a_non_nullable_child() {
     )]));
     let records = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(object)]).unwrap();
     let change = Change::try_new(records, Int64Array::from(vec![1, 1])).unwrap();
-    let encoded = encode_change(&change).unwrap();
+    let codec = SchemaBoundChangeCodec::try_new(change.schema()).unwrap();
+    let encoded = codec.encode(&change).unwrap();
 
-    assert_change_eq(&decode_change(&encoded).unwrap(), &change);
+    assert_change_eq(&codec.decode(&encoded).unwrap(), &change);
     let identity = ChangeProjection::try_new(Arc::clone(&schema), [0]).unwrap();
     assert_change_eq(
-        &decode_change_projected(&encoded, &identity).unwrap(),
+        &codec
+            .decode(&encoded)
+            .unwrap()
+            .try_project(&identity)
+            .unwrap(),
         &change,
     );
     let empty = ChangeProjection::try_new(schema, []).unwrap();
-    let empty = decode_change_projected(&encoded, &empty).unwrap();
+    let empty = codec.decode(&encoded).unwrap().try_project(&empty).unwrap();
     assert_eq!(empty.num_rows(), 2);
     assert_eq!(empty.diffs().values(), &[1, 1]);
 }

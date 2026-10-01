@@ -21,6 +21,8 @@ const MAX_I32_OFFSET: usize = 2_147_483_647;
 pub(crate) struct Fixture {
     pub(crate) name: &'static str,
     pub(crate) change: Change,
+    // Used by change_core; change_codec compiles this shared fixture module separately.
+    #[allow(dead_code)]
     pub(crate) narrow_fields: &'static [usize],
 }
 

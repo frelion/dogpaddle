@@ -5,7 +5,7 @@ use std::{fs, hint::black_box, sync::Arc, time::Duration};
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow_schema::Schema;
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput};
-use dogpaddle_change::{Change, ChangeProjection, encode_change};
+use dogpaddle_change::{Change, ChangeProjection, SchemaBoundChangeCodec};
 use dogpaddle_perf_context::{HostEnvironment, PerformanceProfile, RunRoot, require_release_build};
 use serde_json::json;
 
@@ -228,7 +228,9 @@ fn write_context(
                 "workload": fixture.name,
                 "rows_per_change": fixture.change.num_rows(),
                 "narrow_fields": fixture.narrow_fields,
-                "encoded_bytes_per_change": encode_change(&fixture.change)
+                "encoded_bytes_per_change": SchemaBoundChangeCodec::try_new(fixture.change.schema())
+                    .expect("bind benchmark fixture outside timing")
+                    .encode(&fixture.change)
                     .expect("encode benchmark fixture outside timing")
                     .len(),
             })

@@ -4,32 +4,32 @@ use arrow_array::{Int64Array, NullArray, RecordBatch};
 use arrow_ipc::{Buffer as IpcBuffer, FieldNode};
 use arrow_schema::{DataType, Field, Schema};
 
-use super::super::encode_change;
+use super::super::SchemaBoundChangeCodec;
 use super::support::*;
-use crate::{Change, ChangeProjection};
+use crate::Change;
 
 #[test]
-fn both_decoders_validate_all_unselected_batch_metadata() {
+pub(super) fn borrowed_and_owned_decoders_validate_all_batch_metadata() {
     let change = layout_change();
-    let encoded = encode_change(&change).unwrap();
-    let projection = ChangeProjection::try_new(change.schema(), [0]).unwrap();
-    let short_fixed_width = corrupt_layout(&encoded, |parsed, layout, _, buffers| {
+    let codec = SchemaBoundChangeCodec::try_new(change.schema()).unwrap();
+    let encoded = codec.encode(&change).unwrap();
+    let short_fixed_width = corrupt_layout(&encoded, &codec, |parsed, layout, _, buffers| {
         let index = field_layout(parsed, layout, "object").buffers.end - 1;
         let descriptor = buffers[index];
         buffers[index] = IpcBuffer::new(descriptor.offset(), descriptor.length() - 8);
         8
     });
-    let invalid_struct = corrupt_layout(&encoded, |parsed, layout, nodes, _| {
+    let invalid_struct = corrupt_layout(&encoded, &codec, |parsed, layout, nodes, _| {
         let index = field_layout(parsed, layout, "object").nodes.start;
         nodes[index] = FieldNode::new(parsed.batch.length() - 1, nodes[index].null_count());
         0
     });
-    let invalid_non_nullable = corrupt_layout(&encoded, |parsed, layout, nodes, _| {
+    let invalid_non_nullable = corrupt_layout(&encoded, &codec, |parsed, layout, nodes, _| {
         let index = field_layout(parsed, layout, "payload").nodes.start;
         nodes[index] = FieldNode::new(nodes[index].length(), 1);
         0
     });
-    let out_of_body = corrupt_layout(&encoded, |parsed, layout, _, buffers| {
+    let out_of_body = corrupt_layout(&encoded, &codec, |parsed, layout, _, buffers| {
         let index = field_layout(parsed, layout, "object").buffers.end - 1;
         let descriptor = buffers[index];
         buffers[index] = IpcBuffer::new(descriptor.offset(), descriptor.length() + 8);
@@ -42,12 +42,12 @@ fn both_decoders_validate_all_unselected_batch_metadata() {
         invalid_non_nullable,
         out_of_body,
     ] {
-        assert_both_invalid_encoding(&malformed, &projection);
+        assert_both_invalid_encoding(&malformed, &codec);
     }
 }
 
 #[test]
-fn non_nullable_null_still_requires_an_all_null_field_node() {
+pub(super) fn non_nullable_null_still_requires_an_all_null_field_node() {
     let schema = Arc::new(Schema::new(vec![Field::new(
         "nothing",
         DataType::Null,
@@ -55,40 +55,40 @@ fn non_nullable_null_still_requires_an_all_null_field_node() {
     )]));
     let records = RecordBatch::try_new(schema, vec![Arc::new(NullArray::new(2))]).unwrap();
     let change = Change::try_new(records, Int64Array::from(vec![1, -1])).unwrap();
-    let encoded = encode_change(&change).unwrap();
-    let projection = ChangeProjection::try_new(change.schema(), []).unwrap();
-    let malformed = corrupt_layout(&encoded, |parsed, layout, nodes, _| {
+    let codec = SchemaBoundChangeCodec::try_new(change.schema()).unwrap();
+    let encoded = codec.encode(&change).unwrap();
+    let malformed = corrupt_layout(&encoded, &codec, |parsed, layout, nodes, _| {
         let index = field_layout(parsed, layout, "nothing").nodes.start;
         nodes[index] = FieldNode::new(parsed.batch.length(), parsed.batch.length() - 1);
         0
     });
 
-    assert_both_invalid_encoding(&malformed, &projection);
+    assert_both_invalid_encoding(&malformed, &codec);
 }
 
 #[test]
-fn temporal_and_decimal_buffer_widths_are_validated_even_when_unselected() {
+pub(super) fn temporal_and_decimal_buffer_widths_are_validated() {
     let change = extended_fixed_width_change();
-    let encoded = encode_change(&change).unwrap();
-    let projection = ChangeProjection::try_new(change.schema(), []).unwrap();
+    let codec = SchemaBoundChangeCodec::try_new(change.schema()).unwrap();
+    let encoded = codec.encode(&change).unwrap();
 
     for name in ["date", "timestamp", "decimal"] {
-        let malformed = corrupt_layout(&encoded, |parsed, layout, _, buffers| {
+        let malformed = corrupt_layout(&encoded, &codec, |parsed, layout, _, buffers| {
             let index = field_layout(parsed, layout, name).buffers.start + 1;
             let descriptor = buffers[index];
             buffers[index] = IpcBuffer::new(descriptor.offset(), descriptor.length() - 1);
             0
         });
-        assert_both_invalid_encoding(&malformed, &projection);
+        assert_both_invalid_encoding(&malformed, &codec);
     }
 }
 
 #[test]
-fn batch_layout_rejects_missing_extra_negative_and_noncanonical_descriptors() {
+pub(super) fn batch_layout_rejects_missing_extra_negative_and_noncanonical_descriptors() {
     let change = simple_change(&[1, -1]);
-    let encoded = encode_change(&change).unwrap();
-    let projection = ChangeProjection::try_new(change.schema(), []).unwrap();
-    let (parsed, layout) = parsed_layout(&encoded);
+    let codec = SchemaBoundChangeCodec::try_new(change.schema()).unwrap();
+    let encoded = codec.encode(&change).unwrap();
+    let (parsed, layout) = parsed_layout(&encoded, &codec);
     let row_count = parsed.batch.length();
     let body = parsed.body.to_vec();
     let nodes = layout.nodes;
@@ -146,6 +146,6 @@ fn batch_layout_rejects_missing_extra_negative_and_noncanonical_descriptors() {
         replace(Some(&nodes), Some(&overlap)),
     ];
     for encoded in malformed {
-        assert_both_invalid_encoding(&encoded, &projection);
+        assert_both_invalid_encoding(&encoded, &codec);
     }
 }

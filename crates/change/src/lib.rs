@@ -6,10 +6,7 @@ mod projection;
 mod schema;
 
 pub use change::{Change, ChangeError};
-pub use codec::{
-    CodecError, SchemaBoundChangeCodec, decode_change, decode_change_owned,
-    decode_change_projected, encode_change, encode_change_bounded,
-};
+pub use codec::{CodecError, SchemaBoundChangeCodec};
 pub use projection::{ChangeProjection, ProjectionError};
 pub use schema::{
     MAX_NESTING_DEPTH, MAX_SCHEMA_FIELDS, MAX_SCHEMA_METADATA_ENTRIES, MAX_SCHEMA_TEXT_BYTES,

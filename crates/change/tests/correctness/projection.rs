@@ -1,9 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use arrow_schema::{DataType, Schema};
-use dogpaddle_change::{
-    ChangeProjection, CodecError, ProjectionError, decode_change_projected, encode_change,
-};
+use dogpaddle_change::{ChangeProjection, ProjectionError};
 
 use super::support::{assert_change_eq, representative_change};
 
@@ -78,7 +76,6 @@ fn empty_and_identity_projections_preserve_rows_diffs_and_schema_identity() {
 fn projection_rejects_reordering_duplicates_bounds_and_exact_schema_drift() {
     let change = representative_change();
     let schema = change.schema();
-    let encoded = encode_change(&change).unwrap();
     assert!(matches!(
         ChangeProjection::try_new(Arc::clone(&schema), [2, 0]),
         Err(ProjectionError::FieldsNotStrictlyIncreasing {
@@ -105,10 +102,6 @@ fn projection_rejects_reordering_duplicates_bounds_and_exact_schema_drift() {
     assert!(matches!(
         change.try_project(&drifted_projection),
         Err(ProjectionError::SchemaMismatch)
-    ));
-    assert!(matches!(
-        decode_change_projected(&encoded, &drifted_projection),
-        Err(CodecError::Projection(ProjectionError::SchemaMismatch))
     ));
 
     for container in ["items", "object"] {
@@ -143,10 +136,6 @@ fn projection_rejects_reordering_duplicates_bounds_and_exact_schema_drift() {
         assert!(matches!(
             change.try_project(&drifted_projection),
             Err(ProjectionError::SchemaMismatch)
-        ));
-        assert!(matches!(
-            decode_change_projected(&encoded, &drifted_projection),
-            Err(CodecError::Projection(ProjectionError::SchemaMismatch))
         ));
     }
 }

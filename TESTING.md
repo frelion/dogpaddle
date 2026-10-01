@@ -90,7 +90,7 @@ Right lowering 还要断言原 SQL 字段顺序与 nullability。所有 Join fam
 每个源码模块目录只有一个 `tests.rs` 入口。超大模块可在同目录的 `tests/` 下按完整领域拆分；不要按每个生产源码文件建立镜像目录。当前较大的分区为：
 
 - Flow：`flow/advance/tests.rs` 只保留需要逐次驱动内部持久动作或注入边界故障的证据；
-- Change codec：`support`、`schema`、`projection`、`batch_layout`，精确 subprocess case 留在 `tests.rs`；
+- Change codec：`support`、`framing`、`values`、`batch_layout`，精确 subprocess case 留在 `tests.rs`；
 - SQLite Sink：`row`、`target`。
 - EquiJoin correctness：`family` 拥有五种关系语义与持久恢复，`inner_runtime` 拥有 Inner 热路径及 Join
   分页/预算分支；literal golden 只在 `family`。
@@ -109,7 +109,7 @@ Right lowering 还要断言原 SQL 字段顺序与 nullability。所有 Join fam
 
 持久化定义或布局变更必须同时覆盖成功构建、纯校验失败无文件副作用、不完整构建、稳定编码、资源布局和重新打开。项目不识别、迁移或兼容未发布的旧格式；旧数据库直接删除并重建。
 
-Change IPC 变更必须覆盖 self-contained Stream literal golden、标准 Arrow reader 互操作、顺序保持、零/多 RecordBatch 拒绝、截断和尾随字节；schema-bound 格式还必须覆盖 marker、Schema fingerprint、单 batch framing、owned decode 与 reopen。
+Change IPC 变更必须覆盖 schema-bound 完整零列 entry literal golden、切片与时间/Decimal 的独立 RecordBatch+EOS golden、顺序保持、零/多 RecordBatch 拒绝、截断和尾随字节，以及 marker、精确 Schema fingerprint、完整递归 layout/value 校验、owned decode 与 reopen。自描述 Stream 互操作与选择性 IPC 解码不再属于公开能力。
 
 普通 correctness 测试不得依赖 wall-clock 断言、系统 Java 或外部 PostgreSQL。没有覆盖率或代码行数 CI 阈值。
 
@@ -129,7 +129,7 @@ Change IPC 变更必须覆盖 self-contained Stream literal golden、标准 Arro
 | Target | Runner 与必须保留的口径 |
 | --- | --- |
 | `change_core` | Criterion |
-| `change_codec` | Change 自有七路旋转 runner：self-contained/schema-bound encode 与 full decode，加三种 self-contained projected decode；同 fixture 记录两种格式 bytes 与节省比例 |
+| `change_codec` | Change 自有两路旋转 runner：schema-bound encode 与 full decode；同 fixture 记录 bytes，独立 records/diffs oracle 在计时外 |
 | `cell` | Criterion |
 | `projection` | Operation 自有 Criterion：Select 默认/显式 Schema 覆盖的 8/128/512 列 × 1/256 行，加 2 列 × 1/256/65536 行的 identity/删列/Decimal/空投影；只计时 Atomic apply 与输出释放，构造、Store 事务创建、校验在计时外，无提交；保留完整行数、记录和 diff oracle |
 | `aggregate_extrema` | Operation 自有 Criterion：同组高 multiplicity、极值撤回、保持历史口径的同 layout 重复 MIN/MAX、独立的多真实 layout MIN/MAX、单页多行、单页重复极值 key、页内净零 group/extrema 循环、多组已有 group 各一行更新与批量新 group ID 分配；按 case 计时完整 Atomic apply/`Transaction::commit`，有写才同步 WAL，fixture 与输出 oracle 不计时；多组已有 group case 使用 Int64 极值 key |

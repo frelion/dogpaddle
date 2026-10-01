@@ -11,7 +11,7 @@ use std::{
 };
 
 use arrow_array::{Int32Array, Int64Array, StringArray};
-use dogpaddle_change::{SchemaBoundChangeCodec, decode_change, encode_change};
+use dogpaddle_change::SchemaBoundChangeCodec;
 use dogpaddle_operation::{
     OperationDefinition, RuntimeResource, decode_definition, encode_definition,
     operation::{
@@ -236,7 +236,7 @@ impl DirectScan {
                 .unwrap_or(0);
             self.output
                 .access(transaction.access())?
-                .put(&tail, &encode_change(&change)?)?;
+                .put(&tail, &self.codec.encode(&change)?)?;
             self.output_tail
                 .access(transaction.access())?
                 .set(&tail.checked_add(1).ok_or("gate output tail exhausted")?)?;
@@ -278,7 +278,7 @@ impl DirectScan {
         }
         let mut rows = Vec::new();
         for (_, encoded) in page.entries {
-            let change = decode_change(&encoded)?;
+            let change = self.codec.decode(&encoded)?;
             if change.num_rows() > DIAGNOSTIC_OUTPUT_ROWS - rows.len() {
                 return Err("gate output exceeded the diagnostic row limit".into());
             }

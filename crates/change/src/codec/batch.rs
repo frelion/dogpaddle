@@ -1,94 +1,34 @@
 use std::{collections::HashMap, ops::Range, sync::Arc};
 
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, RecordBatchOptions};
-use arrow_buffer::{Buffer as ArrowBuffer, MutableBuffer};
+use arrow_buffer::Buffer as ArrowBuffer;
 use arrow_ipc::{
     Buffer as IpcBuffer, FieldNode, MetadataVersion, RecordBatch as IpcRecordBatch,
-    RecordBatchArgs, reader::RecordBatchDecoder,
+    reader::RecordBatchDecoder,
 };
 use arrow_schema::{Field, SchemaRef};
-use flatbuffers::FlatBufferBuilder;
 
-use super::{
-    CodecError,
-    stream::{ParsedChange, physical_schema},
-};
-use crate::{change::Change, projection::ChangeProjection, schema::DataTypeLayout};
+use super::{CodecError, stream::ParsedChange};
+use crate::{change::Change, schema::DataTypeLayout};
 
-pub(super) fn decode(
-    parsed: &ParsedChange<'_>,
-    projection: Option<&ChangeProjection>,
-) -> Result<Change, CodecError> {
-    let layout = BatchLayout::parse(parsed)?;
-    let logical_schema = projection.map_or_else(
-        || Arc::clone(&parsed.logical_schema),
-        |projection| Arc::clone(projection.output_schema_ref()),
-    );
-
-    let physical =
-        if let Some(projection) = projection.filter(|projection| !projection.is_identity()) {
-            let compact = layout.compact(parsed.body, projection)?;
-            decode_compact(&compact, parsed.batch.length(), projection)?
-        } else {
-            decode_complete(
-                parsed.body,
-                parsed.batch,
-                Arc::clone(&parsed.physical_schema),
-            )?
-        };
-    change_from_physical(physical, logical_schema)
+pub(super) fn decode(parsed: &ParsedChange<'_>) -> Result<Change, CodecError> {
+    validate_layout(parsed)?;
+    let body = ArrowBuffer::from(parsed.body);
+    let physical = decode_record_batch(&body, parsed.batch, Arc::clone(&parsed.physical_schema))?;
+    change_from_physical(physical, Arc::clone(&parsed.logical_schema))
 }
 
 pub(super) fn decode_owned(
     encoded: &ArrowBuffer,
     parsed: &ParsedChange<'_>,
 ) -> Result<Change, CodecError> {
-    BatchLayout::parse(parsed)?;
+    validate_layout(parsed)?;
     let body_offset = (parsed.body.as_ptr() as usize)
         .checked_sub(encoded.as_ptr() as usize)
         .ok_or_else(|| CodecError::invalid("IPC body precedes its owned allocation"))?;
     let body = encoded.slice_with_length(body_offset, parsed.body.len());
     let physical = decode_record_batch(&body, parsed.batch, Arc::clone(&parsed.physical_schema))?;
     change_from_physical(physical, Arc::clone(&parsed.logical_schema))
-}
-
-fn decode_complete(
-    body: &[u8],
-    batch: IpcRecordBatch<'_>,
-    schema: SchemaRef,
-) -> Result<RecordBatch, CodecError> {
-    let body = ArrowBuffer::from(body);
-    decode_record_batch(&body, batch, schema)
-}
-
-fn decode_compact(
-    compact: &CompactedBatch,
-    row_count: i64,
-    projection: &ChangeProjection,
-) -> Result<RecordBatch, CodecError> {
-    let mut builder = FlatBufferBuilder::new();
-    let nodes = builder.create_vector(&compact.nodes);
-    let buffers = builder.create_vector(&compact.buffers);
-    let batch = IpcRecordBatch::create(
-        &mut builder,
-        &RecordBatchArgs {
-            length: row_count,
-            nodes: Some(nodes),
-            buffers: Some(buffers),
-            compression: None,
-            variadicBufferCounts: None,
-        },
-    );
-    builder.finish_minimal(batch);
-    let batch =
-        flatbuffers::root::<IpcRecordBatch<'_>>(builder.finished_data()).map_err(|error| {
-            CodecError::invalid(format!("invalid compacted RecordBatch metadata: {error}"))
-        })?;
-    decode_record_batch(
-        &compact.body,
-        batch,
-        physical_schema(projection.output_schema_ref()),
-    )
 }
 
 fn decode_record_batch(
@@ -126,143 +66,65 @@ fn change_from_physical(
     Ok(Change::try_new_with_validated_schema(records, diffs)?)
 }
 
-pub(super) struct BatchLayout {
-    pub(super) nodes: Vec<FieldNode>,
-    pub(super) buffers: Vec<Range<usize>>,
-    pub(super) fields: Vec<FieldLayout>,
-}
-
-pub(super) struct FieldLayout {
-    pub(super) nodes: Range<usize>,
-    pub(super) buffers: Range<usize>,
-}
-
 #[derive(Default)]
 struct LayoutCursor {
     nodes: usize,
     buffers: usize,
 }
 
-impl BatchLayout {
-    pub(super) fn parse(parsed: &ParsedChange<'_>) -> Result<Self, CodecError> {
-        let expected = expected_layout_counts(&parsed.physical_schema)?;
-        let node_descriptors = parsed
-            .batch
-            .nodes()
-            .ok_or_else(|| CodecError::invalid("RecordBatch metadata has no field nodes"))?;
-        if node_descriptors.len() != expected.nodes {
-            return Err(CodecError::invalid(format!(
-                "RecordBatch has {} field nodes; Schema requires {}",
-                node_descriptors.len(),
-                expected.nodes
-            )));
-        }
-        let nodes = node_descriptors.iter().copied().collect::<Vec<_>>();
-        let descriptors = parsed
-            .batch
-            .buffers()
-            .ok_or_else(|| CodecError::invalid("RecordBatch metadata has no buffers"))?;
-        if descriptors.len() != expected.buffers {
-            return Err(CodecError::invalid(format!(
-                "RecordBatch has {} buffers; Schema requires {}",
-                descriptors.len(),
-                expected.buffers
-            )));
-        }
-        let buffers = validate_buffer_layout(descriptors.iter().copied(), parsed.body.len())?;
-
-        let mut cursor = LayoutCursor::default();
-        let fields = parsed
-            .physical_schema
-            .fields()
-            .iter()
-            .map(|field| {
-                consume_field_layout(
-                    field,
-                    Some(parsed.row_count),
-                    0,
-                    &nodes,
-                    &buffers,
-                    &mut cursor,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if cursor.nodes != nodes.len() {
-            return Err(CodecError::invalid(format!(
-                "RecordBatch has {} field nodes; Schema requires {}",
-                nodes.len(),
-                cursor.nodes
-            )));
-        }
-        if cursor.buffers != buffers.len() {
-            return Err(CodecError::invalid(format!(
-                "RecordBatch has {} buffers; Schema requires {}",
-                buffers.len(),
-                cursor.buffers
-            )));
-        }
-        Ok(Self {
-            nodes,
-            buffers,
-            fields,
-        })
+fn validate_layout(parsed: &ParsedChange<'_>) -> Result<(), CodecError> {
+    let expected = expected_layout_counts(&parsed.physical_schema)?;
+    let node_descriptors = parsed
+        .batch
+        .nodes()
+        .ok_or_else(|| CodecError::invalid("RecordBatch metadata has no field nodes"))?;
+    if node_descriptors.len() != expected.nodes {
+        return Err(CodecError::invalid(format!(
+            "RecordBatch has {} field nodes; Schema requires {}",
+            node_descriptors.len(),
+            expected.nodes
+        )));
     }
-
-    pub(super) fn compact(
-        &self,
-        body: &[u8],
-        projection: &ChangeProjection,
-    ) -> Result<CompactedBatch, CodecError> {
-        let selected = std::iter::once(0)
-            .chain(projection.field_indices().iter().map(|index| index + 1))
-            .map(|index| {
-                self.fields.get(index).ok_or_else(|| {
-                    CodecError::invalid(format!(
-                        "projected physical field {index} is outside the Schema"
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let capacity = self.compact_body_len(&selected)?;
-        let mut compact = MutableBuffer::new(capacity);
-        let mut nodes = Vec::new();
-        let mut buffers = Vec::new();
-        for field in selected {
-            nodes.extend_from_slice(&self.nodes[field.nodes.clone()]);
-            for range in &self.buffers[field.buffers.clone()] {
-                let source = body.get(range.clone()).ok_or_else(|| {
-                    CodecError::invalid("validated selected buffer is outside the body")
-                })?;
-                let target_offset = i64::try_from(compact.len())
-                    .map_err(|_| CodecError::invalid("compacted buffer offset exceeds i64"))?;
-                let length = i64::try_from(range.len())
-                    .map_err(|_| CodecError::invalid("compacted buffer length exceeds i64"))?;
-                buffers.push(IpcBuffer::new(target_offset, length));
-                compact.extend_from_slice(source);
-                compact.resize(align_to_eight(compact.len())?, 0);
-            }
-        }
-        debug_assert_eq!(compact.len(), capacity);
-        Ok(CompactedBatch {
-            nodes,
-            buffers,
-            body: compact.into(),
-        })
+    let nodes = node_descriptors.iter().copied().collect::<Vec<_>>();
+    let descriptors = parsed
+        .batch
+        .buffers()
+        .ok_or_else(|| CodecError::invalid("RecordBatch metadata has no buffers"))?;
+    if descriptors.len() != expected.buffers {
+        return Err(CodecError::invalid(format!(
+            "RecordBatch has {} buffers; Schema requires {}",
+            descriptors.len(),
+            expected.buffers
+        )));
     }
+    let buffers = validate_buffer_layout(descriptors.iter().copied(), parsed.body.len())?;
 
-    fn compact_body_len(&self, selected: &[&FieldLayout]) -> Result<usize, CodecError> {
-        let mut length = 0_usize;
-        for field in selected {
-            for range in &self.buffers[field.buffers.clone()] {
-                length = length
-                    .checked_add(range.len())
-                    .ok_or_else(|| CodecError::invalid("compacted body length overflowed"))?;
-                length = align_to_eight(length)?;
-            }
-        }
-        Ok(length)
+    let mut cursor = LayoutCursor::default();
+    for field in parsed.physical_schema.fields() {
+        consume_field_layout(
+            field,
+            Some(parsed.row_count),
+            0,
+            &nodes,
+            &buffers,
+            &mut cursor,
+        )?;
     }
+    if cursor.nodes != nodes.len() {
+        return Err(CodecError::invalid(format!(
+            "RecordBatch has {} field nodes; Schema requires {}",
+            nodes.len(),
+            cursor.nodes
+        )));
+    }
+    if cursor.buffers != buffers.len() {
+        return Err(CodecError::invalid(format!(
+            "RecordBatch has {} buffers; Schema requires {}",
+            buffers.len(),
+            cursor.buffers
+        )));
+    }
+    Ok(())
 }
 
 fn expected_layout_counts(schema: &SchemaRef) -> Result<LayoutCursor, CodecError> {
@@ -299,12 +161,6 @@ fn expected_layout_counts(schema: &SchemaRef) -> Result<LayoutCursor, CodecError
     Ok(counts)
 }
 
-pub(super) struct CompactedBatch {
-    pub(super) nodes: Vec<FieldNode>,
-    pub(super) buffers: Vec<IpcBuffer>,
-    pub(super) body: ArrowBuffer,
-}
-
 fn consume_field_layout(
     field: &Field,
     expected_length: Option<usize>,
@@ -312,7 +168,7 @@ fn consume_field_layout(
     nodes: &[FieldNode],
     buffers: &[Range<usize>],
     cursor: &mut LayoutCursor,
-) -> Result<FieldLayout, CodecError> {
+) -> Result<(), CodecError> {
     let node_start = cursor.nodes;
     let node = nodes.get(node_start).ok_or_else(|| {
         CodecError::invalid(format!(
@@ -395,10 +251,7 @@ fn consume_field_layout(
         }
         _ => {}
     }
-    Ok(FieldLayout {
-        nodes: node_start..cursor.nodes,
-        buffers: buffer_start..cursor.buffers,
-    })
+    Ok(())
 }
 
 fn validate_own_buffer_lengths(

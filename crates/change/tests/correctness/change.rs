@@ -5,7 +5,7 @@ use arrow_array::{
 };
 use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, Schema};
-use dogpaddle_change::{Change, ChangeError, decode_change, encode_change};
+use dogpaddle_change::{Change, ChangeError, SchemaBoundChangeCodec};
 
 use super::support::{
     assert_array_buffers_shared, assert_change_eq, event_change, events, representative_change,
@@ -205,8 +205,9 @@ fn slice_and_into_parts_are_zero_copy_contiguous_owned_and_check_bounds() {
             .values(),
         &[7, 8]
     );
+    let codec = SchemaBoundChangeCodec::try_new(slice.schema()).unwrap();
     assert_change_eq(
-        &decode_change(&encode_change(&slice).unwrap()).unwrap(),
+        &codec.decode(&codec.encode(&slice).unwrap()).unwrap(),
         &slice,
     );
 
@@ -239,8 +240,10 @@ fn stable_rebatching_preserves_the_flattened_event_sequence() {
         let mut actual = Vec::new();
         for &size in *sizes {
             let end = start + size;
-            let encoded = encode_change(&event_change(&expected[start..end])).unwrap();
-            actual.extend(events(&decode_change(&encoded).unwrap()));
+            let change = event_change(&expected[start..end]);
+            let codec = SchemaBoundChangeCodec::try_new(change.schema()).unwrap();
+            let encoded = codec.encode(&change).unwrap();
+            actual.extend(events(&codec.decode(&encoded).unwrap()));
             start = end;
         }
         assert_eq!(start, expected.len());

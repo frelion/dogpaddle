@@ -99,8 +99,8 @@ Aggregate 不保留完整输入行，只按分组与调用参数检查被跟踪�
 `dogpaddle.` 开头的 metadata key 留给物理协议使用。
 
 v1 还固定限制为最多 16,384 个顶层加嵌套字段、49,152 个 Schema/Field metadata entry，以及
-8 MiB 的字段名、Timestamp timezone、metadata key/value 全局 UTF-8 字节总量。解码器在复制这些
-字符串前执行同一预算，并以 64 MiB apparent-size ceiling 限制 `FlatBuffer` 的展开大小，避免很小的恶意 offset 图放大为无界分配。
+8 MiB 的字段名、Timestamp timezone、metadata key/value 全局 UTF-8 字节总量。codec 构造时验证资源所有者提供的
+Schema；entry 不携带另一份 Schema。batch metadata 仍以 64 MiB apparent-size ceiling 限制 `FlatBuffer` 的展开大小。
 
 Timestamp 保留可选 timezone 字符串，但拒绝空字符串；`None` 表示无时区。Decimal128 precision
 必须在 `1..=38`，正 scale 不能超过 precision。构造和完整解码还会检查每个 non-null 物理值确实
@@ -125,9 +125,7 @@ use std::sync::Arc;
 
 use arrow_array::{Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
-use dogpaddle_change::{
-    Change, ChangeProjection, decode_change_projected, encode_change,
-};
+use dogpaddle_change::{Change, ChangeProjection, SchemaBoundChangeCodec};
 
 let schema = Arc::new(Schema::new(vec![
     Field::new("id", DataType::UInt64, false),
@@ -146,16 +144,15 @@ let change = Change::try_new(records, Int64Array::from(vec![1]))?;
 let projection = ChangeProjection::try_new(schema, [0, 2])?;
 
 let in_memory = change.try_project(&projection)?;
-let encoded = encode_change(&change)?;
-let from_ipc = decode_change_projected(&encoded, &projection)?;
+let codec = SchemaBoundChangeCodec::try_new(change.schema())?;
+let encoded = codec.encode(&change)?;
+let from_ipc = codec.decode(&encoded)?.try_project(&projection)?;
 assert_eq!(in_memory.records(), from_ipc.records());
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-内存投影只重组 Schema 和 `ArrayRef`，不会复制选中的 Arrow 数据。选择性 IPC 解码会跳过未选字段
-的值区，但仍先验证内嵌 Schema、完整 framing，以及全部不读取 payload 即可判断的 batch metadata。List/Struct 只能按完整子树选择；所选字段递归校验，返回不借用 entry 或事务的 owned Change。它减少解码和分配，不会改变已经写入的
-日志大小，也不承诺 `RocksDB` 或设备层面的字段级 I/O。未选字段的 UTF-8、List offset、Decimal
-value 等值级约束不会被读取和验证；需要审计全部内容时使用 [`decode_change`]。
+内存投影只重组 Schema 和 `ArrayRef`，不会复制选中的 Arrow 数据。List/Struct 按完整子树选择。
+IPC 解码始终验证并恢复全部字段，再按需进行内存投影；没有跳过未选字段坏值的选择性解码入口。
 
 ## 在系统中的位置
 
@@ -171,40 +168,8 @@ Flow 在需要跨事务保留数据时编码；Store 看到的只是字节。这
 
 ## 持久化格式
 
-[`encode_change`] 把每个 `Change` 写成一条完整、自描述的标准 Arrow IPC Stream：
-
-```text
-Schema message
-  └─ $dogpaddle.diff: non-null Int64
-  └─ 所有 logical fields
-RecordBatch message/body（恰好一个非空 batch）
-canonical EOS
-```
-
-没有额外的 `DogPaddle` envelope、独立 Schema resource、fingerprint 或 segment，也不依赖日志外部的 Schema。标准 Arrow reader 可以读取这条
-Stream；[`decode_change`] 只凭一条 entry 的字节恢复完整记录、diff 和顺序。调用方已经拥有编码
-字节时，[`decode_change_owned`] 可以继续共享满足对齐要求的 Arrow body 分配。
-
-物理 Schema 的第零字段固定为 non-null Int64 `$dogpaddle.diff`，随后是完整 logical fields；
-Schema metadata 固定包含 `dogpaddle.kind = change` 和 `dogpaddle.change.version = 1`。
-
-需要在写入持久容量前限制分配时使用 [`encode_change_bounded`]。它先按 Arrow v1 支持类型无拷贝计算
-当前逻辑 slice 的未压缩 IPC body，并用自持超限标记的限长 writer 约束完整输出；Schema 写入、batch 和 EOS
-任一阶段超限都返回同一容量错误，因此超大 body 不会先被完整构造后才遭拒绝。普通 [`encode_change`]
-保留无调用方 byte limit 的通用入口。
-
-自描述格式的写入端固定使用 Metadata V5、8 字节对齐、非 legacy framing 和无压缩。decoder 会拒绝
-错误 marker、大端、压缩、多个 batch、非 canonical EOS、尾随字节以及不合法的 `DogPaddle`
-Schema。canonical 约束 framing、EOS、writer options，以及有序且唯一的 metadata key；decoder
-不要求把输入重新编码后逐字节相等。`encode_change` 的确定性输出和 golden bytes 是写入端基准。
-
-这是开发期 v1。修改物理 diff 布局、Schema marker、writer options、允许类型或解码规则时，应同步更新
-golden 和 reopen 证据并重建旧 Flow，不增加旧格式迁移或兼容分支。
-
-### 资源已绑定 Schema 的 entry
-
-同一个持久资源内的每条 Change 都使用同一精确 Schema 时，可以构造
-[`SchemaBoundChangeCodec`]，把完整 Schema 留在资源所有者处，只在每条 entry 保存固定身份：
+[`SchemaBoundChangeCodec`] 在编解码前绑定资源所有者的精确 Schema。
+每条 entry 保存固定身份和恰好一个非空 batch：
 
 ```text
 DPCHB001                                      8-byte format/version marker
@@ -213,7 +178,7 @@ RecordBatch message/body                     exactly one non-empty batch
 canonical EOS
 ```
 
-这里的 canonical physical Schema 是 [`encode_change`] 使用的同一个布局：non-null Int64 diff 在第零列，
+canonical physical Schema 的 non-null Int64 `$dogpaddle.diff` 在第零列，
 其后是 logical fields，并包含固定 kind/version metadata。fingerprint 因此覆盖字段顺序、名称、类型、
 nullability、嵌套结构以及全部 Schema/Field metadata。codec 在编码时要求 `Change` 的 logical Schema
 逐项相等；解码时先比较 fingerprint，避免把物理 buffer 布局恰好相同但语义不同的 entry 错绑到当前
@@ -228,11 +193,13 @@ entry。
 绑定格式也是开发期 v1 持久边界。marker、fingerprint 输入、writer options、物理布局或 framing 变化
 必须同步更新 bound golden/layout/reopen 证据并重建受影响资源，不增加旧格式兼容分支。
 
-两种 codec 的职责不同：[`encode_change`]/[`decode_change`] 用于没有可信外部 Schema 上下文、需要单条
-自描述 Arrow Stream 的边界，[`decode_change_projected`] 也只读取这种自描述格式；
-[`SchemaBoundChangeCodec`] 用于一个持久资源已经由 exact Schema 拥有、会连续保存许多 Change 的边界。
-Source 队列、Flow 挂起页和 Sink outbox 使用后一种格式。Flow 为每个逻辑输出绑定 codec，
+Source 队列、Flow 挂起页和 Sink outbox 都使用此格式。Flow 为每个逻辑输出绑定 codec，
 恢复输入时完整解码；子调用直接读取父调用保存的页。页的保留、容量和回收由其 owner 负责。
+
+公开自描述 Arrow Stream 导入/导出、从 entry 发现 Schema，以及选择性 IPC 解码能力已经退役。
+不提供 `StreamReader` fallback。现有 schema-bound marker、fingerprint 和 entry bytes 不变。
+`encode_bounded` 写入前先计算逻辑 slice 的未压缩 body 大小，再由限长 writer 约束完整输出；超限返回容量错误。
+完整零列 entry 有 literal golden；切片和时间/Decimal 的独立 golden 覆盖 `RecordBatch` 与 EOS 后缀。
 
 ## 从哪里继续读
 
@@ -241,7 +208,7 @@ Source 队列、Flow 挂起页和 Sink outbox 使用后一种格式。Flow 为�
 1. [`src/change.rs`](src/change.rs)：核心不变量、切片和投影入口。
 2. [`src/schema.rs`](src/schema.rs)：v1 Schema 边界。
 3. [`src/projection.rs`](src/projection.rs)：精确 Schema 绑定的顶层投影。
-4. [`src/codec/`](src/codec/)：一条 Change 如何变成 Arrow IPC Stream。
+4. [`src/codec/`](src/codec/)：一条 Change 如何变成绑定 Schema 的 IPC entry。
 5. [`tests/correctness/`](tests/correctness/)：构造、Schema、投影和损坏输入的公共证据。
 
 ## 验证与性能
