@@ -343,7 +343,8 @@ public final class ConnectorRuntime {
         }
 
         OffsetStoreRegistry.PreparedCheckpoint prepared = offsets.preview(records);
-        byte[] encoded = codec.encode(prepared.encoded(), records, maximumDeliveryBytes);
+        byte[] encoded = codec.encode(
+                CheckpointCodec.encode(prepared.checkpoint()), records, maximumDeliveryBytes);
         DeliveryExchange.Delivery delivery = exchange.install(encoded);
 
         Throwable deliveryFailure = null;

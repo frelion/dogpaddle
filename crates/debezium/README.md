@@ -108,10 +108,17 @@ Java bridge 因此新建一个 `OffsetStorageWriter`、只捕获写入的内存 
 
 1. 从上一次已接受的完整 offset map 开始。
 2. 合并当前 records 的 partition/offset。
-3. 返回候选完整 map，编码成 `Checkpoint`。
+3. 返回候选完整 map，在发布 Delivery 前编码成 `Checkpoint`。
 4. 调用方持久化 records 与 checkpoint。
 5. `ack()` 先把预演 delta 设为本次期望值，再运行真正的 Debezium committer；实际 backing store 收到写入后，
    按原始字节核对 delta 和最终完整 checkpoint 都完全一致。
+
+Java 预演结果只保留原始 delta 和不可变的候选 checkpoint。checkpoint 的编码容量检查在预演返回后、
+发布 Delivery 前完成；编码失败不会发布批次、进入 ACK 或改写当前 offset。完整编码只作为构造 Delivery 的临时输入，
+不再随预演结果保留至 ACK；已发布的 Delivery frame 本身仍包含 checkpoint bytes。
+检查点编码器保持每次写入前的容量检查，直接从内部缓冲区计算 CRC，再一次复制到包含校验和的最终数组，
+不另建完整 body 数组，也不为追加校验和扩大内部缓冲区。内部缓冲区、最终 frame、原始 offset map 和
+`RawBytes` 的防御性复制仍存在；这不构成 JVM 堆峰值或 RSS 上限保证。Checkpoint v1 字节格式不变。
 
 Checkpoint 绑定稳定的 engine name 和 connector class，可能包含多个 source partition。它不是 delivery ID，
 也不是某一种数据库位置。这个绑定不检查其余 connector properties 是否兼容；具体 source identity、固定 Schema
@@ -248,6 +255,28 @@ checkpoint-only restart 和下一批恢复。确定性 probe 位于 `system-test
 17.628–19.947 ms 和 5.166–27.417 µs。这只反映已启动 host 的重复打开成本，不表示 JVM 首次启动或 CDC 吞吐提速。
 原始上下文、32 个样本、二进制 SHA 和验证日志位于 `/tmp/dogpaddle-validated-jvm-performance/`；
 其中 `*-stale-artifact.*` 使用了未重编的旧二进制，已作废，不计入结果。
+
+2026-10-01 的 checkpoint 编码分配对照使用同一仓库外 Java 程序和实际 `CheckpointCodec.encode`，
+Temurin `21.0.12.1+1`、Java 17 bytecode，JVM 参数为 `-Xms64m -Xmx1024m -XX:+UseSerialGC`。
+七种 body 长度各按旧/新/新/旧运行四个新 JVM，共 28 个进程；预热后测量当前线程累计分配，
+小于 64 KiB 的 body 每进程编码 32 次，其余编码 8 次。每个版本两轮的每次编码平均分配完全相同：
+
+| body bytes | 旧分配 bytes/encode | 新分配 bytes/encode | 减少 bytes/encode |
+| ---: | ---: | ---: | ---: |
+| 24 | 8672 | 8632 | 40 |
+| 8191 | 33224 | 25016 | 8208 |
+| 8192 | 33224 | 25016 | 8208 |
+| 8193 | 49632 | 41416 | 8216 |
+| 16384 | 74200 | 57800 | 16400 |
+| 1048576 | 4202968 | 3154376 | 1048592 |
+| 8388608 | 33563096 | 25174472 | 8388624 |
+
+body 不含末尾 4 字节 CRC。fixture 构造、控制帧编码/SHA、decode、预热和输出均在分配计数外；
+每种长度的控制帧 SHA 在两版本间一致，测量后的结果也通过 checkpoint decode 等值验证。
+这只证明编码线程省去 body 临时副本的分配，不测量等待 ACK 时的保留内存、整个 JVM/native heap、RSS 或吞吐。
+本轮生产 Java 净增加 2 行；删除的是完整 body 临时数组和预演结果中的 encoded checkpoint 持有，
+不是大量代码。原始 28 份结果、对照、源码与 class SHA 位于 `/tmp/dogpaddle-checkpoint-encoding-memory/`；
+临时程序 SHA256 为 `1942f276571dc00e535f172bcdf089c1f85fd1c981ca84666072edde874f6681`。
 
 ## 版本边界
 

@@ -4,9 +4,11 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
+import java.nio.ByteBuffer;
 import java.util.HexFormat;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.zip.CRC32;
 import org.junit.jupiter.api.Test;
 
 class CheckpointCodecTest {
@@ -118,21 +120,41 @@ class CheckpointCodecTest {
     }
 
     @Test
-    void checkpoint_encode_bounds_the_complete_aggregate_before_growing_past_limit() {
-        TreeMap<RawBytes, RawBytes> entries = new TreeMap<>();
-        entries.put(
-                new RawBytes(new byte[] {1}),
-                new RawBytes(new byte[32 * 1024 * 1024]));
-        entries.put(
-                new RawBytes(new byte[] {2}),
-                new RawBytes(new byte[32 * 1024 * 1024]));
-        Checkpoint checkpoint = new Checkpoint("engine-a", "connector.A", entries);
+    void checkpoint_encode_accepts_the_exact_limit_and_rejects_one_more_byte() {
+        int maximumBytes = 64 * 1024 * 1024;
+        RawBytes firstValue = new RawBytes(new byte[32 * 1024 * 1024]);
+        for (int extra = 0; extra <= 1; extra++) {
+            // Two one-byte bindings and keys occupy 46 bytes including the checksum.
+            Checkpoint checkpoint = new Checkpoint("a", "b", Map.of(
+                    new RawBytes(new byte[] {1}), firstValue,
+                    new RawBytes(new byte[] {2}),
+                    new RawBytes(new byte[maximumBytes - 46 - firstValue.size() + extra])));
+            if (extra == 0) {
+                assertEquals(maximumBytes, CheckpointCodec.encode(checkpoint).length);
+            }
+            else {
+                IllegalArgumentException error = assertThrows(
+                        IllegalArgumentException.class,
+                        () -> CheckpointCodec.encode(checkpoint));
+                assertEquals("checkpoint exceeds 67108864 bytes", error.getMessage());
+            }
+        }
+    }
 
-        IllegalArgumentException error = assertThrows(
-                IllegalArgumentException.class,
-                () -> CheckpointCodec.encode(checkpoint));
-
-        assertEquals("checkpoint exceeds 67108864 bytes", error.getMessage());
+    @Test
+    void checkpoint_checksum_crosses_the_initial_buffer_boundary_without_padding() {
+        for (int bodyBytes : new int[] {8191, 8192, 8193}) {
+            // The body has 33 framing bytes for one entry and one-byte bindings/key.
+            Checkpoint checkpoint = new Checkpoint("a", "b", Map.of(
+                    new RawBytes(new byte[] {1}), new RawBytes(new byte[bodyBytes - 33])));
+            byte[] encoded = CheckpointCodec.encode(checkpoint);
+            assertEquals(bodyBytes + Integer.BYTES, encoded.length);
+            CRC32 checksum = new CRC32();
+            checksum.update(encoded, 0, bodyBytes);
+            assertEquals(checksum.getValue(), Integer.toUnsignedLong(
+                    ByteBuffer.wrap(encoded, bodyBytes, Integer.BYTES).getInt()));
+            assertEquals(checkpoint, CheckpointCodec.decode(encoded));
+        }
     }
 
     @Test

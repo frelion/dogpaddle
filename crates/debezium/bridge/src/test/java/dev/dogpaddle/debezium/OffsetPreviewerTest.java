@@ -56,6 +56,14 @@ class OffsetPreviewerTest {
         assertEquals(2, prepared.delta().size());
         assertEquals(2, prepared.checkpoint().entries().size());
         assertNotEquals(initial, prepared.checkpoint());
+        byte[] encoded = CheckpointCodec.encode(prepared.checkpoint());
+        assertEquals(initial, entry.snapshot());
+        try (DeliveryCodec codec = new DeliveryCodec()) {
+            assertThrows(
+                    IllegalStateException.class,
+                    () -> codec.encode(encoded, records, DeliveryCodec.MINIMUM_MAXIMUM_BYTES));
+        }
+        assertEquals(initial, entry.snapshot());
 
         entry.arm(prepared);
         flushWithPublicWriter(actualStore, records);
@@ -64,7 +72,7 @@ class OffsetPreviewerTest {
         assertEquals(prepared.checkpoint(), entry.snapshot());
         assertEquals(
                 prepared.checkpoint(),
-                CheckpointCodec.decode(prepared.encoded()));
+                CheckpointCodec.decode(encoded));
 
         var expectedPartitions = java.util.Set.of(
                 Map.<String, Object>of("partition", "a"),
@@ -77,6 +85,33 @@ class OffsetPreviewerTest {
                 firstPartitions.iterator().next(),
                 secondPartitions.iterator().next());
         assertEquals(java.util.Set.of(), actualStore.connectorPartitions("another-engine"));
+    }
+
+    @Test
+    void checkpoint_encoding_failure_leaves_the_preview_uncommitted() throws Exception {
+        Checkpoint initial = new Checkpoint("engine-a", "example.Connector", Map.of());
+        OffsetStoreRegistry.Entry entry = new OffsetStoreRegistry.Entry(initial);
+        DogPaddleOffsetBackingStore store = new DogPaddleOffsetBackingStore(entry);
+        store.start();
+        SourceRecord oversizedOffset = new SourceRecord(
+                Map.of("partition", "a"),
+                Map.of("position", "x".repeat(32 * 1024 * 1024)),
+                "topic", 0, Schema.STRING_SCHEMA, "a", Schema.INT64_SCHEMA, 1L, 123L);
+        OffsetStoreRegistry.PreparedCheckpoint oversized = entry.preview(List.of(oversizedOffset));
+
+        IllegalArgumentException error = assertThrows(
+                IllegalArgumentException.class,
+                () -> CheckpointCodec.encode(oversized.checkpoint()));
+        assertEquals("checkpoint offset entry exceeds 33554432 bytes", error.getMessage());
+        assertEquals(initial, entry.snapshot());
+
+        List<SourceRecord> records = List.of(record("a", 1L));
+        OffsetStoreRegistry.PreparedCheckpoint prepared = entry.preview(records);
+        byte[] encoded = CheckpointCodec.encode(prepared.checkpoint());
+        entry.arm(prepared);
+        flushWithPublicWriter(store, records);
+        entry.requireCommitted(prepared);
+        assertEquals(CheckpointCodec.decode(encoded), entry.snapshot());
     }
 
     @Test
@@ -112,11 +147,12 @@ class OffsetPreviewerTest {
         producingStore.start();
         List<SourceRecord> records = List.of(record("a", 1L), record("a", 2L));
         OffsetStoreRegistry.PreparedCheckpoint prepared = producing.preview(records);
+        byte[] encoded = CheckpointCodec.encode(prepared.checkpoint());
         producing.arm(prepared);
         flushWithPublicWriter(producingStore, records);
         producing.requireCommitted(prepared);
 
-        Checkpoint restoredCheckpoint = CheckpointCodec.decode(prepared.encoded());
+        Checkpoint restoredCheckpoint = CheckpointCodec.decode(encoded);
         OffsetStoreRegistry.Entry restored = new OffsetStoreRegistry.Entry(restoredCheckpoint);
         DogPaddleOffsetBackingStore restoredStore = new DogPaddleOffsetBackingStore(restored);
         restoredStore.start();

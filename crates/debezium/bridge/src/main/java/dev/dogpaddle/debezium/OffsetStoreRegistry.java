@@ -99,8 +99,7 @@ final class OffsetStoreRegistry {
             Checkpoint candidate = current.merge(delta);
             return new PreparedCheckpoint(
                     Collections.unmodifiableMap(new TreeMap<>(delta)),
-                    candidate,
-                    CheckpointCodec.encode(candidate));
+                    candidate);
         }
 
         synchronized void arm(PreparedCheckpoint prepared) {
@@ -205,7 +204,6 @@ final class OffsetStoreRegistry {
 
     record PreparedCheckpoint(
             Map<RawBytes, RawBytes> delta,
-            Checkpoint checkpoint,
-            byte[] encoded) {
+            Checkpoint checkpoint) {
     }
 }

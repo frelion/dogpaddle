@@ -54,13 +54,7 @@ final class CheckpointCodec {
                 writeRequiredBytes(output, entry.getValue().bytes());
             }
             output.flush();
-            byte[] body = bytes.toByteArray();
-            CRC32 checksum = new CRC32();
-            checksum.update(body);
-            return ByteBuffer.allocate(body.length + CHECKSUM_BYTES)
-                    .put(body)
-                    .putInt((int) checksum.getValue())
-                    .array();
+            return bytes.finish();
         }
         catch (IOException error) {
             throw new IllegalStateException("cannot encode checkpoint", error);
@@ -200,6 +194,15 @@ final class CheckpointCodec {
         public synchronized void write(byte[] bytes, int offset, int length) {
             requireCapacity(length);
             super.write(bytes, offset, length);
+        }
+
+        private byte[] finish() {
+            CRC32 checksum = new CRC32();
+            checksum.update(buf, 0, count);
+            byte[] encoded = Arrays.copyOf(buf, count + CHECKSUM_BYTES);
+            ByteBuffer.wrap(encoded, count, CHECKSUM_BYTES)
+                    .putInt((int) checksum.getValue());
+            return encoded;
         }
 
         private void requireCapacity(int additional) {

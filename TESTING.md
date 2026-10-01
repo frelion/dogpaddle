@@ -220,6 +220,8 @@ system-tests 的稳定 host 布局：根 workspace 的 `system-tests/debezium-ru
 真实 runtime bundle probe 覆盖失败首次打开后的重试、四线程首次启动、同 canonical 路径/符号链接别名复用、不同目录的配置冲突和无效路径拒绝。可选 `--measure-open` 只观测初始化后 32 次同路径 open，旧、新产品共用相同 probe 源码；初始化、输出和 drop 在计时外，默认完整生命周期仍由系统验收执行。
 Delivery 的 records 所有权验证复用此真实 probe：移出原 allocation、重复取出为空、原句柄继续阻止 poll、释放 records 后 drop/replay 完整字节、drained 句柄的成功 ACK 与跨 connector/stop 拒绝，以及 ACK 返回原 checkpoint bytes 和 buffer 地址。wire 零 records 拒绝仍由 Debezium 私有 codec 测试覆盖；不增加公开构造 Delivery 的测试接口。
 
+Java checkpoint 测试保留 v1 literal golden，并覆盖完整 64 MiB 上限及超出一字节、内部缓冲区边界的 CRC/无填充，以及发布前编码失败不提交 offset、正常预演与实际写入一致。
+
 Debezium delivery wire v2 的 Rust/Java literal golden 必须一致，并覆盖最短 checkpoint 28 字节加一个 null topic/value record 的 58 字节边界、旧 wire/bridge 拒绝。跨 JNI 只导出 topic/value；真实 probe 与 D1 仍比较顺序、重投字节和 checkpoint-only 恢复，不再以 key/header 作为输出合同。MySQL CDC 既有 pre-ACK crash/reopen 场景同时覆盖 UPDATE、INSERT 和 DELETE 的完整有序行像。
 
 普通 Cargo gate 保持离线。真实系统入口为：
