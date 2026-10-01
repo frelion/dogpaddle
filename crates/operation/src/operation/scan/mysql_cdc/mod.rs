@@ -7,7 +7,7 @@ mod error;
 mod runtime;
 mod schema;
 
-pub use connection::{MySqlCdcScanConfig, MySqlCdcScanOptions};
+pub use connection::MySqlCdcScanConfig;
 pub use definition::{MySqlCdcScanDefinition, MySqlCdcScanSpec};
 pub use error::MySqlCdcScanError;
 use runtime::MySqlCdcScanOperation;

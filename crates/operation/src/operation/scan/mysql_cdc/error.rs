@@ -7,9 +7,6 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum MySqlCdcScanError {
-    /// The ephemeral connector tuning is invalid.
-    #[error("invalid MySQL CDC scan options: {0}")]
-    InvalidOptions(String),
     /// The non-sensitive Scan definition is invalid.
     #[error("invalid MySQL CDC scan definition: {0}")]
     InvalidDefinition(String),
@@ -37,10 +34,6 @@ pub enum MySqlCdcScanError {
 }
 
 impl MySqlCdcScanError {
-    pub(super) fn invalid_options(message: impl Into<String>) -> Self {
-        Self::InvalidOptions(message.into())
-    }
-
     pub(super) fn new(message: impl Into<String>) -> Self {
         Self::InvalidRuntime(message.into())
     }

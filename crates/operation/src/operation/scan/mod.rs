@@ -1,18 +1,20 @@
 //! Scan operations that produce records without consuming input.
 
 mod cdc_convert;
+mod cdc_options;
 pub(crate) mod cdc_runtime;
 pub(crate) mod mysql_cdc;
 pub(crate) mod postgres_cdc;
 pub(crate) mod sequence;
 
+pub use cdc_options::{CdcOptions, CdcOptionsError};
 pub use mysql_cdc::{
-    MySqlCdcScanConfig, MySqlCdcScanDefinition, MySqlCdcScanError, MySqlCdcScanOptions,
-    MySqlCdcScanSpec, MySqlColumn, MySqlType,
+    MySqlCdcScanConfig, MySqlCdcScanDefinition, MySqlCdcScanError, MySqlCdcScanSpec, MySqlColumn,
+    MySqlType,
 };
 pub use postgres_cdc::{
-    PostgresCdcScanConfig, PostgresCdcScanDefinition, PostgresCdcScanError, PostgresCdcScanOptions,
-    PostgresCdcScanSpec, PostgresColumn, PostgresType,
+    PostgresCdcScanConfig, PostgresCdcScanDefinition, PostgresCdcScanError, PostgresCdcScanSpec,
+    PostgresColumn, PostgresType,
 };
 pub use sequence::{SequenceScanDefinition, SequenceScanError};
 

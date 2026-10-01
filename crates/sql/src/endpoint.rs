@@ -14,8 +14,8 @@ use dogpaddle_flow::FlowFactory;
 use dogpaddle_operation::OperationDefinition;
 use dogpaddle_operation::operation::{
     scan::{
-        MySqlCdcScanConfig, MySqlCdcScanDefinition, MySqlCdcScanOptions, PostgresCdcScanConfig,
-        PostgresCdcScanDefinition, PostgresCdcScanOptions, SequenceScanDefinition,
+        CdcOptions, MySqlCdcScanConfig, MySqlCdcScanDefinition, PostgresCdcScanConfig,
+        PostgresCdcScanDefinition, SequenceScanDefinition,
     },
     sink::{
         ClickHouseSinkConfig, ClickHouseSinkDefinition, DiscardDefinition, DorisSinkConfig,
@@ -126,72 +126,37 @@ struct CdcTuningParameters {
 }
 
 impl CdcTuningParameters {
-    fn postgres_options(&self) -> Result<PostgresCdcScanOptions, SqlError> {
-        let mut options = PostgresCdcScanOptions::new();
-        if let Some(value) = self.milliseconds("postgres_cdc", "connect_timeout_ms")? {
+    fn resolve(&self, endpoint: &str) -> Result<CdcOptions, SqlError> {
+        let mut options = CdcOptions::new();
+        if let Some(value) = self.milliseconds(endpoint, "connect_timeout_ms")? {
             options = options
                 .connect_timeout(value)
-                .map_err(|error| invalid_cdc_tuning("postgres_cdc", "connect_timeout_ms", error))?;
+                .map_err(|error| invalid_cdc_tuning(endpoint, "connect_timeout_ms", error))?;
         }
-        if let Some(value) = self.milliseconds("postgres_cdc", "query_timeout_ms")? {
+        if let Some(value) = self.milliseconds(endpoint, "query_timeout_ms")? {
             options = options
                 .query_timeout(value)
-                .map_err(|error| invalid_cdc_tuning("postgres_cdc", "query_timeout_ms", error))?;
+                .map_err(|error| invalid_cdc_tuning(endpoint, "query_timeout_ms", error))?;
         }
-        if let Some(value) = self.unsigned("postgres_cdc", "retry_limit")? {
+        if let Some(value) = self.unsigned(endpoint, "retry_limit")? {
             options = options
                 .retry_limit(value)
-                .map_err(|error| invalid_cdc_tuning("postgres_cdc", "retry_limit", error))?;
+                .map_err(|error| invalid_cdc_tuning(endpoint, "retry_limit", error))?;
         }
-        if let Some(value) = self.milliseconds("postgres_cdc", "retry_max_delay_ms")? {
+        if let Some(value) = self.milliseconds(endpoint, "retry_max_delay_ms")? {
             options = options
                 .retry_max_delay(value)
-                .map_err(|error| invalid_cdc_tuning("postgres_cdc", "retry_max_delay_ms", error))?;
+                .map_err(|error| invalid_cdc_tuning(endpoint, "retry_max_delay_ms", error))?;
         }
-        if let Some(value) = self.milliseconds("postgres_cdc", "heartbeat_interval_ms")? {
-            options = options.heartbeat_interval(value).map_err(|error| {
-                invalid_cdc_tuning("postgres_cdc", "heartbeat_interval_ms", error)
-            })?;
-        }
-        if let Some(value) = self.nonzero_unsigned("postgres_cdc", "snapshot_fetch_size")? {
-            options = options.snapshot_fetch_size(value).map_err(|error| {
-                invalid_cdc_tuning("postgres_cdc", "snapshot_fetch_size", error)
-            })?;
-        }
-        Ok(options)
-    }
-
-    fn mysql_options(&self) -> Result<MySqlCdcScanOptions, SqlError> {
-        let mut options = MySqlCdcScanOptions::new();
-        if let Some(value) = self.milliseconds("mysql_cdc", "connect_timeout_ms")? {
-            options = options
-                .connect_timeout(value)
-                .map_err(|error| invalid_cdc_tuning("mysql_cdc", "connect_timeout_ms", error))?;
-        }
-        if let Some(value) = self.milliseconds("mysql_cdc", "query_timeout_ms")? {
-            options = options
-                .query_timeout(value)
-                .map_err(|error| invalid_cdc_tuning("mysql_cdc", "query_timeout_ms", error))?;
-        }
-        if let Some(value) = self.unsigned("mysql_cdc", "retry_limit")? {
-            options = options
-                .retry_limit(value)
-                .map_err(|error| invalid_cdc_tuning("mysql_cdc", "retry_limit", error))?;
-        }
-        if let Some(value) = self.milliseconds("mysql_cdc", "retry_max_delay_ms")? {
-            options = options
-                .retry_max_delay(value)
-                .map_err(|error| invalid_cdc_tuning("mysql_cdc", "retry_max_delay_ms", error))?;
-        }
-        if let Some(value) = self.milliseconds("mysql_cdc", "heartbeat_interval_ms")? {
+        if let Some(value) = self.milliseconds(endpoint, "heartbeat_interval_ms")? {
             options = options
                 .heartbeat_interval(value)
-                .map_err(|error| invalid_cdc_tuning("mysql_cdc", "heartbeat_interval_ms", error))?;
+                .map_err(|error| invalid_cdc_tuning(endpoint, "heartbeat_interval_ms", error))?;
         }
-        if let Some(value) = self.nonzero_unsigned("mysql_cdc", "snapshot_fetch_size")? {
+        if let Some(value) = self.nonzero_unsigned(endpoint, "snapshot_fetch_size")? {
             options = options
                 .snapshot_fetch_size(value)
-                .map_err(|error| invalid_cdc_tuning("mysql_cdc", "snapshot_fetch_size", error))?;
+                .map_err(|error| invalid_cdc_tuning(endpoint, "snapshot_fetch_size", error))?;
         }
         Ok(options)
     }
@@ -335,7 +300,7 @@ impl DatabaseConnection {
     fn postgres_cdc_config(
         &self,
         runtime_bundle: &Path,
-        options: PostgresCdcScanOptions,
+        options: CdcOptions,
     ) -> Result<PostgresCdcScanConfig, SqlError> {
         PostgresCdcScanConfig::new_unencrypted(
             runtime_bundle,
@@ -385,7 +350,7 @@ impl DatabaseConnection {
     fn mysql_config(
         &self,
         runtime_bundle: &Path,
-        options: MySqlCdcScanOptions,
+        options: CdcOptions,
     ) -> Result<MySqlCdcScanConfig, SqlError> {
         MySqlCdcScanConfig::new_unencrypted(
             runtime_bundle,
@@ -488,14 +453,14 @@ pub(crate) struct ResolvedPostgresCdc {
     table: String,
     publication: String,
     bootstrap_spool_bytes: NonZeroU64,
-    options: PostgresCdcScanOptions,
+    options: CdcOptions,
 }
 
 pub(crate) struct ResolvedMySqlCdc {
     connection: DatabaseConnection,
     table: String,
     bootstrap_spool_bytes: NonZeroU64,
-    options: MySqlCdcScanOptions,
+    options: CdcOptions,
 }
 
 impl ScanEndpoint {
@@ -521,7 +486,7 @@ impl ScanEndpoint {
                         bootstrap_spool_bytes: endpoint
                             .bootstrap_spool_bytes
                             .resolve_nonzero_u64("postgres_cdc", "bootstrap_spool_bytes")?,
-                        options: endpoint.tuning.postgres_options()?,
+                        options: endpoint.tuning.resolve("postgres_cdc")?,
                     },
                 )))
             }
@@ -537,7 +502,7 @@ impl ScanEndpoint {
                     bootstrap_spool_bytes: endpoint
                         .bootstrap_spool_bytes
                         .resolve_nonzero_u64("mysql_cdc", "bootstrap_spool_bytes")?,
-                    options: endpoint.tuning.mysql_options()?,
+                    options: endpoint.tuning.resolve("mysql_cdc")?,
                 })))
             }
         }
@@ -1393,7 +1358,7 @@ mod tests {
             heartbeat_interval_ms: Some(Parameter::Literal("5005".to_owned())),
             snapshot_fetch_size: Some(Parameter::Literal("6006".to_owned())),
         };
-        let expected_postgres = PostgresCdcScanOptions::new()
+        let expected = CdcOptions::new()
             .connect_timeout(std::time::Duration::from_millis(1001))
             .unwrap()
             .query_timeout(std::time::Duration::from_millis(2002))
@@ -1406,21 +1371,7 @@ mod tests {
             .unwrap()
             .snapshot_fetch_size(NonZeroU32::new(6006).unwrap())
             .unwrap();
-        let expected_mysql = MySqlCdcScanOptions::new()
-            .connect_timeout(std::time::Duration::from_millis(1001))
-            .unwrap()
-            .query_timeout(std::time::Duration::from_millis(2002))
-            .unwrap()
-            .retry_limit(3)
-            .unwrap()
-            .retry_max_delay(std::time::Duration::from_millis(4004))
-            .unwrap()
-            .heartbeat_interval(std::time::Duration::from_millis(5005))
-            .unwrap()
-            .snapshot_fetch_size(NonZeroU32::new(6006).unwrap())
-            .unwrap();
-
-        assert_eq!(tuning.postgres_options().unwrap(), expected_postgres);
-        assert_eq!(tuning.mysql_options().unwrap(), expected_mysql);
+        assert_eq!(tuning.resolve("postgres_cdc").unwrap(), expected);
+        assert_eq!(tuning.resolve("mysql_cdc").unwrap(), expected);
     }
 }

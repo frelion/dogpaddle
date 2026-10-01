@@ -156,7 +156,7 @@ URL 必须包含用户名和一个数据库路径段，用户名、密码和数�
 
 `bootstrap_spool_bytes` 是同一持久 input Queue 在 bootstrap 捕获期间的非零硬上限，默认 1 GiB。SQL 会先把所有同源引用需要的列合成最小并集，Queue 只按该 projected output 的 schema-bound entry 计费；source 的完整列声明仍用于校验每个 row image。PostgreSQL 的容量要覆盖 projected 快照和封口前的 WAL 重叠；MySQL 的容量要覆盖 projected 快照，binlog 必须保留到 streaming 追平。封口后 Flow 原地消费这条 Queue，不搬运到第二条发布队列；streaming capture 受同一 Queue 的 64 MiB 上限约束。容量不足时当前 delivery 不提交也不 ACK，需要以更大容量和新状态重建。
 
-两个 CDC Scan 都接受下面这些可选运行调优参数：
+两个 CDC Scan 都接受下面这些可选运行调优参数。两种 endpoint 共用一次参数解析和校验，得到 Operation 的 `CdcOptions` 覆盖；未设置的项由具体 Scan 决定默认值：
 
 | 参数 | 作用 | 约束 |
 | --- | --- | --- |

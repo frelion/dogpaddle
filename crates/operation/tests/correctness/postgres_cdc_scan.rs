@@ -4,8 +4,8 @@ use dogpaddle_operation::{
     operation::{
         Operation,
         scan::{
-            PostgresCdcScanConfig, PostgresCdcScanDefinition, PostgresCdcScanOptions,
-            PostgresCdcScanSpec, PostgresColumn, PostgresType,
+            CdcOptions, PostgresCdcScanConfig, PostgresCdcScanDefinition, PostgresCdcScanSpec,
+            PostgresColumn, PostgresType,
         },
     },
 };
@@ -318,15 +318,15 @@ fn postgres_cdc_projection_is_ordered_and_can_preserve_rows_without_columns() {
 
 #[test]
 fn postgres_cdc_runtime_config_is_secret_safe_and_requires_explicit_unencrypted_setup() {
-    let options = PostgresCdcScanOptions::new()
+    let options = CdcOptions::new()
         .retry_limit(3)
         .unwrap()
         .heartbeat_interval(Duration::from_secs(2))
         .unwrap();
     let debug = format!("{:?}", config().options(options));
     assert!(debug.contains("[redacted]"));
-    assert!(debug.contains("PostgresCdcScanOptions"));
-    assert!(debug.contains("retry_limit: 3"));
+    assert!(debug.contains("CdcOptions"));
+    assert!(debug.contains("retry_limit: Some(3)"));
     assert!(!debug.contains("do-not-persist-this-password"));
     assert!(
         PostgresCdcScanConfig::new_unencrypted("relative", "host", 5432, "db", "user", "password")
@@ -339,12 +339,33 @@ fn postgres_cdc_runtime_config_is_secret_safe_and_requires_explicit_unencrypted_
 }
 
 #[test]
-fn postgres_cdc_runtime_options_validate_java_bounds_before_external_io() {
-    let defaults = PostgresCdcScanOptions::new();
-    assert_eq!(defaults, PostgresCdcScanOptions::default());
+fn cdc_invalid_duration_reports_the_option_name() {
+    let options = CdcOptions::new();
+    for (name, result) in [
+        ("connect_timeout", options.connect_timeout(Duration::ZERO)),
+        ("query_timeout", options.query_timeout(Duration::ZERO)),
+        (
+            "heartbeat_interval",
+            options.heartbeat_interval(Duration::ZERO),
+        ),
+        ("retry_max_delay", options.retry_max_delay(Duration::ZERO)),
+    ] {
+        assert!(result.unwrap_err().to_string().contains(name));
+    }
+}
+
+#[test]
+fn cdc_runtime_options_validate_java_bounds_before_external_io() {
+    let defaults = CdcOptions::new();
+    assert_eq!(defaults, CdcOptions::default());
 
     let too_large = Duration::from_millis(u64::try_from(i32::MAX).unwrap() + 1);
-    for invalid in [Duration::ZERO, Duration::from_nanos(1), too_large] {
+    for invalid in [
+        Duration::ZERO,
+        Duration::from_nanos(1),
+        Duration::from_nanos(1_000_001),
+        too_large,
+    ] {
         assert!(defaults.connect_timeout(invalid).is_err());
         assert!(defaults.query_timeout(invalid).is_err());
         assert!(defaults.heartbeat_interval(invalid).is_err());
@@ -362,6 +383,16 @@ fn postgres_cdc_runtime_options_validate_java_bounds_before_external_io() {
             .query_timeout(Duration::from_millis(2_147_483_001))
             .is_err()
     );
+    assert!(
+        defaults
+            .query_timeout(Duration::from_secs(2_147_483))
+            .is_ok()
+    );
+    let maximum_duration = Duration::from_millis(u64::try_from(i32::MAX).unwrap());
+    assert!(defaults.connect_timeout(maximum_duration).is_ok());
+    assert!(defaults.heartbeat_interval(maximum_duration).is_ok());
+    assert!(defaults.retry_max_delay(maximum_duration).is_ok());
+    assert!(defaults.retry_limit(0).is_ok());
 
     let maximum = u32::try_from(i32::MAX).unwrap();
     assert!(defaults.retry_limit(maximum).is_ok());

@@ -1,19 +1,15 @@
-use std::{fmt, num::NonZeroU32, path::PathBuf, time::Duration};
+use std::{fmt, path::PathBuf, time::Duration};
 
 use dogpaddle_debezium::{Checkpoint, Connector, ConnectorConfig, DebeziumRuntime, ErrorKind};
 use postgres::{Client, Config, GenericClient, NoTls};
 
+use super::super::CdcOptions;
 use super::{PostgresCdcScanError, PostgresCdcScanSpec, PostgresColumn, PostgresType, schema};
 
 pub(super) const CONNECTOR_CLASS: &str = "io.debezium.connector.postgresql.PostgresConnector";
 const MAX_DELIVERY_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_CONNECT_TIMEOUT_MS: i32 = 5_000;
 const DEFAULT_QUERY_TIMEOUT_MS: i32 = 5_000;
-const MAX_JDBC_QUERY_TIMEOUT_MS: i32 = i32::MAX / 1_000 * 1_000;
-const DEFAULT_RETRY_MAX_DELAY_MS: i32 = 10_000;
-const RETRY_INITIAL_DELAY_MS: i32 = 300;
-const DEFAULT_STREAM_HEARTBEAT_INTERVAL_MS: i32 = 1_000;
-const SNAPSHOT_HEARTBEAT_INTERVAL_MS: i32 = 1;
 const DEFAULT_SNAPSHOT_FETCH_SIZE: i32 = 10_240;
 
 #[derive(Clone, Copy)]
@@ -28,149 +24,6 @@ enum ConnectorMode {
     Streaming,
 }
 
-/// Runtime-only tuning for one `PostgreSQL` CDC Scan.
-///
-/// The defaults preserve `DogPaddle`'s existing connection and query deadlines,
-/// Debezium's unlimited post-start retry policy, and the pinned Debezium 3.6
-/// snapshot and retry behavior. These values are not encoded into an Operation
-/// or Flow Definition, so a caller may replace them when reopening existing
-/// state.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PostgresCdcScanOptions {
-    connect_timeout_ms: i32,
-    query_timeout_ms: i32,
-    retry_limit: i32,
-    retry_max_delay_ms: i32,
-    heartbeat_interval_ms: i32,
-    snapshot_fetch_size: i32,
-}
-
-impl PostgresCdcScanOptions {
-    /// Creates options with the supported defaults.
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            connect_timeout_ms: DEFAULT_CONNECT_TIMEOUT_MS,
-            query_timeout_ms: DEFAULT_QUERY_TIMEOUT_MS,
-            retry_limit: -1,
-            retry_max_delay_ms: DEFAULT_RETRY_MAX_DELAY_MS,
-            heartbeat_interval_ms: DEFAULT_STREAM_HEARTBEAT_INTERVAL_MS,
-            snapshot_fetch_size: DEFAULT_SNAPSHOT_FETCH_SIZE,
-        }
-    }
-
-    /// Sets the deadline for native discovery and Debezium JDBC connections.
-    ///
-    /// `PostgreSQL` JDBC accepts whole seconds, so the connector deadline is
-    /// rounded up while native discovery retains the exact millisecond value.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error unless `timeout` is a positive whole number of
-    /// milliseconds representable by a Java signed integer.
-    pub fn connect_timeout(mut self, timeout: Duration) -> Result<Self, PostgresCdcScanError> {
-        self.connect_timeout_ms = duration_millis("connect timeout", timeout)?;
-        Ok(self)
-    }
-
-    /// Sets the deadline for native catalog statements and Debezium queries.
-    ///
-    /// Debezium 3.6 ultimately gives JDBC whole seconds, so a sub-second
-    /// remainder is rounded up for the connector while native discovery keeps
-    /// the exact duration.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error unless `timeout` is a positive whole number of
-    /// milliseconds no greater than 2,147,483,000 milliseconds.
-    pub fn query_timeout(mut self, timeout: Duration) -> Result<Self, PostgresCdcScanError> {
-        let milliseconds = duration_millis("query timeout", timeout)?;
-        if milliseconds > MAX_JDBC_QUERY_TIMEOUT_MS {
-            return Err(PostgresCdcScanError::invalid_options(
-                "query timeout exceeds 2,147,483,000 milliseconds",
-            ));
-        }
-        self.query_timeout_ms = milliseconds;
-        Ok(self)
-    }
-
-    /// Sets how many times Debezium retries a retryable polling failure.
-    ///
-    /// Zero disables retries. Leaving the default options unchanged preserves
-    /// Debezium's unlimited retry policy. This setting applies after connector
-    /// startup; it does not govern initial task startup or replication-slot
-    /// creation.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when `limit` exceeds a Java signed integer.
-    pub fn retry_limit(mut self, limit: u32) -> Result<Self, PostgresCdcScanError> {
-        self.retry_limit = i32::try_from(limit).map_err(|_| {
-            PostgresCdcScanError::invalid_options("retry limit exceeds Java Integer.MAX_VALUE")
-        })?;
-        Ok(self)
-    }
-
-    /// Sets the maximum delay in Debezium's post-start polling retry loop.
-    ///
-    /// The initial retry delay remains fixed at 300 milliseconds.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error unless `delay` is a whole number of milliseconds,
-    /// greater than 300 milliseconds, and representable by a Java signed
-    /// integer.
-    pub fn retry_max_delay(mut self, delay: Duration) -> Result<Self, PostgresCdcScanError> {
-        let delay = duration_millis("maximum retry delay", delay)?;
-        if delay <= RETRY_INITIAL_DELAY_MS {
-            return Err(PostgresCdcScanError::invalid_options(
-                "maximum retry delay must exceed 300 milliseconds",
-            ));
-        }
-        self.retry_max_delay_ms = delay;
-        Ok(self)
-    }
-
-    /// Sets the heartbeat interval used after the initial snapshot is sealed.
-    ///
-    /// Snapshot capture retains `DogPaddle`'s internal one-millisecond heartbeat.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error unless `interval` is a positive whole number of
-    /// milliseconds representable by a Java signed integer.
-    pub fn heartbeat_interval(mut self, interval: Duration) -> Result<Self, PostgresCdcScanError> {
-        self.heartbeat_interval_ms = duration_millis("heartbeat interval", interval)?;
-        Ok(self)
-    }
-
-    /// Sets the maximum rows fetched in one initial-snapshot database batch.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when `size` exceeds a Java signed integer.
-    pub fn snapshot_fetch_size(mut self, size: NonZeroU32) -> Result<Self, PostgresCdcScanError> {
-        self.snapshot_fetch_size = i32::try_from(size.get()).map_err(|_| {
-            PostgresCdcScanError::invalid_options(
-                "snapshot fetch size exceeds Java Integer.MAX_VALUE",
-            )
-        })?;
-        Ok(self)
-    }
-
-    fn connect_timeout_duration(self) -> Duration {
-        Duration::from_millis(
-            u64::try_from(self.connect_timeout_ms).expect("validated connect timeout is positive"),
-        )
-    }
-}
-
-impl Default for PostgresCdcScanOptions {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Ephemeral `PostgreSQL` credentials and the installed Debezium runtime bundle.
 ///
 /// This pilot explicitly uses unencrypted `PostgreSQL` connections. Use it only
@@ -183,7 +36,7 @@ pub struct PostgresCdcScanConfig {
     database: String,
     user: String,
     password: String,
-    options: PostgresCdcScanOptions,
+    options: CdcOptions,
 }
 
 impl PostgresCdcScanConfig {
@@ -210,7 +63,7 @@ impl PostgresCdcScanConfig {
             database: database.into(),
             user: user.into(),
             password: password.into(),
-            options: PostgresCdcScanOptions::new(),
+            options: CdcOptions::new(),
         };
         if !config.runtime_bundle.is_absolute() || port == 0 {
             return Err(PostgresCdcScanError::new(
@@ -231,7 +84,7 @@ impl PostgresCdcScanConfig {
 
     /// Replaces runtime tuning without connecting or changing persistent identity.
     #[must_use]
-    pub const fn options(mut self, options: PostgresCdcScanOptions) -> Self {
+    pub const fn options(mut self, options: CdcOptions) -> Self {
         self.options = options;
         self
     }
@@ -363,14 +216,18 @@ impl PostgresCdcScanConfig {
     fn connect_read_only(&self) -> Result<Client, PostgresCdcScanError> {
         self.connect(&format!(
             "-c statement_timeout={} -c default_transaction_read_only=on",
-            self.options.query_timeout_ms
+            self.options
+                .query_timeout_ms
+                .unwrap_or(DEFAULT_QUERY_TIMEOUT_MS)
         ))
     }
 
     fn connect_management(&self) -> Result<Client, PostgresCdcScanError> {
         self.connect(&format!(
             "-c statement_timeout={}",
-            self.options.query_timeout_ms
+            self.options
+                .query_timeout_ms
+                .unwrap_or(DEFAULT_QUERY_TIMEOUT_MS)
         ))
     }
 
@@ -381,7 +238,9 @@ impl PostgresCdcScanConfig {
             .dbname(&self.database)
             .user(&self.user)
             .password(&self.password)
-            .connect_timeout(self.options.connect_timeout_duration())
+            .connect_timeout(self.options.connect_timeout_or(Duration::from_millis(
+                u64::try_from(DEFAULT_CONNECT_TIMEOUT_MS).expect("default timeout is positive"),
+            )))
             .options(options)
             .connect(NoTls)
             .map_err(|error| catalog_error("connect", &error))
@@ -589,59 +448,18 @@ impl fmt::Debug for PostgresCdcScanConfig {
     }
 }
 
-fn duration_millis(label: &str, duration: Duration) -> Result<i32, PostgresCdcScanError> {
-    let milliseconds = i32::try_from(duration.as_millis()).map_err(|_| {
-        PostgresCdcScanError::invalid_options(format!(
-            "{label} exceeds Java Integer.MAX_VALUE milliseconds"
-        ))
-    })?;
-    if milliseconds == 0 || !duration.subsec_nanos().is_multiple_of(1_000_000) {
-        return Err(PostgresCdcScanError::invalid_options(format!(
-            "{label} must be a positive whole number of milliseconds"
-        )));
-    }
-    Ok(milliseconds)
-}
-
-fn tuning_properties(
-    options: PostgresCdcScanOptions,
-    mode: ConnectorMode,
-) -> Vec<(&'static str, String)> {
-    let connect_timeout_seconds = u64::try_from(options.connect_timeout_ms)
-        .expect("validated connect timeout is positive")
-        .div_ceil(1_000);
-    let heartbeat_interval_ms = match mode {
-        ConnectorMode::Snapshot => SNAPSHOT_HEARTBEAT_INTERVAL_MS,
-        ConnectorMode::Streaming => options.heartbeat_interval_ms,
-    };
-    let mut properties = vec![
+fn tuning_properties(options: CdcOptions, mode: ConnectorMode) -> Vec<(&'static str, String)> {
+    let connect_timeout_ms = options
+        .connect_timeout_ms
+        .unwrap_or(DEFAULT_CONNECT_TIMEOUT_MS);
+    let connect_timeout_seconds =
+        connect_timeout_ms / 1_000 + i32::from(connect_timeout_ms % 1_000 != 0);
+    options.connector_properties(
         ("driver.connectTimeout", connect_timeout_seconds.to_string()),
-        (
-            "database.query.timeout.ms",
-            jdbc_query_timeout_millis(options.query_timeout_ms).to_string(),
-        ),
-        ("errors.max.retries", options.retry_limit.to_string()),
-        (
-            "errors.retry.delay.initial.ms",
-            RETRY_INITIAL_DELAY_MS.to_string(),
-        ),
-        (
-            "errors.retry.delay.max.ms",
-            options.retry_max_delay_ms.to_string(),
-        ),
-        ("heartbeat.interval.ms", heartbeat_interval_ms.to_string()),
-    ];
-    if matches!(mode, ConnectorMode::Snapshot) {
-        properties.push((
-            "snapshot.fetch.size",
-            options.snapshot_fetch_size.to_string(),
-        ));
-    }
-    properties
-}
-
-fn jdbc_query_timeout_millis(milliseconds: i32) -> i32 {
-    (milliseconds / 1_000 + i32::from(milliseconds % 1_000 != 0)) * 1_000
+        matches!(mode, ConnectorMode::Snapshot),
+        DEFAULT_QUERY_TIMEOUT_MS,
+        Some(DEFAULT_SNAPSHOT_FETCH_SIZE),
+    )
 }
 
 fn validate_publication(
@@ -759,11 +577,13 @@ fn catalog_error(stage: &str, error: &postgres::Error) -> PostgresCdcScanError {
 
 #[cfg(test)]
 mod option_tests {
+    use std::num::NonZeroU32;
+
     use super::*;
 
     #[test]
     fn defaults_pin_every_tuning_property_and_keep_snapshot_heartbeat_private() {
-        let options = PostgresCdcScanOptions::new();
+        let options = CdcOptions::new();
         assert_eq!(
             tuning_properties(options, ConnectorMode::Snapshot),
             vec![
@@ -784,7 +604,7 @@ mod option_tests {
 
     #[test]
     fn customized_tuning_maps_units_and_keeps_snapshot_heartbeat_private() {
-        let options = PostgresCdcScanOptions::new()
+        let options = CdcOptions::new()
             .connect_timeout(Duration::from_millis(1_001))
             .unwrap()
             .query_timeout(Duration::from_millis(2_001))
@@ -797,6 +617,10 @@ mod option_tests {
             .unwrap()
             .snapshot_fetch_size(NonZeroU32::new(17).unwrap())
             .unwrap();
+        assert_eq!(
+            options.connect_timeout_or(Duration::from_secs(5)),
+            Duration::from_millis(1_001)
+        );
         assert_eq!(
             tuning_properties(options, ConnectorMode::Streaming),
             vec![
@@ -816,5 +640,22 @@ mod option_tests {
             tuning_properties(options, ConnectorMode::Snapshot)[6],
             ("snapshot.fetch.size", "17".to_owned())
         );
+    }
+
+    #[test]
+    fn jdbc_timeouts_round_up_without_overflow_at_java_bounds() {
+        for (connect_ms, query_ms, connect_seconds, query_milliseconds) in [
+            (1, 1, "1", "1000"),
+            (2_147_483_647, 2_147_483_000, "2147484", "2147483000"),
+        ] {
+            let options = CdcOptions::new()
+                .connect_timeout(Duration::from_millis(connect_ms))
+                .unwrap()
+                .query_timeout(Duration::from_millis(query_ms))
+                .unwrap();
+            let properties = tuning_properties(options, ConnectorMode::Streaming);
+            assert_eq!(properties[0].1, connect_seconds);
+            assert_eq!(properties[1].1, query_milliseconds);
+        }
     }
 }

@@ -130,6 +130,7 @@ nearest、tolerance、多 order、residual、tie-break、NotDistinct、canonical
 Source 拥有一条 input Queue、phase、checkpoint 和真实 Delivery 的 ACK。快照封口前隐藏，封口后在原地可消费，不把 payload 搬到第二条队列。
 `published` 只读返回 schema-bound front bytes；调用方用 exact Schema 解码，完成全部页和下游调用后以 `consume_published` 同事务删除前项。捕获只追加，不随 consumer 进度延迟 ACK。
 捕获、恢复、容量及 `PostgreSQL` / `MySQL` 差异由 [CDC 契约](docs/cdc.md) 规定。
+两种源的 Config 均接收 `CdcOptions` 的六项运行覆盖；未设置的项由具体源使用各自默认值，参数校验返回 `CdcOptionsError`。它们不进入 Definition 或持久状态。
 
 Sink 拥有 outbox，事件位置同时确定消费进度和固定 occurrence IDs；Prepared 只保存边界与删除 IDs。enqueue 与独立 drain 的事务、
 目标重投及负 diff 前缀验证由 [Sink 契约](docs/sinks.md) 规定。

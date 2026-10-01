@@ -3,6 +3,25 @@
 本文件是该领域的维护契约；用法和阅读入口见 [crate README](../README.md)。
 修改实现时同步更新本文件及其所属测试。
 
+## 运行调优
+
+`PostgresCdcScanConfig::options` 和 `MySqlCdcScanConfig::options` 统一接收 `CdcOptions`。`new()` / `default()` 不设置任何覆盖；具体源在发现和 connector 启动时分别应用自己的默认值，不预先解析或保存第二份调优状态。六个 setter 都在外部 I/O 前校验，失败返回包含 setter 参数名和原因的 `CdcOptionsError`。
+
+| setter | 准入 | connector 属性 |
+| --- | --- | --- |
+| `connect_timeout(Duration)` | 正整数毫秒，至多 `2147483647` | PG `driver.connectTimeout` 向上取整为秒；MySQL `connect.timeout.ms` 保留毫秒 |
+| `query_timeout(Duration)` | 正整数毫秒，至多 `2147483000` | `database.query.timeout.ms` 向上取整至下一个整秒的毫秒数 |
+| `retry_limit(u32)` | `0..=2147483647` | `errors.max.retries`，`0` 禁用重试，未设置为无限重试 `-1` |
+| `retry_max_delay(Duration)` | 整数毫秒，`301..=2147483647` | `errors.retry.delay.max.ms`，初始延迟固定 `300ms` |
+| `heartbeat_interval(Duration)` | 正整数毫秒，至多 `2147483647` | `heartbeat.interval.ms`，只应用于持续捕获 |
+| `snapshot_fetch_size(NonZeroU32)` | `1..=2147483647` | `snapshot.fetch.size`，只应用于初始快照 |
+
+PG 发现和 connector 默认连接、查询超时均为 5 秒，快照 fetch size 默认 `10240`。MySQL 发现默认连接、查询超时为 5 秒，connector 分别为 30 秒和 10 分钟；其快照 fetch size 默认省略，保留 Debezium 的流式读取行为。两者持续捕获 heartbeat 默认为 1 秒，bootstrap 固定为 1 毫秒；重试最大延迟默认为 10 秒。
+
+显式连接和查询覆盖同时用于发现与 connector。发现保留精确毫秒；MySQL 发现查询预算用于 socket 读写，connector 用于 JDBC statement。JDBC 的整秒向上取整防止 `1..999ms` 变为无限等待。重试仅作用于启动成功后的 polling 故障，不延长固定 60 秒 readiness 边界，也不控制 PG slot 创建。
+
+这些覆盖只存在于本次进程的 Config，不改变 Definition、Program 身份、资源布局或恢复状态；重开时再次提供。SQL 两个 endpoint 的同名参数通过同一解析路径产生 `CdcOptions`，参数词汇及单位见 [SQL endpoint 合同](../../sql/README.md#endpoint-合同)。
+
 ## PostgreSQL
 
 PostgresCdcScan 只有一个具体 Scan，不另建公共 IngressScan 或 connector driver trait。
