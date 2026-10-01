@@ -765,3 +765,134 @@ fn partition_view_reads_and_writes_generic_values_using_the_same_map() {
     );
     transaction.commit().unwrap();
 }
+
+#[test]
+fn partition_presence_observes_transaction_writes_and_stable_snapshots() {
+    let root = tempfile::tempdir().unwrap();
+    let path = store_path(&root);
+    let mut setup = StoreSetup::new();
+    let values = setup
+        .create_data::<OrderedMap<PartitionKey<Vec<u8>, Vec<u8>>, NonZeroU64>>("values")
+        .unwrap();
+    let (mut writes, reads) = setup.commit(&path, |_| Ok(())).unwrap().split();
+    let old = reads.begin();
+    let empty = Vec::new();
+    let zero = vec![0];
+    let neighbor = vec![0, 0];
+    {
+        let transaction = writes.begin();
+        let mut access = values.access(transaction.access()).unwrap();
+        access
+            .partition(&empty)
+            .unwrap()
+            .set_multiplicity(&empty, 1)
+            .unwrap();
+        access
+            .partition(&neighbor)
+            .unwrap()
+            .set_multiplicity(&empty, 1)
+            .unwrap();
+        let mut partition = access.partition(&zero).unwrap();
+        assert!(partition.is_empty().unwrap());
+        assert!(!partition.has_other_key(&empty).unwrap());
+        partition.set_multiplicity(&empty, 1).unwrap();
+        assert!(!partition.is_empty().unwrap());
+        assert!(!partition.has_other_key(&empty).unwrap());
+        assert!(partition.has_other_key(&zero).unwrap());
+        partition.set_multiplicity(&zero, 2).unwrap();
+        assert!(partition.has_other_key(&empty).unwrap());
+        assert!(partition.has_other_key(&zero).unwrap());
+        partition.set_multiplicity(&empty, 0).unwrap();
+        assert!(!partition.has_other_key(&zero).unwrap());
+        transaction.commit().unwrap();
+    }
+    let old_access = values.read(old.access()).unwrap();
+    assert!(old_access.partition(&zero).unwrap().is_empty().unwrap());
+    assert!(
+        !old_access
+            .partition(&zero)
+            .unwrap()
+            .has_other_key(&empty)
+            .unwrap()
+    );
+    drop(old);
+    {
+        let current = reads.begin();
+        let access = values.read(current.access()).unwrap();
+        let partition = access.partition(&zero).unwrap();
+        assert!(!partition.is_empty().unwrap());
+        assert!(!partition.has_other_key(&zero).unwrap());
+        assert!(partition.has_other_key(&empty).unwrap());
+    }
+    {
+        let transaction = writes.begin();
+        let mut access = values.access(transaction.access()).unwrap();
+        let mut partition = access.partition(&zero).unwrap();
+        partition.set_multiplicity(&zero, 0).unwrap();
+        assert!(partition.is_empty().unwrap());
+        // Roll back this deletion; the adjacent partition must never count.
+    }
+    drop((writes, reads));
+    let store = Store::open(&path).unwrap();
+    let values = store
+        .open_data::<OrderedMap<PartitionKey<Vec<u8>, Vec<u8>>, NonZeroU64>>("values")
+        .unwrap();
+    let snapshot = store.read_transaction();
+    let access = values.read(snapshot.access()).unwrap();
+    assert!(!access.partition(&zero).unwrap().is_empty().unwrap());
+    assert!(
+        !access
+            .partition(&zero)
+            .unwrap()
+            .has_other_key(&zero)
+            .unwrap()
+    );
+    assert!(access.partition(&vec![0, 1]).unwrap().is_empty().unwrap());
+}
+
+#[test]
+fn partition_presence_does_not_decode_neighbor_values_and_preserves_poison() {
+    let root = tempfile::tempdir().unwrap();
+    let path = store_path(&root);
+    let mut setup = StoreSetup::new();
+    let raw = setup
+        .create_data::<OrderedMap<PartitionKey<Vec<u8>, Vec<u8>>, Vec<u8>>>("values")
+        .unwrap();
+    let partition_key = vec![0];
+    let local_key = Vec::new();
+    let transactions = setup
+        .commit(&path, |access| {
+            raw.access(access)?
+                .partition(&partition_key)?
+                .put(&local_key, &vec![0; 8])
+        })
+        .unwrap();
+    drop(transactions);
+    let store = Store::open(&path).unwrap();
+    let values = store
+        .open_data::<OrderedMap<PartitionKey<Vec<u8>, Vec<u8>>, NonZeroU64>>("values")
+        .unwrap();
+    let mut transactions = store.into_transactions();
+    let transaction = transactions.begin();
+    let mut access = values.access(transaction.access()).unwrap();
+    let partition = access.partition(&partition_key).unwrap();
+    assert!(!partition.is_empty().unwrap());
+    assert!(!partition.has_other_key(&local_key).unwrap());
+    assert!(partition.has_other_key(&vec![1]).unwrap());
+    assert!(matches!(
+        partition.multiplicity(&local_key),
+        Err(StoreError::Codec(_))
+    ));
+    assert!(matches!(
+        partition.is_empty(),
+        Err(StoreError::TransactionPoisoned)
+    ));
+    assert!(matches!(
+        partition.has_other_key(&local_key),
+        Err(StoreError::TransactionPoisoned)
+    ));
+    assert!(matches!(
+        transaction.commit(),
+        Err(StoreError::TransactionPoisoned)
+    ));
+}

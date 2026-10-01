@@ -271,3 +271,51 @@ draft 和 PostgreSQL 缓存 SQL。程序不发布 Store，不访问数据库、�
 `754cfb927ca381f3be5e8e35d71d332255a727863796db9bf247860bab894fae`，
 测量 Cargo.lock SHA256 为
 `4d35f0727efabafd13d9163bdba29dce19243587b42b00960b5ba5416eafb4cc`。
+
+## EquiJoin 从 Rows 推导纯 presence：2026-10-01 对照
+
+无 residual 的非 Inner 不再声明 key-count 资源，也不读写其 16-byte value；
+presence 和 first/last distinct-row 边界由真实 Rows 分区推导。所有 kind 的当前事件
+最后一页直接写回已检查的 after 权重，省去重复点读。residual qualifying support
+仍保留，Rows key/value 和 Resume 不变；受影响的开发期状态直接重建。
+最终生产 Rust（排除私有测试模块）净减少 16 行，主要收益是退休派生持久事实及维护机制。
+
+Apple M5、macOS arm64、Rust 1.96，同一锁文件与原 `equi_join` reference fixture：
+1024 个同 key 候选、256 head items、4 MiB 页预算、同步提交；每 case 10 samples，
+100 ms warmup、5 s measurement。baseline 为 `7502703`，最终 candidate 为同一
+基线加本轮 diff；benchmark 只改上下文说明，fixture、计时与输出行数/方向 oracle 未改。
+两个保存的 release binary 按 baseline/candidate/candidate/baseline 顺序运行全部 11 cases。
+下表为每轮 Criterion mean 的变化；正值表示变慢，CI 栏表示该轮两侧 95% CI 是否重叠。
+
+| case | 正序变化 | CI 重叠 | 反序变化 | CI 重叠 |
+| --- | ---: | :---: | ---: | :---: |
+| full_outer_first_last_match | +3.29% | 否 | -2.65% | 否 |
+| full_outer_residual_partial_transition | -7.58% | 否 | -13.93% | 否 |
+| inner_first_last_match | +1.47% | 否 | -6.73% | 否 |
+| inner_residual_full_selectivity | +1.22% | 是 | -29.14% | 否 |
+| inner_residual_half_selective | +1.39% | 是 | -2.22% | 否 |
+| inner_residual_zero_selectivity | +0.95% | 是 | -4.28% | 否 |
+| left_semi_first_last_match | +3.00% | 否 | -7.61% | 否 |
+| left_semi_presence_stable | -8.24% | 否 | -2.12% | 是 |
+| left_semi_residual_left_presence_stable | -3.48% | 是 | +7.45% | 否 |
+| left_semi_residual_partial_transition | -8.68% | 否 | -24.83% | 否 |
+| left_semi_residual_presence_stable | -6.12% | 否 | -23.34% | 否 |
+
+先前把事件准入逻辑展开在 driver 内的 candidate，完整 ABBA 的 Inner residual
+zero/half/full 分别出现 +12.23%/+7.79%/+4.87% 和 +59.11%/+14.37%/+19.64%，
+全部 CI 分离。用同一对原二进制只过滤这三个 case 重测后，变化为
++1.66%/+1.20%/+1.05% 和 +0.07%/+0.02%/-0.39%；仅 half 正序 CI 分离。
+最终代码把事件准入恢复为借用同一 partition 的小函数；读写、prefix 生命周期和预算未改。
+原始负证据仍保留；结果对运行上下文敏感，尚未分离顺序、前序 workload 与 host 状态
+的影响，不能证明内联是原因，也不构成普遍提速、无性能回归或 RSS 改善的承诺。
+
+仓库外相同公开 API 程序核实三个 Inner residual selectivity 的插入/撤回各用四页，
+每页消费 256 work items，输出行数、方向和 More/Done 与原版本逐页相同；
+新版本每页恰多 44 bytes 剩余预算。单页时钟读数仅作诊断，不作为吞吐对照。
+两组无 residual 宽 equality 测试在原 8 MiB/1 MiB 页预算均完成；新版本接受了
+4 MiB/512 KiB 的四个首段探测，但四个续段仍拒绝，不代表整个 workload 已适配小页。
+
+完整与过滤的原始 samples、estimates、比较、源码 patch 与 binary SHA 保存在
+`/tmp/dogpaddle-join-partition-presence-performance/`；最终对照为
+`helper-comparison.json`，原展开版本为 `comparison.json`，过滤对照为
+`filtered-comparison.json`。逐页程序与 oracle 保存在 `/tmp/dogpaddle-join-page-witness/`。

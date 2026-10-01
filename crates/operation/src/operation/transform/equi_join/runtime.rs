@@ -8,7 +8,7 @@ use std::{cell::OnceCell, mem::size_of, num::NonZeroU64, ops::Deref, sync::Arc};
 use arrow_array::{Array, Int64Array, RecordBatch, RecordBatchOptions};
 use arrow_schema::{Field, SchemaRef};
 use datafusion_common::ScalarValue;
-use dogpaddle_store::{OrderedMapAccess, StoreError, TransactionAccess};
+use dogpaddle_store::{MapPartition, OrderedMapAccess, TransactionAccess};
 
 use crate::{
     expression::BoundExpression,
@@ -23,7 +23,7 @@ use crate::{
 
 use super::{
     EquiJoinError, EquiJoinKind,
-    state::{Counts, JoinCursor, MatchCounts, Rows, actual_match_key},
+    state::{JoinCursor, MatchCounts, Rows, actual_match_key},
 };
 
 use output::OutputRows;
@@ -69,7 +69,6 @@ pub(crate) struct EquiJoinOperation {
     pub(super) nulls: [Vec<ScalarValue>; 2],
     pub(super) left_rows: Rows,
     pub(super) right_rows: Rows,
-    pub(super) key_counts: Option<Counts>,
     pub(super) match_counts: Option<MatchCounts>,
 }
 
@@ -329,12 +328,12 @@ impl EquiJoinOperation {
 
     fn event_effect(
         &self,
-        port: usize,
         row: &PreparedRow,
-        access: TransactionAccess<'_>,
-    ) -> Result<RowEffect, EquiJoinError> {
-        let mut own = self.rows(port).access(access)?;
-        let before = own.partition(&row.key)?.multiplicity(&row.row)?;
+        partition: &MapPartition<'_, '_, Vec<u8>, NonZeroU64>,
+    ) -> Result<(RowEffect, u64), EquiJoinError> {
+        let before = partition
+            .multiplicity(&row.row)
+            .map_err(EquiJoinError::Store)?;
         let after = adjusted_weight(before, row.difference)?;
         let mut effect = RowEffect {
             matched: row.matchable,
@@ -346,23 +345,24 @@ impl EquiJoinOperation {
                 (false, true) => KeyTransition::Last,
                 _ => KeyTransition::None,
             };
-        } else if row.matchable
-            && let Some(counts) = &self.key_counts
-        {
-            let mut counts = counts
-                .access(access)?
-                .get_bounded(&row.key, 16)?
-                .unwrap_or_default();
-            let key_before = counts.0[port];
-            effect.matched = counts.0[1 - port] > 0;
-            counts.adjust(port, before, after)?;
-            effect.transition = match (key_before == 0, counts.0[port] == 0) {
-                (true, false) => KeyTransition::First,
-                (false, true) => KeyTransition::Last,
-                _ => KeyTransition::None,
+        } else if self.kind != EquiJoinKind::Inner && row.matchable {
+            effect.transition = if before == 0
+                && after > 0
+                && partition.is_empty().map_err(EquiJoinError::Store)?
+            {
+                KeyTransition::First
+            } else if before > 0
+                && after == 0
+                && !partition
+                    .has_other_key(&row.row)
+                    .map_err(EquiJoinError::Store)?
+            {
+                KeyTransition::Last
+            } else {
+                KeyTransition::None
             };
         }
-        Ok(effect)
+        Ok((effect, after))
     }
 
     #[expect(
@@ -402,16 +402,27 @@ impl EquiJoinOperation {
             if !budget.can_start(prepared) {
                 break;
             }
-            // Admission reads, final adjustment read/write, and optional
-            // support-count reads/writes all share the page allowance.
-            budget.charge(StepBudget::stored_row_bytes(prepared).saturating_mul(3))?;
-            if self.key_counts.is_some() {
-                budget.charge(prepared.key.len().saturating_add(16).saturating_mul(3))?;
+            // One admission read and final write; the checked weight remains
+            // local to this event and is recomputed after every continuation.
+            budget.charge(StepBudget::stored_row_bytes(prepared).saturating_mul(2))?;
+            if self.residual.is_none() && self.kind != EquiJoinKind::Inner && prepared.matchable {
+                // Each presence query owns one physical seek (P + 5) and
+                // namespace upper bound (5), never a neighbor row payload.
+                budget.charge(
+                    partition_bytes(&prepared.key)
+                        .saturating_add(10)
+                        .saturating_mul(2),
+                )?;
             }
             if self.match_counts.is_some() {
                 budget.charge(prepared.row.len().saturating_add(9).saturating_mul(3))?;
             }
-            let effect = self.event_effect(input.port, prepared, access)?;
+            let mut own = self
+                .rows(input.port)
+                .access(access)
+                .map_err(EquiJoinError::Store)?;
+            let mut partition = own.partition(&prepared.key).map_err(EquiJoinError::Store)?;
+            let (mut effect, after) = self.event_effect(prepared, &partition)?;
             let row = ActiveRow::new(prepared, slice.records(), index);
             if self.residual.is_some() {
                 let found_match =
@@ -465,7 +476,7 @@ impl EquiJoinOperation {
                 let Some(page) = self.scan_matches(
                     input.port,
                     &row,
-                    effect,
+                    &mut effect,
                     state.resume_after.as_ref(),
                     budget,
                     access,
@@ -492,7 +503,9 @@ impl EquiJoinOperation {
                     break;
                 }
             }
-            self.adjust_own_row(input.port, &row, access)?;
+            partition
+                .set_multiplicity(&prepared.row, after)
+                .map_err(EquiJoinError::Store)?;
             next += 1;
             state.found_match = false;
             state.resume_after = None;
@@ -675,34 +688,6 @@ impl EquiJoinOperation {
         Ok(actual > 0)
     }
 
-    fn adjust_own_row(
-        &self,
-        port: usize,
-        row: &PreparedRow,
-        access: TransactionAccess<'_>,
-    ) -> Result<(), EquiJoinError> {
-        let change = self
-            .rows(port)
-            .access(access)?
-            .partition(&row.key)?
-            .adjust(&row.row, row.difference)
-            .map_err(map_weight_error)?;
-        if row.matchable
-            && let Some(counts) = &self.key_counts
-            && (change.before() == 0) != (change.after() == 0)
-        {
-            let mut counts = counts.access(access)?;
-            let mut value = counts.get_bounded(&row.key, 16)?.unwrap_or_default();
-            value.adjust(port, change.before(), change.after())?;
-            if value.is_empty() {
-                counts.erase(&row.key)?;
-            } else {
-                counts.put(&row.key, &value)?;
-            }
-        }
-        Ok(())
-    }
-
     fn output_work(
         &self,
         port: usize,
@@ -880,14 +865,6 @@ fn match_transition(before: u64, after: u64) -> MatchTransition {
     }
 }
 
-fn map_weight_error(error: StoreError) -> EquiJoinError {
-    match error {
-        StoreError::MultiplicityUnderflow => EquiJoinError::NegativeWeight,
-        StoreError::MultiplicityOverflow => EquiJoinError::WeightOverflow,
-        source => EquiJoinError::Store(source),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1009,7 +986,6 @@ mod tests {
             nulls: [Vec::new(), Vec::new()],
             left_rows: scope.data("left").unwrap(),
             right_rows: scope.data("right").unwrap(),
-            key_counts: None,
             match_counts: None,
         };
         // Utf8 canonical framing writes its marker and u64 length before the
@@ -1032,5 +1008,95 @@ mod tests {
             .unwrap();
         assert!(error.is::<BudgetExceeded>());
         assert_eq!(budget.remaining_bytes(), 0);
+    }
+
+    #[test]
+    fn past_last_candidate_cursor_does_not_make_a_nonempty_partition_unmatched() {
+        use super::{JoinCursor, canonical_row_bounded};
+        use crate::operation::transform::{EquiJoinDefinition, EquiJoinKind};
+        use crate::operation::{Cursor, OperationInput, Progress, Resume};
+        use crate::{OperationDefinition, RuntimeResource, col};
+        use arrow_array::{Int64Array, UInt64Array};
+        use dogpaddle_change::Change;
+        use dogpaddle_store::StoreSetup;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::UInt64, false),
+            Field::new("value", DataType::UInt64, false),
+        ]));
+        let event = |value| {
+            Change::try_new(
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(UInt64Array::from(vec![1])),
+                        Arc::new(UInt64Array::from(vec![value])),
+                    ],
+                )
+                .unwrap(),
+                Int64Array::from(vec![1]),
+            )
+            .unwrap()
+        };
+        let mut setup = StoreSetup::new();
+        let operation = OperationDefinition::from(
+            EquiJoinDefinition::try_new(
+                EquiJoinKind::FullOuter,
+                [(col("key"), col("key"))],
+                ["lk", "lv", "rk", "rv"],
+                None,
+            )
+            .unwrap(),
+        )
+        .construct(
+            &[Arc::clone(&schema), Arc::clone(&schema)],
+            &mut setup.data_scope(),
+            RuntimeResource::none(),
+        )
+        .unwrap()
+        .into_parts()
+        .0;
+        let root = tempfile::tempdir().unwrap();
+        let mut transactions = setup.commit(root.path().join("store"), |_| Ok(())).unwrap();
+        {
+            let transaction = transactions.begin();
+            let step = operation
+                .step(
+                    OperationInput {
+                        port: 1,
+                        change: &event(1),
+                    },
+                    &operation.initial_resume(),
+                    transaction.access(),
+                    &mut StepBudget::new(1, 1024 * 1024),
+                )
+                .unwrap();
+            assert_eq!(step.progress, Progress::Done);
+            transaction.commit().unwrap();
+        }
+        // This same-equality, exact-schema cursor is accepted by existing
+        // validation but lies beyond the only candidate. Its empty scan page
+        // must not override independent whole-partition presence.
+        let resume = Resume {
+            ordinal: 0,
+            cursor: Cursor::EquiJoin(JoinCursor {
+                found_match: false,
+                resume_after: Some(canonical_row_bounded(event(2).records(), 0, 1024).unwrap()),
+            }),
+        };
+        let transaction = transactions.begin();
+        let step = operation
+            .step(
+                OperationInput {
+                    port: 0,
+                    change: &event(0),
+                },
+                &resume,
+                transaction.access(),
+                &mut StepBudget::new(1, 1024 * 1024),
+            )
+            .unwrap();
+        assert_eq!(step.progress, Progress::Done);
+        assert!(step.output.is_none());
+        transaction.commit().unwrap();
     }
 }

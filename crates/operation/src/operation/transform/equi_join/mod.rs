@@ -26,11 +26,6 @@ fn construct(
     let left_rows = scope.data::<state::Rows>(definition::LEFT_ROWS)?;
     let right_rows = scope.data::<state::Rows>(definition::RIGHT_ROWS)?;
     let has_residual = layout.residual.is_some();
-    let key_counts = if layout.kind != EquiJoinKind::Inner && !has_residual {
-        Some(scope.data::<state::Counts>(definition::KEY_COUNTS)?)
-    } else {
-        None
-    };
     let match_counts = if layout.kind != EquiJoinKind::Inner && has_residual {
         Some(scope.data::<state::MatchCounts>(definition::MATCH_COUNTS)?)
     } else {
@@ -46,7 +41,6 @@ fn construct(
         nulls: layout.nulls,
         left_rows,
         right_rows,
-        key_counts,
         match_counts,
     })))
 }
@@ -220,12 +214,6 @@ pub enum EquiJoinError {
     /// An exact input row's durable multiplicity cannot represent an adjustment.
     #[error("equi-join row weight overflow")]
     WeightOverflow,
-    /// The number of distinct rows under one key cannot be represented.
-    #[error("equi-join key row count overflow")]
-    KeyCountOverflow,
-    /// Persisted key counts disagree with an exact row removal.
-    #[error("equi-join key row count underflow")]
-    KeyCountUnderflow,
     /// The number of qualifying distinct opposite rows for one exact row cannot be represented.
     #[error("equi-join match count overflow")]
     MatchCountOverflow,

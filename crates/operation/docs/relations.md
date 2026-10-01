@@ -40,7 +40,7 @@ Definition 保留 `Inner/LeftSemi/LeftAnti/LeftOuter/FullOuter`、非空 equalit
 residual 在 `left.* + right.*` candidate Schema 上绑定，必须 Boolean，只有 non-null true qualifying。
 
 两侧 rows 为 `OrderedMap<PartitionKey<Vec<u8>, Vec<u8>>, NonZeroU64>`，以完整 equality key 和 canonical row
-维护正 multiplicity。无 residual 的非 Inner 另有 `key_counts: OrderedMap<Vec<u8>, KeyCounts>`；
+维护正 multiplicity。无 residual 的非 Inner 从两侧 Rows 的分区物理存在性推导匹配和 first/last distinct-row transition，不持久保存 key counts。
 有 residual 的非 Inner 用 `match_counts: OrderedMap<Vec<u8>, u64>` 按完整行保存 qualifying distinct opposite rows，
 FullOuter 跟踪双侧，其他 presence kind 只跟踪 left。zero counts 必须缺失。
 match-count key 为单字节 port 加 canonical row；不声明 operator continuation。
@@ -51,8 +51,11 @@ match-count key 为单字节 port 加 canonical row；不声明 operator continu
 
 页内批量扫描候选、求值 residual，并立即更新真实 support。
 outer null correction 与对应 pair 共同占一个 head work item，即使该项输出两行，也不二次扣 head 数量。
-最后一页调整本侧 rows/key counts；More 持久位置与状态和输出同事务。
+最后一页把本事件已 checked 的 after 权重写回本侧 rows，不重复点读；after 只在当前事件调用内存活，More 后仍重新读取和检查真实权重。More 持久位置与状态和输出同事务。
 帧的 DFS 顺序保证当前输入处理完前对侧不被后续事件改变。
+分区存在性独立于 candidate continuation 页；空页不能证明分区为空。存在查询不复制或解码邻居行，当前输入权重和实际扫描到的候选仍按原 codec 严格检查。
+当前布局仅声明两侧 `equi_join.left_rows/right_rows`，另按 residual presence kind 声明 `equi_join.match_counts`。退役 key-count 缓存后受影响的开发期状态直接重建；不检测、迁移或删除既有未使用 catalog 项。
+纯 presence 页的读写准入为两份完整 stored-row bytes，加至多两份 physical seek 和 namespace upper bound；分区 framing 的零字节 escape 同样计费。
 
 晚期负权重、residual、codec 或 output diff overflow 只回滚当前页，先前提交页与帧保留。
 候选扫描或嵌套行解码的预算拒绝通过标准错误 source 链保留 `BudgetExceeded`，调用者因此能回滚并缩小同一页；不能将包装后的预算错误当作语义失败。

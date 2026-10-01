@@ -121,7 +121,7 @@ ReadTransactions   → begin() → ReadTransaction   → ReadTransactionAccess
 
 `OrderedMap<K, NonZeroU64>` 以标准库正整数表示权重，value 是严格八字节 big-endian，零和其他长度是 codec 错误。其 `multiplicity` 把缺失读为零；`adjust` 逐事件 checked signed adjustment，underflow/overflow 毒化事务，结果零删除 key。`set_multiplicity` 直接写此前已逐事件检查的最终权重，零删除，不再点读。公共 `checked_weight` 提供同一纯算术检查；单独调用它不毒化事务。
 
-`OrderedMap<PartitionKey<P, K>, V>` 使用普通 Map handle 与 catalog。`partition(&P)` 产生当前事务内的泛型 view，只处理 local key `K`，支持点读、写入、erase、有界 scan 和 first/last。分区 framing 将 P 的零字节 escape 为 `00 ff`，并以 `00 00` 终止，K 原样跟随，严格保持 `(P, K)` 字典序，空值、前缀和零字节不会跨分区。分区 view 的正权重方法复用 Map 的 codec 与 checked adjustment，不另设集合、metadata 或状态事实。
+`OrderedMap<PartitionKey<P, K>, V>` 使用普通 Map handle 与 catalog。`partition(&P)` 产生当前事务内的泛型 view，只处理 local key `K`，支持点读、写入、erase、有界 scan 和 first/last。分区 framing 将 P 的零字节 escape 为 `00 ff`，并以 `00 00` 终止，K 原样跟随，严格保持 `(P, K)` 字典序，空值、前缀和零字节不会跨分区。分区 view 的正权重方法复用 Map 的 codec 与 checked adjustment，不另设集合、metadata 或状态事实。 `is_empty` 与 `has_other_key` 只检查当前事务或 snapshot 中的物理 key 是否存在；后者至多检查两个 key，不复制或解码邻居 key/value，也不验证其 codec。编码和存储错误仍毒化当前事务。
 
 Queue 的只读 `front_bounded(max_value_bytes)` 返回当前 snapshot 的队首，写访问的 `pop_front_bounded(max_value_bytes)` 同时删除队首；两者都在复制或解码前检查编码长度，超限保持事务健康，可在同一 snapshot 或事务提高上限重试。Queue 每项按完整 encoded value 加八字节私有 sequence 计费；空队列也拒绝超大项，队列变空删除 metadata 并重置编号。owner 在每次 `try_push` 传入稳定容量策略，不保存进 metadata；容量不包含 `RocksDB` 开销。`Queue<Vec<u8>>::discard_front(max_entries)` 有界读取长度、验证连续性并暂存删除，不复制或解码完整 value，末尾一次更新 metadata。先只读队首、后事务消费时，owner 必须保持唯一协调消费者；只读访问不预留条目。
 

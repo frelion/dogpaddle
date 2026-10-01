@@ -175,7 +175,7 @@ fn write_context(root: &RunRoot, profile: PerformanceProfile, fanout: usize) {
             "throughput_unit": "complete inputs (two per timed iteration)",
             "untimed": "fixture, relation seed, warmup, output validation, teardown",
             "cases": {
-                "inner_first_last_match": "Inner control without key-count traffic",
+                "inner_first_last_match": "Inner control without partition-presence queries",
                 "left_semi_presence_stable": "exact right row changes while another right row preserves key presence",
                 "left_semi_first_last_match": "first/last right match publishes every preserved left row",
                 "full_outer_first_last_match": "first/last right match flips null-padded output for every left row",
@@ -187,6 +187,8 @@ fn write_context(root: &RunRoot, profile: PerformanceProfile, fanout: usize) {
                 "left_semi_residual_partial_transition": "one right row changes match support for only half of preserved left rows",
                 "full_outer_residual_partial_transition": "one right row changes two-sided match support for half of the candidate pairs"
             },
+            "driving_row_state": "one checked Rows admission read per event/page and one final Rows write on Done; no repeated admission read at final write",
+            "pure_presence": "non-Inner joins derive presence from Rows with at most two physical partition queries per event/page; no persistent key-count resource or maintenance",
             "residual_workloads": {
                 "predicate": "left.value < right.value for every residual case; the driving right.value changes selectivity without changing the expression shape",
                 "scope": "one timed iteration is a +1 input followed by its -1 input; right-stable keeps one identical right row present, left-stable keeps the left row and a right fanout present",

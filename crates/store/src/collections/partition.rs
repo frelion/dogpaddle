@@ -102,6 +102,23 @@ impl<'transaction, P: StoreKey, K: StoreKey, V: StoreValue>
 }
 
 impl<K: StoreKey, V: StoreValue> MapPartition<'_, '_, K, V> {
+    /// Reports whether this partition has no physical entries.
+    /// No stored key or value is copied or decoded.
+    /// # Errors
+    /// Storage failures poison the transaction.
+    pub fn is_empty(&self) -> Result<bool, StoreError> {
+        self.data.as_read().partition_is_empty(&self.prefix, None)
+    }
+    /// Reports whether this partition contains a key other than `key`.
+    /// Inspects at most two physical keys without copying or decoding entries.
+    /// # Errors
+    /// Key encoding and storage failures poison the transaction.
+    pub fn has_other_key(&self, key: &K) -> Result<bool, StoreError> {
+        let data = self.data.as_read();
+        let key = data.poison_on_error(key.encode_key())?;
+        data.partition_is_empty(&self.prefix, Some(key.as_ref()))
+            .map(|empty| !empty)
+    }
     /// Reads one local key.
     /// # Errors
     /// Encoding, decoding and storage failures poison the transaction.
@@ -174,6 +191,23 @@ impl<K: StoreKey, V: StoreValue> MapPartition<'_, '_, K, V> {
     }
 }
 impl<K: StoreKey, V: StoreValue> MapReadPartition<'_, '_, K, V> {
+    /// Reports whether this partition has no physical entries.
+    /// No stored key or value is copied or decoded.
+    /// # Errors
+    /// Storage failures poison the snapshot.
+    pub fn is_empty(&self) -> Result<bool, StoreError> {
+        self.data.partition_is_empty(&self.prefix, None)
+    }
+    /// Reports whether this partition contains a key other than `key`.
+    /// Inspects at most two physical keys without copying or decoding entries.
+    /// # Errors
+    /// Key encoding and storage failures poison the snapshot.
+    pub fn has_other_key(&self, key: &K) -> Result<bool, StoreError> {
+        let data = self.data;
+        let key = data.poison_on_error(key.encode_key())?;
+        data.partition_is_empty(&self.prefix, Some(key.as_ref()))
+            .map(|empty| !empty)
+    }
     /// Reads one local key visible to the snapshot.
     /// # Errors
     /// Encoding, decoding and storage failures poison the snapshot.

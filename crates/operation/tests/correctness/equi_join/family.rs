@@ -592,3 +592,215 @@ fn raw_duplicate_output_names_are_rejected_before_store_handle_access() {
         RuntimeResource::none(),
     );
 }
+
+#[test]
+fn pure_join_uses_current_row_membership_after_each_event_in_one_window() {
+    let kind = EquiJoinKind::FullOuter;
+    let left = (Some(1), 10);
+    let right = (Some(1), 20);
+    let other = (Some(1), 30);
+    let mut fixture = Fixture::new(kind, Residual::None);
+    fixture.run(0, &change(&[(left, 1)]), 64);
+    // The 2 -> 1 adjustment does not change distinct membership; the last
+    // deletion alone restores the left NULL row, in the same input window.
+    let step = fixture
+        .page(
+            1,
+            &change(&[(right, 2), (right, -1), (right, -1)]),
+            64,
+            true,
+        )
+        .unwrap();
+    assert_eq!(step.progress, Progress::Done);
+    assert_eq!(
+        output(&step.output.unwrap(), kind),
+        [
+            ((Some(left), None), -1),
+            ((Some(left), Some(right)), 2),
+            ((Some(left), Some(right)), -1),
+            ((Some(left), Some(right)), -1),
+            ((Some(left), None), 1),
+        ]
+    );
+    fixture = fixture.reopen();
+    // Removing the first exact row leaves the other row under the same key;
+    // only removing that other row makes the equality partition empty.
+    let input = change(&[(right, 1), (other, 1), (right, -1), (other, -1)]);
+    let rolled_back = fixture.page(1, &input, 64, false).unwrap();
+    fixture = fixture.reopen();
+    let step = fixture.page(1, &input, 64, true).unwrap();
+    assert_eq!(step.progress, Progress::Done);
+    let expected = [
+        ((Some(left), None), -1),
+        ((Some(left), Some(right)), 1),
+        ((Some(left), Some(other)), 1),
+        ((Some(left), Some(right)), -1),
+        ((Some(left), Some(other)), -1),
+        ((Some(left), None), 1),
+    ];
+    assert_eq!(output(&rolled_back.output.unwrap(), kind), expected);
+    assert_eq!(output(&step.output.unwrap(), kind), expected);
+    fixture = fixture.reopen();
+    assert_eq!(
+        output(&fixture.run(0, &change(&[(left, 1)]), 64).remove(0), kind),
+        [((Some(left), None), 1)]
+    );
+}
+
+#[test]
+fn pure_join_reopens_with_rows_without_declaring_derived_key_counts() {
+    use dogpaddle_store::{OrderedMap, PartitionKey};
+    use std::num::NonZeroU64;
+    for kind in KINDS {
+        let fixture = Fixture::new(kind, Residual::None);
+        let Fixture {
+            root,
+            operation,
+            transactions,
+            ..
+        } = fixture;
+        drop((operation, transactions));
+        let store = Store::open(root.path()).unwrap();
+        for side in ["left_rows", "right_rows"] {
+            assert!(
+                store
+                    .open_data::<OrderedMap<PartitionKey<Vec<u8>, Vec<u8>>, NonZeroU64>>(&format!(
+                        "operation/equi_join.{side}"
+                    ))
+                    .is_ok()
+            );
+        }
+        assert!(
+            store
+                .open_data::<OrderedMap<Vec<u8>, Vec<u8>>>("operation/equi_join.key_counts")
+                .is_err()
+        );
+        assert!(
+            store
+                .open_data::<OrderedMap<Vec<u8>, u64>>("operation/equi_join.match_counts")
+                .is_err()
+        );
+        assert!(
+            OperationDefinition::from(definition(kind, Residual::None))
+                .construct(
+                    &[schema(), schema()],
+                    &mut store.data_scope().scoped("operation"),
+                    RuntimeResource::none(),
+                )
+                .is_ok()
+        );
+    }
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "One fixture verifies malformed and overflowing durable weights, transaction poison, and unchanged reopened state."
+)]
+fn pure_join_checks_current_weight_before_writing_checked_after() {
+    use dogpaddle_store::{OrderedMap, PartitionKey, ScanDirection, ScanLimit, StoreError};
+    let mut fixture = Fixture::new(EquiJoinKind::FullOuter, Residual::None);
+    let left = (Some(1), 10);
+    fixture.run(0, &change(&[(left, 1)]), 64);
+    let Fixture {
+        root,
+        operation,
+        transactions,
+        ..
+    } = fixture;
+    drop((operation, transactions));
+    let store = Store::open(root.path()).unwrap();
+    let raw = store
+        .open_data::<OrderedMap<PartitionKey<Vec<u8>, Vec<u8>>, Vec<u8>>>(
+            "operation/equi_join.left_rows",
+        )
+        .unwrap();
+    let operation = OperationDefinition::from(definition(EquiJoinKind::FullOuter, Residual::None))
+        .construct(
+            &[schema(), schema()],
+            &mut store.data_scope().scoped("operation"),
+            RuntimeResource::none(),
+        )
+        .unwrap()
+        .into_parts()
+        .0;
+    let mut transactions = store.into_transactions();
+    let key = {
+        let transaction = transactions.begin();
+        let access = raw.access(transaction.access()).unwrap();
+        let key = access
+            .scan(
+                ..,
+                ScanDirection::Ascending,
+                None,
+                ScanLimit::new(1, 1024).unwrap(),
+            )
+            .unwrap()
+            .entries
+            .pop()
+            .unwrap()
+            .0;
+        transaction.commit().unwrap();
+        key
+    };
+    for bytes in [
+        vec![0; 8],
+        vec![1; 7],
+        vec![1; 9],
+        u64::MAX.to_be_bytes().to_vec(),
+    ] {
+        {
+            let transaction = transactions.begin();
+            raw.access(transaction.access())
+                .unwrap()
+                .put(&key, &bytes)
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        let transaction = transactions.begin();
+        let error = operation
+            .step(
+                OperationInput {
+                    port: 0,
+                    change: &change(&[(left, 1)]),
+                },
+                &operation.initial_resume(),
+                transaction.access(),
+                &mut StepBudget::new(64, 4 * 1024 * 1024),
+            )
+            .unwrap_err();
+        if bytes == u64::MAX.to_be_bytes() {
+            assert!(matches!(
+                error.downcast_ref::<EquiJoinError>(),
+                Some(EquiJoinError::WeightOverflow)
+            ));
+            // The pure arithmetic admission error keeps the existing policy:
+            // no write occurred, and the unchanged raw weight is still readable.
+            assert_eq!(
+                raw.access(transaction.access()).unwrap().get(&key).unwrap(),
+                Some(bytes)
+            );
+        } else {
+            assert!(matches!(
+                error.downcast_ref::<EquiJoinError>(),
+                Some(EquiJoinError::Store(StoreError::Codec(_)))
+            ));
+            assert!(matches!(
+                transaction.commit(),
+                Err(StoreError::TransactionPoisoned)
+            ));
+        }
+    }
+    drop((operation, transactions));
+    let store = Store::open(root.path()).unwrap();
+    let raw = store
+        .open_data::<OrderedMap<PartitionKey<Vec<u8>, Vec<u8>>, Vec<u8>>>(
+            "operation/equi_join.left_rows",
+        )
+        .unwrap();
+    let snapshot = store.read_transaction();
+    assert_eq!(
+        raw.read(snapshot.access()).unwrap().get(&key).unwrap(),
+        Some(u64::MAX.to_be_bytes().to_vec())
+    );
+}

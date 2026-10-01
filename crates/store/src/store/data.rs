@@ -235,11 +235,20 @@ impl TransactionRef<'_> {
         self.record_result(result)
     }
 
-    fn is_physically_empty(self, prefix: [u8; 5]) -> Result<bool, StoreError> {
+    fn is_physically_empty(
+        self,
+        prefix: [u8; 5],
+        suffix: &[u8],
+        excluded: Option<&[u8]>,
+    ) -> Result<bool, StoreError> {
         self.ensure_healthy()?;
         let result = match self {
-            Self::Read(transaction) => namespace_is_empty(&transaction.snapshot, prefix),
-            Self::Write(transaction) => namespace_is_empty(&transaction.inner.snapshot(), prefix),
+            Self::Read(transaction) => {
+                namespace_is_empty(&transaction.snapshot, prefix, suffix, excluded)
+            }
+            Self::Write(transaction) => {
+                namespace_is_empty(&transaction.inner.snapshot(), prefix, suffix, excluded)
+            }
         };
         self.record_result(result)
     }
@@ -333,7 +342,17 @@ impl ReadDataAccess<'_> {
 
     /// Reports whether this namespace contains no entries.
     pub(crate) fn is_physically_empty(&self) -> Result<bool, StoreError> {
-        self.transaction.is_physically_empty(self.prefix)
+        self.partition_is_empty(&[], None)
+    }
+
+    /// Inspects physical keys without decoding keys or values.
+    pub(crate) fn partition_is_empty(
+        &self,
+        suffix: &[u8],
+        excluded: Option<&[u8]>,
+    ) -> Result<bool, StoreError> {
+        self.transaction
+            .is_physically_empty(self.prefix, suffix, excluded)
     }
 
     /// Decodes one bounded, owned page directly from iterator bytes.
@@ -391,15 +410,32 @@ impl ReadDataAccess<'_> {
 fn namespace_is_empty<D: DBAccess>(
     snapshot: &SnapshotWithThreadMode<'_, D>,
     prefix: [u8; 5],
+    suffix: &[u8],
+    excluded: Option<&[u8]>,
 ) -> Result<bool, StoreError> {
     let mut options = ReadOptions::default();
     options.set_iterate_upper_bound(prefix_successor(prefix));
     let mut iterator = snapshot.raw_iterator_opt(options);
-    iterator.seek(prefix);
+    let seek = if suffix.is_empty() {
+        Cow::Borrowed(prefix.as_slice())
+    } else {
+        Cow::Owned(physical_key(prefix, suffix))
+    };
+    iterator.seek(seek.as_ref());
+    if let Some(excluded) = excluded
+        && iterator
+            .key()
+            .and_then(|key| key.strip_prefix(seek.as_ref()))
+            == Some(excluded)
+    {
+        iterator.next();
+    }
     iterator
         .status()
         .map_err(|error| StoreError::storage("inspect data namespace", error))?;
-    Ok(!iterator.valid())
+    Ok(!iterator
+        .key()
+        .is_some_and(|key| key.starts_with(seek.as_ref())))
 }
 
 fn scan_data<D: DBAccess, K: StoreKey, V: StoreValue>(

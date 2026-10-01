@@ -116,7 +116,8 @@ head item 额度限制输入事件、扫描候选或修正原子；Atomic tail �
 
 `EquiJoin` 分区按 equality key 组织 exact rows。NULL key 不匹配；residual 绑定到 `left.* + right.*`，
 只有 non-null true qualifying。outer null correction 和对应 pair 是同一个分页工作项。
-当前事件最后一页才调整本侧 rows/counts；帧按 DFS 运行保证处理该页期间对侧关系不被后续输入改变。
+无 residual 的 presence 从两侧 Rows 分区推导，不另保存 key-count 缓存；residual qualifying support 仍是独立持久事实。
+当前事件最后一页直接写回已 checked 的本侧 Rows after 权重，More 后重新从真实权重准入；帧按 DFS 运行保证处理该页期间对侧关系不被后续输入改变。
 
 ASOF equality 使用 SQL NULL 规则，order 为精确同型可索引 scalar。
 右侧 exact-row multiplicity 不影响单候选选择；distinct rows 在被选中的同一时刻形成歧义并拒绝。

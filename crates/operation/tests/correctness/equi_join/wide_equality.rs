@@ -1,12 +1,12 @@
 use std::{borrow::Cow, sync::Arc};
 
-use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
+use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
     OperationDefinition, RuntimeResource, col,
     operation::{
-        Operation, OperationInput, Progress, Resume, StepBudget,
+        BudgetExceeded, Operation, OperationInput, Progress, Resume, StepBudget,
         transform::{EquiJoinDefinition, EquiJoinKind},
     },
 };
@@ -183,4 +183,195 @@ fn narrow_rows_with_wide_equality_complete_minimum_pages_after_reopen() {
         transactions = store.into_transactions();
     }
     assert_eq!(actual, [0, 1]);
+}
+
+#[test]
+fn pure_join_with_4096_wide_string_keys_completes_with_eight_mebibyte_pages() {
+    // The existing residual fixture does not reserve the pure join's key counts.
+    // Probe 4 MiB separately; the successful old-domain witness uses 8 MiB.
+    let key: ArrayRef = Arc::new(StringArray::from(vec!["k".repeat(KEY_BYTES)]));
+    pure_join_pages_after_reopen(&key, 8 * 1024 * 1024, PAGE_BYTES);
+}
+
+#[test]
+fn pure_join_with_4096_zero_dense_integer_keys_completes_with_one_mebibyte_pages() {
+    // Eight of each nine canonical bytes are zero and must be escaped in the
+    // partition. A short exact row keeps every persisted cursor below 1 KiB.
+    let key: ArrayRef = Arc::new(Int64Array::from(vec![0]));
+    pure_join_pages_after_reopen(&key, 1024 * 1024, 512 * 1024);
+}
+
+fn key_event(schema: &SchemaRef, key: &ArrayRef, value: i64, difference: i64) -> Change {
+    Change::try_new(
+        RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![Arc::clone(key), Arc::new(Int64Array::from(vec![value]))],
+        )
+        .unwrap(),
+        Int64Array::from(vec![difference]),
+    )
+    .unwrap()
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Two concrete key encodings share the same pure-join insertion, withdrawal, budget rollback and reopen witness."
+)]
+fn pure_join_pages_after_reopen(key: &ArrayRef, page_bytes: usize, probe_bytes: usize) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("key", key.data_type().clone(), false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    let definition = OperationDefinition::from(
+        EquiJoinDefinition::try_new(
+            EquiJoinKind::FullOuter,
+            (0..KEY_REPETITIONS).map(|_| (col("key"), col("key"))),
+            ["left_key", "left_value", "right_key", "right_value"],
+            None,
+        )
+        .unwrap(),
+    );
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("store");
+    let mut setup = StoreSetup::new();
+    let mut operation = definition
+        .construct(
+            &[Arc::clone(&schema), Arc::clone(&schema)],
+            &mut setup.data_scope().scoped("operation"),
+            RuntimeResource::none(),
+        )
+        .unwrap()
+        .into_parts()
+        .0;
+    let mut transactions = setup.commit(&path, |_| Ok(())).unwrap();
+    for value in [0, 1] {
+        let input = key_event(&schema, key, value, 1);
+        let transaction = transactions.begin();
+        let step = operation
+            .step(
+                OperationInput {
+                    port: 0,
+                    change: &input,
+                },
+                &operation.initial_resume(),
+                transaction.access(),
+                &mut StepBudget::new(1, page_bytes),
+            )
+            .unwrap();
+        assert_eq!(step.progress, Progress::Done);
+        let output = step.output.unwrap();
+        assert_eq!(output.diffs().values(), &[1]);
+        assert!(output.records().column(3).is_null(0));
+        transaction.commit().unwrap();
+    }
+    for difference in [1, -1] {
+        let input = key_event(&schema, key, 2, difference);
+        let mut resume = operation.initial_resume();
+        for page in 0..2 {
+            let probe = {
+                let transaction = transactions.begin();
+                match operation.step(
+                    OperationInput {
+                        port: 1,
+                        change: &input,
+                    },
+                    &resume,
+                    transaction.access(),
+                    &mut StepBudget::new(1, probe_bytes),
+                ) {
+                    Ok(step) => Some(step),
+                    Err(error) => {
+                        let mut source: &(dyn std::error::Error + 'static) = error.as_ref();
+                        while !source.is::<BudgetExceeded>() {
+                            source = source.source().expect("only budget refusal can retry");
+                        }
+                        None
+                    }
+                }
+                // Both successful and budget-refused probes roll back.
+            };
+            eprintln!(
+                "pure join {:?}: diff={difference}, page={page}, bytes={probe_bytes}, admitted={}",
+                key.data_type(),
+                probe.is_some()
+            );
+            drop((operation, transactions));
+            let store = Store::open(&path).unwrap();
+            operation = open_operation(&store, &definition, &schema);
+            transactions = store.into_transactions();
+            let transaction = transactions.begin();
+            let mut budget = StepBudget::new(1, page_bytes);
+            let step = operation
+                .step(
+                    OperationInput {
+                        port: 1,
+                        change: &input,
+                    },
+                    &resume,
+                    transaction.access(),
+                    &mut budget,
+                )
+                .unwrap();
+            assert!(budget.remaining_bytes() > 0);
+            if let Some(probe) = probe {
+                assert_eq!(probe.progress, step.progress);
+                let expected = probe.output.unwrap();
+                let actual = step.output.as_ref().unwrap();
+                assert_eq!(actual.records(), expected.records());
+                assert_eq!(actual.diffs(), expected.diffs());
+            }
+            let output = step.output.unwrap();
+            assert_eq!(output.num_rows(), 2);
+            assert_eq!(output.diffs().values(), &[-1, 1]);
+            let left = output
+                .records()
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let right = output
+                .records()
+                .column(3)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            assert_eq!(left.values(), &[i64::from(page); 2]);
+            let paired = usize::from(difference > 0);
+            assert!(right.is_null(1 - paired));
+            assert_eq!(right.value(paired), 2);
+            match step.progress {
+                Progress::More(next) => {
+                    assert_eq!(page, 0);
+                    let encoded = next.encode_value().unwrap();
+                    assert!(encoded.as_ref().len() < 1024);
+                    resume = Resume::decode_value(Cow::Borrowed(encoded.as_ref())).unwrap();
+                }
+                Progress::Done => assert_eq!(page, 1),
+            }
+            transaction.commit().unwrap();
+            drop((operation, transactions));
+            let store = Store::open(&path).unwrap();
+            operation = open_operation(&store, &definition, &schema);
+            transactions = store.into_transactions();
+        }
+    }
+    // The completed right withdrawal must stay absent after reopening.
+    let input = key_event(&schema, key, 0, 1);
+    let transaction = transactions.begin();
+    let step = operation
+        .step(
+            OperationInput {
+                port: 0,
+                change: &input,
+            },
+            &operation.initial_resume(),
+            transaction.access(),
+            &mut StepBudget::new(1, page_bytes),
+        )
+        .unwrap();
+    assert_eq!(step.progress, Progress::Done);
+    let output = step.output.unwrap();
+    assert_eq!(output.diffs().values(), &[1]);
+    assert!(output.records().column(3).is_null(0));
+    transaction.commit().unwrap();
 }

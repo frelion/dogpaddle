@@ -9,8 +9,8 @@ use dogpaddle_store::{OrderedMapPage, ScanDirection, ScanLimit, StoreError, Tran
 use crate::operation::relation::decode_canonical_row_bounded;
 
 use super::{
-    ActiveRow, EquiJoinError, EquiJoinOperation, KeyTransition, PreparedMatch, PreparedRow,
-    ResidualPage, RowEffect, StepBudget, canonical_error,
+    ActiveRow, EquiJoinError, EquiJoinKind, EquiJoinOperation, KeyTransition, PreparedMatch,
+    PreparedRow, ResidualPage, RowEffect, StepBudget, canonical_error,
 };
 
 const RESIDUAL_BATCH_ITEMS: usize = 256;
@@ -26,14 +26,15 @@ impl EquiJoinOperation {
         &self,
         port: usize,
         row: &PreparedRow,
-        effect: RowEffect,
+        effect: &mut RowEffect,
         resume_after: Option<&Vec<u8>>,
         budget: &mut StepBudget,
         access: TransactionAccess<'_>,
     ) -> Result<Option<OrderedMapPage<Vec<u8>, NonZeroU64>>, EquiJoinError> {
-        if !effect.matched
+        if !row.matchable
             || (self.kind.left_only()
-                && (port == 0 || matches!(effect.transition, KeyTransition::None)))
+                && port == 1
+                && matches!(effect.transition, KeyTransition::None))
         {
             return Ok(Some(OrderedMapPage {
                 entries: Vec::new(),
@@ -42,6 +43,17 @@ impl EquiJoinOperation {
         }
         let mut opposite = self.rows(1 - port).access(access)?;
         let partition = opposite.partition(&row.key)?;
+        if self.kind != EquiJoinKind::Inner {
+            // A continuation may be past the last row even when the partition
+            // is nonempty; presence is independent of the returned page.
+            effect.matched = !partition.is_empty()?;
+        }
+        if !effect.matched || (self.kind.left_only() && port == 0) {
+            return Ok(Some(OrderedMapPage {
+                entries: Vec::new(),
+                continuation: None,
+            }));
+        }
         let expanded =
             self.kind.preserves(1 - port) && !matches!(effect.transition, KeyTransition::None);
         let repeats_input = !(self.kind.left_only() && port == 1);

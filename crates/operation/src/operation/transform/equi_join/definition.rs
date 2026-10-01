@@ -18,7 +18,6 @@ use super::{
 
 pub(super) const LEFT_ROWS: &str = "equi_join.left_rows";
 pub(super) const RIGHT_ROWS: &str = "equi_join.right_rows";
-pub(super) const KEY_COUNTS: &str = "equi_join.key_counts";
 pub(super) const MATCH_COUNTS: &str = "equi_join.match_counts";
 
 pub(crate) struct EquiJoinLayout {
