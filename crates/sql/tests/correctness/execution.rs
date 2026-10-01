@@ -1025,7 +1025,7 @@ fn assert_initial_asof_state(path: &Path, operation: usize) {
     let read = store.read_transaction();
     for (side, expected) in [("left", 1), ("right", 0)] {
         let rows: OrderedMap<Vec<u8>, NonZeroU64> = store
-            .open_data(&format!("operation/{operation:08x}/asof_join.{side}_rows"))
+            .open_data(&format!("operation/{operation:08x}/asof_join.{side}_index"))
             .unwrap();
         let page = rows
             .read(read.access())

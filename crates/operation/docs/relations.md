@@ -69,7 +69,8 @@ Definition 只有 direction/exactness、SQL equality pairs、一个 order pair �
 nearest、tolerance、lexicographic order、residual、tie-break、NotDistinct、canonical fallback 和额外 kind 退休。
 
 两侧为 `OrderedMap<Vec<u8>, NonZeroU64>`；当前开发期 v1 index key 依次编码 equality partition、order、canonical row，
-各部分使用零字节转义及终止符，order 首字节区分 NULL 与可匹配值。不保存 rank 或 operator continuation。
+equality 与 order 使用零字节转义及终止符，canonical row 直接作为最后的原始后缀；order 首字节区分 NULL 与可匹配值。两段 header 严格检查 framing，真正消费 row 时由 bound Schema 的 canonical decoder 完整检查后缀，包括截断和尾随字节。零列 Schema 的后缀合法为空。
+当前资源为 `asof_join.left_index/right_index`；末段编码改变的开发期旧布局直接重建，不识别或兼容旧 Rows。Winner 只拥有完整 key 及其不可变 row 起点，解码借用该 key 的后缀，不再保存一份完整 row 副本。不保存 rank 或 operator continuation。
 同一 exact RHS row 的多份数只表示一个候选；不同 row 在同一 selected time 时拒绝歧义。
 没有受影响 left 时可以保留歧义 RHS bucket，之后探测或历史修改暴露它时确定性失败。
 
@@ -108,7 +109,7 @@ NULL Struct/List 的 Arrow shape 也计费。这是已知逻辑 scratch 与 payl
 correctness 覆盖五种 EquiJoin 与四种 residual 配置的 independent bag oracle、weighted 插删、NULL、
 逐页 rollback 和完整 runtime 重构、晚页负事件、fanout、4096 空 bucket 的批量推进。
 ASOF 覆盖 Forward/Backward strict/inclusive independent bag、相邻时刻插删、重复同 row multiplicity、
-NULL、空区间、歧义暴露和最後页 RHS 落账。Flow 负责 root/child/send/queue 的持久故障窗口和融合 tail 回滚。
+NULL、空区间、零列 canonical 行的四种邻接边界、行尾截断/多余字节与坏 Resume 的只读拒绝、旧索引布局拒绝、歧义暴露和最後页 RHS 落账。Flow 负责 root/child/send/queue 的持久故障窗口和融合 tail 回滚。
 
 EquiJoin 私有 `runtime/matches.rs` 维护候选扫描和 residual 批次，`runtime/output.rs` 维护结果构造和 checked diff。
 ASOF 只有直接的 indexed kernel 与 index codec，不建立通用候选注册、排名层或共享增量框架。

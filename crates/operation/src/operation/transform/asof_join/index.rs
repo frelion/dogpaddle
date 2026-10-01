@@ -6,12 +6,12 @@ const ESCAPE: u8 = 0;
 const ESCAPED_ZERO: u8 = u8::MAX;
 const TERMINATOR: u8 = 0;
 
-/// Fully decoded ordered-map key.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct ParsedIndexKey {
+/// Decoded equality/order headers and the borrowed canonical row suffix.
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct ParsedIndexKey<'a> {
     pub(super) partition: Vec<u8>,
     pub(super) order: Vec<u8>,
-    pub(super) row: Vec<u8>,
+    pub(super) row: &'a [u8],
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -20,8 +20,6 @@ pub(super) enum IndexCodecError {
     TruncatedComponent,
     #[error("ASOF index component escape is invalid")]
     InvalidEscape,
-    #[error("ASOF index key has trailing bytes")]
-    TrailingBytes,
 }
 
 /// Prefix containing every row in one equality partition.
@@ -53,23 +51,20 @@ pub(super) fn order_prefix(partition: &[u8], order: &[u8]) -> Vec<u8> {
 /// Builds one exact row key in partition/order/canonical-row order.
 pub(super) fn row_key(partition: &[u8], order: &[u8], row: &[u8]) -> Vec<u8> {
     let mut key = order_prefix(partition, order);
-    push_component(&mut key, row);
+    key.extend_from_slice(row);
     key
 }
 
-/// Strictly parses a complete key produced by [`row_key`].
-pub(super) fn parse_row_key(encoded: &[u8]) -> Result<ParsedIndexKey, IndexCodecError> {
+/// Strictly parses the two framed headers and borrows the remaining row bytes.
+/// Canonical row validation belongs to the schema-bound row decoder.
+pub(super) fn parse_row_key(encoded: &[u8]) -> Result<ParsedIndexKey<'_>, IndexCodecError> {
     let mut remaining = encoded;
     let partition = take_component(&mut remaining)?;
     let order = take_component(&mut remaining)?;
-    let row = take_component(&mut remaining)?;
-    if !remaining.is_empty() {
-        return Err(IndexCodecError::TrailingBytes);
-    }
     Ok(ParsedIndexKey {
         partition,
         order,
-        row,
+        row: remaining,
     })
 }
 
@@ -126,17 +121,21 @@ mod tests {
     #[test]
     fn current_layout_contains_exactly_partition_order_and_row() {
         let key = row_key(b"p\0", b"o", b"r\0");
-        assert_eq!(key, b"p\0\xff\0\0o\0\0r\0\xff\0\0");
+        assert_eq!(key, b"p\0\xff\0\0o\0\0r\0");
         let decoded = parse_row_key(&key).unwrap();
         assert_eq!(decoded.partition, b"p\0");
         assert_eq!(decoded.order, b"o");
         assert_eq!(decoded.row, b"r\0");
-        for length in 0..key.len() {
+        let header = order_prefix(b"p\0", b"o");
+        for length in 0..header.len() {
             assert!(parse_row_key(&key[..length]).is_err());
         }
-        let mut extra = key;
-        extra.push(1);
-        assert!(parse_row_key(&extra).is_err());
+        assert!(parse_row_key(&header).unwrap().row.is_empty());
+        assert_eq!(parse_row_key(&[0, 1]), Err(IndexCodecError::InvalidEscape));
+        assert_eq!(
+            parse_row_key(&[0, 0, 0, 1]),
+            Err(IndexCodecError::InvalidEscape)
+        );
     }
     #[test]
     fn framing_and_prefix_successors_preserve_index_order() {
@@ -152,5 +151,11 @@ mod tests {
             assert!(key >= prefix);
             assert!(key < prefix_successor(&prefix).unwrap());
         }
+        let rows = components
+            .iter()
+            .map(|row| row_key(b"p", b"o", row))
+            .collect::<Vec<_>>();
+        assert_eq!(rows[0], order_prefix(b"p", b"o"));
+        assert!(rows.windows(2).all(|pair| pair[0] < pair[1]));
     }
 }

@@ -53,10 +53,14 @@ struct PreparedRow {
     matchable: bool,
     difference: i64,
 }
-#[derive(Clone)]
 struct Winner {
     key: Vec<u8>,
-    row: Vec<u8>,
+    row_start: usize,
+}
+impl Winner {
+    fn row(&self) -> &[u8] {
+        &self.key[self.row_start..]
+    }
 }
 #[derive(Default)]
 struct Candidates {
@@ -237,7 +241,7 @@ impl AsOfJoinOperation {
                 )
                 .into());
             }
-            decode_canonical_row_bounded(&self.layout.input_schemas[0], &parsed.row, budget)?;
+            decode_canonical_row_bounded(&self.layout.input_schemas[0], parsed.row, budget)?;
         }
         Ok(())
     }
@@ -305,10 +309,8 @@ impl AsOfJoinOperation {
             .into_iter()
             .next()
             .map(|key| {
-                parse_row_key(&key).map(|parsed| Winner {
-                    key,
-                    row: parsed.row,
-                })
+                let row_start = parse_row_key(&key).map(|parsed| key.len() - parsed.row.len());
+                row_start.map(|row_start| Winner { key, row_start })
             })
             .transpose()?;
         Ok(Candidates { winner, ambiguous })
@@ -401,8 +403,8 @@ impl AsOfJoinOperation {
             .unwrap_or(false);
         Ok(Candidates {
             winner: Some(Winner {
+                row_start: first.0.len() - parsed.row.len(),
                 key: first.0,
-                row: parsed.row,
             }),
             ambiguous,
         })
@@ -414,7 +416,7 @@ impl AsOfJoinOperation {
     ) -> Result<Option<Vec<ScalarValue>>, OperationError> {
         winner
             .map(|winner| {
-                decode_canonical_row_bounded(&self.layout.input_schemas[1], &winner.row, budget)
+                decode_canonical_row_bounded(&self.layout.input_schemas[1], winner.row(), budget)
             })
             .transpose()
     }
@@ -551,7 +553,7 @@ impl AsOfJoinOperation {
                     let before_decode = budget.remaining_bytes();
                     let left = decode_canonical_row_bounded(
                         &self.layout.input_schemas[0],
-                        &parsed.row,
+                        parsed.row,
                         budget,
                     )?;
                     budget.charge(before_decode - budget.remaining_bytes())?;
@@ -568,7 +570,7 @@ impl AsOfJoinOperation {
                             parsed
                                 .row
                                 .len()
-                                .saturating_add(winner.map_or(0, |winner| winner.row.len())),
+                                .saturating_add(winner.map_or(0, |winner| winner.row().len())),
                             budget,
                         )?;
                     }
@@ -666,7 +668,7 @@ impl PagedOperation for AsOfJoinOperation {
                 let parsed = parse_row_key(&row.key)?;
                 let left = decode_canonical_row_bounded(
                     &self.layout.input_schemas[0],
-                    &parsed.row,
+                    parsed.row,
                     budget,
                 )?;
                 output.push(
@@ -676,7 +678,7 @@ impl PagedOperation for AsOfJoinOperation {
                     parsed
                         .row
                         .len()
-                        .saturating_add(winner.map_or(0, |winner| winner.row.len())),
+                        .saturating_add(winner.map_or(0, |winner| winner.row().len())),
                     budget,
                 )?;
                 self.apply_weight(0, row, after, budget, access)?;

@@ -1,3 +1,6 @@
+#[path = "asof_join/row_suffix.rs"]
+mod row_suffix;
+
 use crate::support::{TestStore, decode_hex};
 use arrow_array::{Array, Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -168,7 +171,7 @@ impl Fixture {
             .into_parts()
             .0;
         let frame = store.open_data("test.frame").unwrap();
-        let raw_right = store.open_data("operation/asof_join.right_rows").unwrap();
+        let raw_right = store.open_data("operation/asof_join.right_index").unwrap();
         Self {
             root,
             definition,
@@ -199,7 +202,7 @@ impl Fixture {
             .into_parts()
             .0;
         let frame = store.open_data("test.frame").unwrap();
-        let raw_right = store.open_data("operation/asof_join.right_rows").unwrap();
+        let raw_right = store.open_data("operation/asof_join.right_index").unwrap();
         Self {
             root,
             definition,
@@ -613,7 +616,7 @@ fn byte_truncated_winner_probe_rolls_back_instead_of_accepting_a_tie() {
         drop((operation, transactions));
         let store = Store::open(root.path()).unwrap();
         let left: OrderedMap<Vec<u8>, Vec<u8>> =
-            store.open_data("operation/asof_join.left_rows").unwrap();
+            store.open_data("operation/asof_join.left_index").unwrap();
         let read = store.read_transaction();
         assert!(
             left.read(read.access())
@@ -801,7 +804,7 @@ fn continued_right_correction_validates_its_cursor_with_the_shared_byte_budget()
     drop((operation, transactions));
     let store = Store::open(root.path()).unwrap();
     let right: OrderedMap<Vec<u8>, Vec<u8>> =
-        store.open_data("operation/asof_join.right_rows").unwrap();
+        store.open_data("operation/asof_join.right_index").unwrap();
     let read = store.read_transaction();
     assert_eq!(
         right
@@ -866,7 +869,7 @@ fn asof_runtime_fixture(
         .unwrap()
         .into_parts()
         .0;
-    let left_rows = store.open_data("operation/asof_join.left_rows").unwrap();
+    let left_rows = store.open_data("operation/asof_join.left_index").unwrap();
     (root, operation, left_rows, store.into_transactions())
 }
 #[test]

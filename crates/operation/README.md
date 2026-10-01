@@ -122,7 +122,7 @@ head item 额度限制输入事件、扫描候选或修正原子；Atomic tail �
 ASOF equality 使用 SQL NULL 规则，order 为精确同型可索引 scalar。
 右侧 exact-row multiplicity 不影响单候选选择；distinct rows 在被选中的同一时刻形成歧义并拒绝。
 历史右侧 presence 变化只修正两个邻接时刻定义的 left 区间，页内共享 before/after winner，
-最后一页才将当前右事件记入真实 RHS index。
+最后一页才将当前右事件记入真实 RHS index。索引只为 equality/order 分段，完整 canonical row 作为原始末段；winner 解码直接借用该 key 的后缀，不持有第二份 row。当前两侧资源为 `asof_join.left_index/right_index`，受影响的开发期旧布局直接重建。
 nearest、tolerance、多 order、residual、tie-break、NotDistinct、canonical fallback 与额外 kind 不属于当前 API。
 
 ## Source 与 Sink 外部边界

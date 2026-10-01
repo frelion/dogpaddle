@@ -40,7 +40,7 @@ Aggregate 的 owner 文件必须证明稳定 tagged JSON 名称 `aggregate` 与 
 
 EquiJoin 的 owner 文件用独立关系 oracle 覆盖 Inner、LeftSemi、LeftAnti、LeftOuter 和 FullOuter，固定 tagged JSON 名称 `equi_join` 与 v1 golden、各 kind 的资源布局、NULL key、重复权重、residual 的 TRUE/FALSE/NULL、outer nullability、正负 diff 和溢出边界。用多个分页大小逐页 rollback/rebuild，证明 opaque Resume 不重复或漏过候选。晚期语义错误只回滚当前页，保留已提交页；reopen 必须再次到达确定性失败。SQL 只证明 lowering、Right swap/Select 和最终关系。
 
-AsOfJoin 的 owner 文件固定 tagged JSON 名称 `asof_join`、v1 golden 与 `asof_join.left_rows/right_rows` 两个索引，覆盖 LeftOuter、Backward/Forward、exact 开关、零/多 Equal 键、单 order、NULL、重复 multiplicity、两侧 insert/retract 和歧义拒绝。独立 winner oracle 验证相邻版本定义的受影响区间、旧负新正顺序、每页 rollback/rebuild，以及 RHS 更新只在最后一页提交。产品只保留 SQL 可表达的 ASOF 语义；不维护 nearest、tolerance、residual 或 tie policy 扩展。
+AsOfJoin 的 owner 文件固定 tagged JSON 名称 `asof_join`、v1 golden 与 `asof_join.left_index/right_index` 两个索引，覆盖 LeftOuter、Backward/Forward、exact 开关、零/多 Equal 键、单 order、NULL、重复 multiplicity、两侧 insert/retract 和歧义拒绝。独立 winner oracle 验证相邻版本定义的受影响区间、旧负新正顺序、每页 rollback/rebuild，以及 RHS 更新只在最后一页提交。零列 canonical 行验证四种邻接边界；行尾截断、多余字节、坏 Resume 和空/非空旧布局均须拒绝且不改写状态。产品只保留 SQL 可表达的 ASOF 语义；不维护 nearest、tolerance、residual 或 tie policy 扩展。
 
 ### Flow
 

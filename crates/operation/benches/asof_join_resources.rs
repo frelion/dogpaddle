@@ -1,5 +1,5 @@
 //! Process-isolated Rust allocation and logical-state evidence for SQL ASOF.
-use arrow_array::{Int64Array, RecordBatch, UInt64Array};
+use arrow_array::{BinaryArray, Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
@@ -74,12 +74,45 @@ fn change(times: Vec<Option<i64>>, values: Vec<i64>) -> Change {
     )
     .unwrap()
 }
+fn payload_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("group", DataType::UInt64, false),
+        Field::new("at", DataType::Int64, true),
+        Field::new("value", DataType::Binary, false),
+    ]))
+}
+fn payload_change(times: Vec<Option<i64>>, payload: &[u8]) -> Change {
+    let rows = times.len();
+    Change::try_new(
+        RecordBatch::try_new(
+            payload_schema(),
+            vec![
+                Arc::new(UInt64Array::from(vec![7; rows])),
+                Arc::new(Int64Array::from(times)),
+                Arc::new(BinaryArray::from_iter_values(std::iter::repeat_n(
+                    payload, rows,
+                ))),
+            ],
+        )
+        .unwrap(),
+        Int64Array::from(vec![1; rows]),
+    )
+    .unwrap()
+}
 impl Fixture {
-    fn new(path: &Path) -> Self {
+    fn new(path: &Path, case: &str) -> Self {
+        let input_schema = if matches!(
+            case,
+            "left_lookup_zero_payload" | "right_zero_payload_rematch"
+        ) {
+            payload_schema()
+        } else {
+            schema()
+        };
         let mut setup = StoreSetup::new();
         let operation = OperationDefinition::from(definition())
             .construct(
-                &[schema(), schema()],
+                &[Arc::clone(&input_schema), Arc::clone(&input_schema)],
                 &mut setup.data_scope().scoped("operation"),
                 RuntimeResource::none(),
             )
@@ -143,7 +176,7 @@ impl Fixture {
 fn state(path: &Path) -> serde_json::Value {
     let store = Store::open(path).unwrap();
     let mut records = Vec::new();
-    for name in ["left_rows", "right_rows"] {
+    for name in ["left_index", "right_index"] {
         let rows: OrderedMap<Vec<u8>, Vec<u8>> = store
             .open_data(&format!("operation/asof_join.{name}"))
             .unwrap();
@@ -179,7 +212,7 @@ fn state(path: &Path) -> serde_json::Value {
 }
 fn child(case: &str, rows: usize, path: &Path) -> serde_json::Value {
     let database = path.join("store");
-    let mut fixture = Fixture::new(&database);
+    let mut fixture = Fixture::new(&database, case);
     let (port, input, expected) = match case {
         "left_lookup_history" => {
             let ordinals = (0..rows)
@@ -230,6 +263,27 @@ fn child(case: &str, rows: usize, path: &Path) -> serde_json::Value {
             fixture.apply(0, &change(vec![None; rows], ordinals));
             (1, change(vec![Some(10)], vec![10]), (0, 0))
         }
+        "left_lookup_zero_payload" => {
+            fixture.apply(1, &payload_change(vec![Some(0)], &vec![0; 64 * 1024]));
+            (0, payload_change(vec![Some(100)], &[]), (1, 0))
+        }
+        "right_zero_payload_rematch" => {
+            fixture.apply(1, &payload_change(vec![Some(0)], &vec![0; 64 * 1024]));
+            fixture.apply(
+                0,
+                &payload_change(
+                    (0..rows)
+                        .map(|index| Some(i64::try_from(index).unwrap() + 100))
+                        .collect(),
+                    &[],
+                ),
+            );
+            (
+                1,
+                payload_change(vec![Some(50)], &vec![0; 64 * 1024]),
+                (rows, rows),
+            )
+        }
         _ => panic!("unknown ASOF resource case"),
     };
     let profiler = dhat::Profiler::builder().testing().build();
@@ -239,12 +293,20 @@ fn child(case: &str, rows: usize, path: &Path) -> serde_json::Value {
     assert_eq!((measurement.positive, measurement.negative), expected);
     if matches!(
         case,
-        "right_empty_interval" | "right_null_left_history" | "left_lookup_history"
+        "right_empty_interval"
+            | "right_null_left_history"
+            | "left_lookup_history"
+            | "left_lookup_zero_payload"
     ) {
         assert_eq!(measurement.pages, 1);
     }
     drop(fixture);
-    json!({"case":case,"history_rows":rows,"pages":measurement.pages,"output_rows":measurement.rows,"failed_attempts":measurement.retries,"rust_heap":{"total_blocks":heap.total_blocks,"total_bytes":heap.total_bytes,"peak_bytes":heap.max_bytes},"persistent_logical_state":state(&database),"rss_bytes":null})
+    let history_rows = if case == "left_lookup_zero_payload" {
+        1
+    } else {
+        rows
+    };
+    json!({"case":case,"history_rows":history_rows,"pages":measurement.pages,"output_rows":measurement.rows,"failed_attempts":measurement.retries,"rust_heap":{"total_blocks":heap.total_blocks,"total_bytes":heap.total_bytes,"peak_bytes":heap.max_bytes},"persistent_logical_state":state(&database),"rss_bytes":null})
 }
 fn main() {
     let arguments = std::env::args().collect::<Vec<_>>();
@@ -274,7 +336,7 @@ fn main() {
     } else {
         257
     };
-    let context = json!({"benchmark":BENCHMARK,"profile":profile,"host":HostEnvironment::collect(Some(root.filesystem_root())),"contracts":{"rust_heap":"Fresh child starts dhat after fixture, seed and driving input; covers Rust allocation during complete paged input; excludes RocksDB native heap.","persistent_logical_state":"Encoded key and value lengths after processing, excluding control, WAL and filesystem allocation.","rss":"Not sampled; allocator counters and logical state bytes are not RSS.","comparison":"Only compare identical host, rustc, profile, workload, and baseline epoch; test-mode values only validate workload execution."}});
+    let context = json!({"benchmark":BENCHMARK,"profile":profile,"host":HostEnvironment::collect(Some(root.filesystem_root())),"contracts":{"rust_heap":"Fresh child starts dhat after fixture, seed and driving input; covers Rust allocation during complete paged input; excludes RocksDB native heap.","persistent_logical_state":"Encoded key and value lengths after processing, excluding control, WAL and filesystem allocation.","rss":"Not sampled; allocator counters and logical state bytes are not RSS.","comparison":"Only compare identical host, rustc, profile, workload, and baseline epoch; test-mode values only validate workload execution."},"zero_payload_cases":{"right_payload_bytes":64*1024,"right_payload_byte":0,"left_payload_bytes":0,"left_lookup_zero_payload_right_rows":1,"right_zero_payload_rematch_left_rows":rows}});
     fs::write(
         root.path().join("resource-context.json"),
         serde_json::to_vec_pretty(&context).unwrap(),
@@ -287,6 +349,8 @@ fn main() {
         "right_historical_interval",
         "right_empty_interval",
         "right_null_left_history",
+        "left_lookup_zero_payload",
+        "right_zero_payload_rematch",
     ] {
         let sample = root.sample(case);
         let output = Command::new(&executable)

@@ -15,8 +15,8 @@ use crate::{
     operation::relation::indexable,
 };
 
-pub(super) const LEFT_ROWS: &str = "asof_join.left_rows";
-pub(super) const RIGHT_ROWS: &str = "asof_join.right_rows";
+pub(super) const LEFT_ROWS: &str = "asof_join.left_index";
+pub(super) const RIGHT_ROWS: &str = "asof_join.right_index";
 
 pub(crate) struct AsOfJoinLayout {
     pub(super) direction: AsOfDirection,

@@ -319,3 +319,60 @@ zero/half/full 分别出现 +12.23%/+7.79%/+4.87% 和 +59.11%/+14.37%/+19.64%，
 `/tmp/dogpaddle-join-partition-presence-performance/`；最终对照为
 `helper-comparison.json`，原展开版本为 `comparison.json`，过滤对照为
 `filtered-comparison.json`。逐页程序与 oracle 保存在 `/tmp/dogpaddle-join-page-witness/`。
+
+## ASOF 原始 row 后缀与借用 winner：2026-10-01 对照
+
+索引只给 equality/order 分段，canonical row 原样作为末尾后缀；winner 只保存
+key 和 row 起点，直接借用后缀。每个 key 少 row 内零字节数量加两个终止字节，
+同时退役 row 解转义和 winner 的第二份 row Vec。两侧资源改为
+`asof_join.left_index/right_index`，受影响的开发期旧布局直接重建；Definition
+字节不变。原准备、scalar、输出重建和分页预算保留。最终生产 Rust 净减少 3 行，
+本轮主要收益是表示和执行成本。
+
+Apple M5、macOS arm64、Rust 1.96，同一锁文件。baseline 为 `034fbba`，
+candidate 为同一基线加本轮源码；原五个 `asof_join` Criterion fixture、计时和
+输出行数/方向 oracle 逐字未改。reference profile：256 partitions、1024 versions，
+历史修正 128 left rows；wide winner 为 64 KiB 非零 UTF-8、128 left rows。
+每 case 10 samples、100 ms warmup、5 s measurement；保存的 release binaries
+按 baseline/candidate/candidate/baseline 运行。下表为 Criterion mean 的变化，
+负数表示耗时减少；CI 栏为两侧 mean 的 95% CI 是否重叠。
+
+| case | 正序变化 | CI 重叠 | 反序变化 | CI 重叠 |
+| --- | ---: | :---: | ---: | :---: |
+| global_partition_lookup | -0.76% | 是 | -4.36% | 否 |
+| partitioned_lookup | -2.82% | 是 | -4.75% | 否 |
+| right_historical_full_rematch | -8.55% | 否 | -9.84% | 否 |
+| right_tail_small_rematch | -4.04% | 否 | -1.51% | 否 |
+| right_wide_winner_rematch | -57.48% | 否 | -59.50% | 否 |
+
+wide winner 的 mean 为 46.585 → 19.808 ms、49.244 → 19.946 ms；
+其它场景收益较小，两个 lookup 正序 CI 重叠，不构成所有 workload 的提速承诺。
+
+`asof_join_resources` 另用 smoke profile 的 512 history rows，按相同 ABBA
+顺序运行六个独立子进程，共 24 个进程。两种新增 fixture 的 RHS payload 为
+64 KiB 全零 Binary，left payload 为空；lookup 的 RHS history 只有一行。
+旧四个 fixture、两个版本的输入、profiler 范围和输出 oracle 相同，仅资源名
+随当前布局改变。fixture、seed 和 driving input 在 DHAT 之前建立；以下
+Rust allocation 与 peak 只包含完整分页 input 的执行，不含 RocksDB native heap。
+每版本的两轮数字完全一致。逻辑状态为两个 map 的 encoded key+value 总长。
+
+| case | 逻辑状态 bytes 旧 → 新 | 累计 Rust allocation bytes 旧 → 新 | Rust peak bytes 旧 → 新 |
+| --- | ---: | ---: | ---: |
+| left_lookup_history | 51823 → 40532 | 6243 → 5790 | 3213 → 3017 |
+| left_lookup_zero_payload | 131282 → 65698 | 598190 → 270214 | 396429 → 199653 |
+| right_empty_interval | 51604 → 40402 | 2514 → 2415 | 1135 → 1110 |
+| right_historical_interval | 51630 → 40414 | 1180809 → 1139900 | 234948 → 228904 |
+| right_null_left_history | 33641 → 25168 | 2572 → 2350 | 1087 → 999 |
+| right_zero_payload_rematch | 314539 → 171486 | 850813321 → 402859512 | 1844459 → 1643094 |
+
+两版本六个场景的页数、输出行数和失败重试数均相同。零 payload 历史修正
+各为 64 页、1024 输出行、315 次失败重试；累计分配包含这些重试，
+不能将它解释为常驻内存。lookup 的 logical bytes 接近减半是这一零字节
+payload 的结果，不代表任意编码或数据库文件大小减半。benchmark oracle
+只检查行数和方向；逐值关系、rollback/reopen 和坏后缀由 correctness 拥有。
+未测量 RSS、native heap、WAL、物理磁盘或跨数据库端到端吞吐。
+
+原始 samples、estimates、24 份 resource 结果、fixture-only baseline patch、
+源码和 binary SHA 位于 `/tmp/dogpaddle-asof-row-suffix-performance/`，
+对照为 `comparison.json` 与 `resource-comparison.json`。初次格式化的 module 路径错误
+与首次编译的借用生命周期错误均已修复，负证据保留；上述对照仅使用修复后的 release binary。

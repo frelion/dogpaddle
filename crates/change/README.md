@@ -193,7 +193,7 @@ entry。
 绑定格式也是开发期 v1 持久边界。marker、fingerprint 输入、writer options、物理布局或 framing 变化
 必须同步更新 bound golden/layout/reopen 证据并重建受影响资源，不增加旧格式兼容分支。
 
-Source 队列、Flow 挂起页和 Sink outbox 都使用此格式。Flow 为每个逻辑输出绑定 codec，
+Source 队列、Flow 挂起页和 Sink outbox 都使用此格式。Flow 为 Source 的原始输出和融合段末端输出绑定 codec，
 恢复输入时完整解码；子调用直接读取父调用保存的页。页的保留、容量和回收由其 owner 负责。
 
 公开自描述 Arrow Stream 导入/导出、从 entry 发现 Schema，以及选择性 IPC 解码能力已经退役。
