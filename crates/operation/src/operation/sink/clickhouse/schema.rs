@@ -4,12 +4,11 @@ use arrow_schema::{DataType, Field, SchemaRef};
 
 use super::error::ClickHouseSinkSchemaError;
 
-pub(super) const TECHNICAL_DELETED: &str = "$dogpaddle.deleted";
 pub(super) const TECHNICAL_HASH: &str = "$dogpaddle.hash";
 pub(super) const TECHNICAL_ID: &str = "$dogpaddle.id";
 pub(super) const TECHNICAL_VERSION: &str = "$dogpaddle.version";
 pub(super) const TECHNICAL_HASH_INDEX: &str = "$dogpaddle.hash.index";
-pub(super) const MAX_LOGICAL_COLUMNS: usize = 4_092;
+pub(super) const MAX_LOGICAL_COLUMNS: usize = 4_093;
 
 /// Checks all identifiers before checking the backend's supported type mapping.
 pub(super) fn validate(schema: &SchemaRef) -> Result<(), ClickHouseSinkSchemaError> {
@@ -78,14 +77,7 @@ fn validate_identifiers(schema: &SchemaRef) -> Result<(), ClickHouseSinkSchemaEr
                 name: name.clone(),
             });
         }
-        if [
-            TECHNICAL_ID,
-            TECHNICAL_HASH,
-            TECHNICAL_VERSION,
-            TECHNICAL_DELETED,
-        ]
-        .contains(&name.as_str())
-        {
+        if [TECHNICAL_ID, TECHNICAL_HASH, TECHNICAL_VERSION].contains(&name.as_str()) {
             return Err(ClickHouseSinkSchemaError::TechnicalColumnCollision {
                 field,
                 name: name.clone(),

@@ -37,8 +37,7 @@ Flow 直接持久化这份类型化 JSON 计划，只有一个版本和 checksum
 Source 拥有单一输入 Queue、phase 和 checkpoint，快照封口前隐藏、封口后直接可消费。完整 Delivery 先持久捕获，
 真实 CDC Delivery 完成 WAL barrier 后才消费原始 ACK 凭证；内部序列和维护动作共用本轮最终 barrier。未封口快照不会被计算提前看见。
 
-Sink 拥有有界 outbox；事件位置同时表示消费进度和正事件身份，Prepared 只持久化边界与删除 IDs。准备在 Store 事务外进行；Prepared
-先提交并持久化，再交付目标，最后短事务结算。目标成功而本地未结算时，重开后重投相同 Prepared。
+Sink 拥有有界 outbox；事件位置同时表示消费进度和正事件身份。初始化意图先提交并持久化；普通 drain 在 barrier 后直接交付保留前缀，再在短事务结算。目标成功而本地未结算时，重开后根据目标已完成的位置重新规划同一输入，不保存第二份执行计划。
 Sink 不占调用帧；outbox 满时父帧停在同一个消费者，目标 drain 仍能继续。
 
 捕获、计算和交付由同一个 `advance()` 显式驱动，没有后台执行器。一次调用轮转服务一个 Source、

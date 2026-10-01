@@ -7,17 +7,20 @@ use arrow_schema::{DataType, Field, SchemaRef};
 use dogpaddle_change::Change;
 use rusqlite::{Connection, OpenFlags, ToSql, TransactionBehavior, params, params_from_iter};
 
+#[cfg(test)]
+use super::row::EncodedRow;
 use super::{
-    TECHNICAL_HASH, TECHNICAL_ID,
-    definition::SqliteSinkSchemaError,
-    error::SqliteSinkError,
-    row::{EncodedRow, RowCodec},
+    TECHNICAL_HASH, TECHNICAL_ID, definition::SqliteSinkSchemaError, error::SqliteSinkError,
+    row::RowCodec,
 };
 use crate::operation::{
     OperationError,
-    sink::relation::{
-        Batch, Lookup, Matches, RelationTarget, decode_signed_id, encode_signed_id,
-        group_mutations, validate_technical_id,
+    sink::{
+        buffered::DeliveryBatch,
+        relation::{
+            Lookup, Matches, RelationTarget, decode_signed_id, encode_signed_id, plan,
+            validate_technical_id,
+        },
     },
 };
 
@@ -49,6 +52,7 @@ impl SqliteTarget {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn encode_row(
         &self,
         change: &Change,
@@ -61,7 +65,7 @@ impl SqliteTarget {
 
     pub(super) fn require_absent(&mut self) -> Result<(), SqliteSinkError> {
         let (connection, sql) = self.parts(Instant::now() + BUSY_TIMEOUT)?;
-        for name in [&sql.table_name, &sql.index_name] {
+        for name in [&sql.table_name, &sql.index_name, &sql.frontier_name] {
             if object_exists(connection, name)? {
                 return Err(SqliteSinkError::TargetExists { name: name.clone() });
             }
@@ -80,41 +84,22 @@ impl SqliteTarget {
         Ok(())
     }
 
-    fn matching_ids(
-        &mut self,
-        encoded: &EncodedRow,
-        select_limit: usize,
-        deadline: Instant,
-    ) -> Result<Matches, SqliteSinkError> {
-        let (connection, sql) = self.parts(deadline)?;
-        let select_limit = i64::try_from(select_limit).expect("the bounded batch limit fits i64");
-        let mut values = std::iter::once(&encoded.hash as &dyn ToSql)
-            .chain(encoded.values.iter().map(|value| value as &dyn ToSql))
-            .collect::<Vec<_>>();
-        values.push(&select_limit);
-        let mut statement = connection.prepare_cached(&sql.select_matching_ids)?;
-        let mut rows = statement.query(values.as_slice())?;
-        let mut selected = Vec::new();
-        while let Some(row) = rows.next()? {
-            let id: i64 = row.get(0)?;
-            let id = decode_signed_id(id)
-                .map_err(|_| SqliteSinkError::InvalidStoredTechnicalId { id })?;
-            selected.push(id);
-        }
-        Ok(Matches { ids: selected })
-    }
-
     pub(super) fn initialize(&mut self) -> Result<(), SqliteSinkError> {
-        let (connection, sql) = self.parts(Instant::now() + BUSY_TIMEOUT)?;
+        let deadline = Instant::now() + BUSY_TIMEOUT;
+        let (connection, sql) = self.parts(deadline)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if !object_exists(&transaction, &sql.table_name)? {
-            if object_exists(&transaction, &sql.index_name)? {
+            if object_exists(&transaction, &sql.index_name)?
+                || object_exists(&transaction, &sql.frontier_name)?
+            {
                 return Err(SqliteSinkError::TargetLayoutMismatch {
-                    name: sql.index_name.clone(),
+                    name: sql.table_name.clone(),
                 });
             }
             transaction.execute(&sql.create_table, [])?;
             transaction.execute(&sql.create_index, [])?;
+            transaction.execute(&sql.create_frontier, [])?;
+            transaction.execute(&sql.initialize_frontier, [encode_signed_id(1)])?;
         }
         require_exact_layout(&transaction, sql)?;
         if transaction.query_row(&sql.has_rows, [], |row| row.get::<_, bool>(0))? {
@@ -122,89 +107,120 @@ impl SqliteTarget {
                 table: sql.table_name.clone(),
             });
         }
+        if read_frontier(&transaction, sql)? != 1 {
+            return Err(super::error::invalid_batch(
+                "initialization frontier is not one",
+            ));
+        }
+        refresh_deadline(&transaction, deadline)?;
         transaction.commit()?;
+        refresh_deadline(connection, deadline)?;
         self.verified = true;
         Ok(())
     }
 
-    fn write(&mut self, change: &Change, batch: &Batch) -> Result<(), SqliteSinkError> {
+    fn deliver(
+        &mut self,
+        input: &DeliveryBatch,
+        tail: u64,
+        original_head: (u64, &Change),
+    ) -> Result<(), OperationError> {
         let deadline = Instant::now() + BUSY_TIMEOUT;
         self.verify_ready(deadline)?;
-        let (groups, deletes) = self.encode_mutation_groups(change, batch)?;
-        let (connection, sql) = self.parts(deadline)?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for group in &groups {
-            let mut statement = transaction.prepare_cached(&sql.insert)?;
-            for id in &group.insert_ids {
-                let values = [id as &dyn ToSql, &group.row.hash as &dyn ToSql]
+        self.parts(deadline)?;
+        let Self {
+            connection,
+            sql,
+            row_codec,
+            ..
+        } = self;
+        let connection = connection.as_mut().expect("parts opened the connection");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(SqliteSinkError::from)?;
+        let frontier = read_frontier(&transaction, sql)?;
+        let end = input.end_event_offset()?;
+        if frontier < input.first_event_offset() || frontier > tail || end > tail {
+            return Err(super::error::invalid_batch(
+                "target frontier is outside the loaded durable prefix",
+            )
+            .into());
+        }
+        if end <= frontier {
+            refresh_deadline(&transaction, deadline)?;
+            transaction.commit().map_err(SqliteSinkError::from)?;
+            refresh_deadline(connection, deadline)?;
+            return Ok(());
+        }
+        let batch = plan(input, frontier, tail, original_head, |requests| {
+            lookup(
+                &transaction,
+                sql,
+                row_codec,
+                input.change(),
+                requests,
+                frontier - 1,
+                deadline,
+            )
+            .map_err(Into::into)
+        })?;
+        for inserts in batch
+            .inserts
+            .chunk_by(|left, right| left.row_index == right.row_index)
+        {
+            refresh_deadline(&transaction, deadline)?;
+            let row_index = usize::try_from(inserts[0].row_index)?;
+            let row = row_codec
+                .encode_row(input.change().records(), row_index)
+                .map_err(SqliteSinkError::from)?;
+            let mut statement = transaction
+                .prepare_cached(&sql.insert)
+                .map_err(SqliteSinkError::from)?;
+            for insert in inserts {
+                let id = technical_id_as_i64(insert.technical_id)?;
+                let values = [&id as &dyn ToSql, &row.hash as &dyn ToSql]
                     .into_iter()
-                    .chain(group.row.values.iter().map(|value| value as &dyn ToSql));
-                statement.execute(params_from_iter(values))?;
+                    .chain(row.values.iter().map(|value| value as &dyn ToSql));
+                refresh_deadline(&transaction, deadline)?;
+                statement
+                    .execute(params_from_iter(values))
+                    .map_err(SqliteSinkError::from)?;
             }
         }
-        for group in &groups {
-            let mut values = group
-                .mutation_ids
-                .iter()
-                .map(|id| id as &dyn ToSql)
-                .chain(std::iter::once(&group.row.hash as &dyn ToSql))
-                .chain(group.row.values.iter().map(|value| value as &dyn ToSql));
-            let mismatch = transaction
-                .prepare_cached(&sql.mismatch_statement(group.mutation_ids.len()))?
-                .query_row(params_from_iter(&mut values), |row| row.get::<_, bool>(0))?;
-            if mismatch {
-                return Err(super::error::invalid_batch(
-                    "target technical ID belongs to a different logical row",
-                ));
-            }
-        }
+        let deletes = batch
+            .deletes
+            .iter()
+            .map(|delete| technical_id_as_i64(delete.technical_id))
+            .collect::<Result<Vec<_>, _>>()?;
         if !deletes.is_empty() {
+            refresh_deadline(&transaction, deadline)?;
             let placeholders = std::iter::repeat_n("?", deletes.len())
                 .collect::<Vec<_>>()
                 .join(", ");
             let delete = format!("{}({placeholders})", sql.delete_prefix);
             transaction
-                .prepare_cached(&delete)?
-                .execute(params_from_iter(deletes))?;
+                .prepare_cached(&delete)
+                .map_err(SqliteSinkError::from)?
+                .execute(params_from_iter(deletes))
+                .map_err(SqliteSinkError::from)?;
         }
-        transaction.commit()?;
+        refresh_deadline(&transaction, deadline)?;
+        if transaction
+            .execute(
+                &sql.advance_frontier,
+                params![encode_signed_id(end), encode_signed_id(frontier)],
+            )
+            .map_err(SqliteSinkError::from)?
+            != 1
+        {
+            return Err(
+                super::error::invalid_batch("locked frontier changed or disappeared").into(),
+            );
+        }
+        refresh_deadline(&transaction, deadline)?;
+        transaction.commit().map_err(SqliteSinkError::from)?;
+        refresh_deadline(connection, deadline)?;
         Ok(())
-    }
-
-    fn encode_mutation_groups(
-        &self,
-        change: &Change,
-        batch: &Batch,
-    ) -> Result<(Vec<EncodedMutationGroup>, Vec<i64>), SqliteSinkError> {
-        let mutations = group_mutations(batch);
-        let groups = mutations
-            .rows
-            .into_iter()
-            .map(|group| {
-                let row_index = usize::try_from(group.row_index).map_err(|_| {
-                    super::error::invalid_batch("mutation row index cannot be represented by usize")
-                })?;
-                Ok(EncodedMutationGroup {
-                    insert_ids: group
-                        .insert_ids
-                        .into_iter()
-                        .map(technical_id_as_i64)
-                        .collect::<Result<_, _>>()?,
-                    mutation_ids: group
-                        .mutation_ids
-                        .into_iter()
-                        .map(technical_id_as_i64)
-                        .collect::<Result<_, _>>()?,
-                    row: self.encode_row(change, row_index)?,
-                })
-            })
-            .collect::<Result<Vec<_>, SqliteSinkError>>()?;
-        let deletes = mutations
-            .delete_ids
-            .into_iter()
-            .map(technical_id_as_i64)
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok((groups, deletes))
     }
 
     fn parts(&mut self, deadline: Instant) -> Result<(&mut Connection, &SqlPlan), SqliteSinkError> {
@@ -220,24 +236,10 @@ impl SqliteTarget {
         let connection = connection
             .as_mut()
             .expect("the SQLite connection was initialized above");
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT),
-                None,
-            )
-            .into());
-        }
-        connection.busy_timeout(remaining)?;
+        refresh_deadline(connection, deadline)?;
         connection.progress_handler(1000, Some(move || Instant::now() >= deadline))?;
         Ok((connection, sql))
     }
-}
-
-struct EncodedMutationGroup {
-    insert_ids: Vec<i64>,
-    mutation_ids: Vec<i64>,
-    row: EncodedRow,
 }
 
 impl RelationTarget for SqliteTarget {
@@ -249,37 +251,33 @@ impl RelationTarget for SqliteTarget {
         Self::initialize(self).map_err(OperationError::from)
     }
 
-    fn lookup(
+    fn deliver_prefix(
         &mut self,
-        input: &Change,
-        requests: &[Lookup],
-    ) -> Result<Vec<Matches>, OperationError> {
-        let deadline = Instant::now() + BUSY_TIMEOUT;
-        self.verify_ready(deadline)?;
-        requests
-            .iter()
-            .map(|request| {
-                let encoded = self.encode_row(input, request.row_index)?;
-                self.matching_ids(&encoded, request.take, deadline)
-                    .map_err(OperationError::from)
-            })
-            .collect()
-    }
-
-    fn write_batch(&mut self, input: &Change, batch: &Batch) -> Result<(), OperationError> {
-        self.write(input, batch).map_err(OperationError::from)
+        input: &DeliveryBatch,
+        tail: u64,
+        original_head: (u64, &Change),
+    ) -> Result<(), OperationError> {
+        let result = self.deliver(input, tail, original_head);
+        if result.is_err() {
+            self.connection = None;
+            self.verified = false;
+        }
+        result
     }
 }
 
 struct SqlPlan {
     table_name: String,
     index_name: String,
+    frontier_name: String,
     create_table: String,
     create_index: String,
+    create_frontier: String,
+    initialize_frontier: String,
+    read_frontier: String,
+    advance_frontier: String,
     insert: String,
     select_matching_ids: String,
-    row_columns: String,
-    row_value_count: usize,
     delete_prefix: String,
     has_rows: String,
 }
@@ -289,12 +287,14 @@ impl SqlPlan {
         let quoted_table = quote_identifier(&table_name);
         let index_name = format!("$dogpaddle.hash_index.{table_name}");
         let quoted_index = quote_identifier(&index_name);
+        let frontier_name = format!("$dogpaddle.frontier.{table_name}");
+        let quoted_frontier = quote_identifier(&frontier_name);
         let quoted_id = quote_identifier(TECHNICAL_ID);
         let quoted_hash = quote_identifier(TECHNICAL_HASH);
 
         let mut definitions = vec![
             format!(
-                "{quoted_id} INTEGER PRIMARY KEY CONSTRAINT \"$dogpaddle.event-address.v1\" \
+                "{quoted_id} INTEGER PRIMARY KEY CONSTRAINT \"$dogpaddle.event-prefix.v1\" \
                  CHECK({quoted_id} > {} AND {quoted_id} < {})",
                 i64::MIN,
                 i64::MAX
@@ -311,6 +311,15 @@ impl SqlPlan {
             definitions.join(", ")
         );
         let create_index = format!("CREATE INDEX {quoted_index} ON {quoted_table}({quoted_hash})");
+        let create_frontier = format!(
+            "CREATE TABLE {quoted_frontier} (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), next_event INTEGER NOT NULL CONSTRAINT \"$dogpaddle.frontier.v1\" CHECK(next_event > {})) STRICT",
+            i64::MIN
+        );
+        let initialize_frontier = format!("INSERT INTO {quoted_frontier} VALUES (1, ?1)");
+        let read_frontier = format!("SELECT singleton, next_event FROM {quoted_frontier} LIMIT 2");
+        let advance_frontier = format!(
+            "UPDATE {quoted_frontier} SET next_event = ?1 WHERE singleton = 1 AND next_event = ?2"
+        );
 
         let mut columns = vec![quoted_id.clone(), quoted_hash.clone()];
         let logical_columns = row_codec
@@ -325,7 +334,7 @@ impl SqlPlan {
             .collect::<Vec<_>>()
             .join(", ");
         let insert = format!(
-            "INSERT INTO {quoted_table} ({}) VALUES ({placeholders}) ON CONFLICT({quoted_id}) DO NOTHING",
+            "INSERT INTO {quoted_table} ({}) VALUES ({placeholders})",
             columns.join(", ")
         );
 
@@ -349,34 +358,82 @@ impl SqlPlan {
         Ok(Self {
             table_name,
             index_name,
+            frontier_name,
             create_table,
             create_index,
+            create_frontier,
+            initialize_frontier,
+            read_frontier,
+            advance_frontier,
             insert,
             select_matching_ids,
-            row_columns,
-            row_value_count: columns.len() - 1,
             delete_prefix,
             has_rows,
         })
     }
+}
 
-    fn mismatch_statement(&self, ids: usize) -> String {
-        assert!(ids != 0);
-        let id_placeholders = (1..=ids)
-            .map(|index| format!("?{index}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let row_placeholders = (ids + 1..=ids + self.row_value_count)
-            .map(|index| format!("?{index}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "SELECT EXISTS(SELECT 1 FROM {} WHERE {} IN ({id_placeholders}) AND NOT (({}) IS ({row_placeholders})))",
-            quote_identifier(&self.table_name),
-            quote_identifier(TECHNICAL_ID),
-            self.row_columns,
+fn refresh_deadline(connection: &Connection, deadline: Instant) -> Result<(), SqliteSinkError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT),
+            None,
         )
+        .into());
     }
+    connection.busy_timeout(remaining)?;
+    Ok(())
+}
+
+fn read_frontier(connection: &Connection, sql: &SqlPlan) -> Result<u64, SqliteSinkError> {
+    let mut statement = connection.prepare_cached(&sql.read_frontier)?;
+    let mut rows = statement.query([])?;
+    let row = rows
+        .next()?
+        .ok_or_else(|| super::error::invalid_batch("owned frontier has no row"))?;
+    let singleton: i64 = row.get(0)?;
+    let next: i64 = row.get(1)?;
+    if singleton != 1 || next == i64::MIN || rows.next()?.is_some() {
+        return Err(super::error::invalid_batch(
+            "owned frontier is not one valid singleton",
+        ));
+    }
+    Ok(u64::from_ne_bytes(next.to_ne_bytes()) ^ (1_u64 << 63))
+}
+
+fn lookup(
+    connection: &Connection,
+    sql: &SqlPlan,
+    codec: &RowCodec,
+    input: &Change,
+    requests: &[Lookup],
+    through: u64,
+    deadline: Instant,
+) -> Result<Vec<Matches>, SqliteSinkError> {
+    requests
+        .iter()
+        .map(|request| {
+            refresh_deadline(connection, deadline)?;
+            let encoded = codec.encode_row(input.records(), request.row_index)?;
+            let take = i64::try_from(request.take).expect("the bounded batch limit fits i64");
+            let values = std::iter::once(&encoded.hash as &dyn ToSql)
+                .chain(encoded.values.iter().map(|value| value as &dyn ToSql))
+                .chain(std::iter::once(&take as &dyn ToSql))
+                .collect::<Vec<_>>();
+            let mut statement = connection.prepare_cached(&sql.select_matching_ids)?;
+            let mut rows = statement.query(values.as_slice())?;
+            let mut ids = Vec::new();
+            while let Some(row) = rows.next()? {
+                let id: i64 = row.get(0)?;
+                ids.push(
+                    decode_signed_id(id)
+                        .map_err(|_| SqliteSinkError::InvalidStoredTechnicalId { id })?,
+                );
+            }
+            Ok(Matches { through, ids })
+        })
+        .collect()
 }
 
 pub(super) fn quote_identifier(identifier: &str) -> String {
@@ -463,13 +520,14 @@ fn object_exists(connection: &Connection, name: &str) -> Result<bool, rusqlite::
 fn require_exact_layout(connection: &Connection, sql: &SqlPlan) -> Result<(), SqliteSinkError> {
     let mut statement = connection.prepare_cached(
         "SELECT type, name, sql FROM sqlite_schema \
-         WHERE tbl_name = ?1 COLLATE NOCASE \
+         WHERE (tbl_name = ?1 COLLATE NOCASE OR tbl_name = ?2 COLLATE NOCASE) \
          AND type IN ('table', 'index', 'trigger') \
          ORDER BY type COLLATE BINARY, name COLLATE BINARY",
     )?;
-    let mut rows = statement.query(params![&sql.table_name])?;
+    let mut rows = statement.query(params![&sql.table_name, &sql.frontier_name])?;
     let mut found_table = false;
     let mut found_index = false;
+    let mut found_frontier = false;
     while let Some(row) = rows.next()? {
         let object_type: String = row.get(0)?;
         let name: String = row.get(1)?;
@@ -487,6 +545,12 @@ fn require_exact_layout(connection: &Connection, sql: &SqlPlan) -> Result<(), Sq
                     return Err(SqliteSinkError::TargetLayoutMismatch { name });
                 }
             }
+            "table" if name == sql.frontier_name => {
+                found_frontier = true;
+                if definition.as_deref() != Some(sql.create_frontier.as_str()) {
+                    return Err(SqliteSinkError::TargetLayoutMismatch { name });
+                }
+            }
             _ => return Err(SqliteSinkError::TargetLayoutMismatch { name }),
         }
     }
@@ -498,6 +562,11 @@ fn require_exact_layout(connection: &Connection, sql: &SqlPlan) -> Result<(), Sq
     if !found_index {
         return Err(SqliteSinkError::TargetMissing {
             name: sql.index_name.clone(),
+        });
+    }
+    if !found_frontier {
+        return Err(SqliteSinkError::TargetMissing {
+            name: sql.frontier_name.clone(),
         });
     }
     Ok(())

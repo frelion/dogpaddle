@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     definition::ConstructedOperation,
-    operation::{OperationError, SinkOperation, SinkPending, SinkPrepared},
+    operation::{OperationError, SinkOperation, SinkPending},
 };
 
 /// Pure definition of a sink that intentionally discards every input Change.
@@ -50,24 +50,24 @@ impl SinkOperation for DiscardOperation {
     ) -> Result<Option<SinkPending>, OperationError> {
         Ok(None)
     }
-    fn prepare(&mut self, _pending: SinkPending) -> Result<SinkPrepared, OperationError> {
+    fn prepare_initialize(&mut self, _pending: &SinkPending) -> Result<bool, OperationError> {
         unreachable!("discard has no pending delivery")
     }
-    fn persist_prepared(
+    fn persist_initialize(
         &self,
         _access: TransactionAccess<'_>,
-        _prepared: &SinkPrepared,
+        _pending: &SinkPending,
     ) -> Result<(), OperationError> {
-        unreachable!("discard has no prepared delivery")
+        unreachable!("discard has no pending delivery")
     }
-    fn deliver(&mut self, _prepared: &SinkPrepared) -> Result<(), OperationError> {
-        unreachable!("discard has no prepared delivery")
+    fn deliver(&mut self, _pending: &SinkPending) -> Result<(), OperationError> {
+        unreachable!("discard has no pending delivery")
     }
     fn settle(
         &mut self,
         _access: TransactionAccess<'_>,
-        _prepared: &SinkPrepared,
+        _pending: &SinkPending,
     ) -> Result<(), OperationError> {
-        unreachable!("discard has no prepared delivery")
+        unreachable!("discard has no pending delivery")
     }
 }

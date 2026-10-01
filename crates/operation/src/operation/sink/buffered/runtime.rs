@@ -1,10 +1,10 @@
 use super::{
     MAX_TARGET_BATCH_BYTES,
-    batch::{self, DeliveryBatch, LoadedBatch},
+    batch::{self, LoadedBatch},
     invalid,
-    state::{self, BufferState, Header, MAX_CONTROL_BYTES, Prepared, State},
+    state::{self, BufferState, MAX_CONTROL_BYTES, State},
 };
-use crate::operation::sink::relation::{self, Batch, RelationTarget};
+use crate::operation::sink::relation::{self, RelationTarget};
 use crate::operation::{OperationError, SinkOperation};
 use dogpaddle_change::{Change, SchemaBoundChangeCodec};
 use dogpaddle_store::{
@@ -30,42 +30,20 @@ pub(crate) struct BufferedSink<T: RelationTarget> {
     #[cfg(test)]
     max_batch_events: u64,
 }
-/// A bounded source prefix, or an already durable prepared front.
+/// A bounded immutable input prefix or initialization intent.
 pub struct SinkPending {
-    expected: Option<Vec<u8>>,
     kind: PendingKind,
 }
+// One transient prefix stays inline to avoid an allocation per delivery.
+#[expect(clippy::large_enum_variant)]
 enum PendingKind {
     Initialize {
         fresh: bool,
     },
     Loaded {
-        ready: BufferState,
+        before: BufferState,
         batch: LoadedBatch,
     },
-    Prepared(PlannedPhase),
-}
-/// The concrete fixed-ID target plan retained until local settlement.
-pub struct SinkPrepared {
-    expected: Option<Vec<u8>>,
-    encoded: Vec<u8>,
-    kind: PreparedKind,
-}
-enum PreparedKind {
-    Initialize,
-    Batch(Box<PlannedPhase>),
-}
-struct PlannedPhase {
-    after: BufferState,
-    delivery: DeliveryBatch,
-    plan: Batch,
-    consumed_keys: Vec<u64>,
-}
-enum Restored {
-    New,
-    Initialize,
-    Ready(BufferState),
-    Prepared(Box<PlannedPhase>),
 }
 impl<T: RelationTarget> BufferedSink<T> {
     pub(crate) const fn new(
@@ -89,78 +67,24 @@ impl<T: RelationTarget> BufferedSink<T> {
         &mut self,
         encoded: Option<&[u8]>,
         access: ReadTransactionAccess<'_>,
-    ) -> Result<Restored, OperationError> {
+    ) -> Result<Option<State>, OperationError> {
         let Some(encoded) = encoded else {
             self.require_empty_buffer(access)?;
-            return Ok(Restored::New);
+            return Ok(None);
         };
-        match state::decode_header(encoded)? {
-            Header::Initialize => {
+        let state = state::decode(encoded)?;
+        match state {
+            State::Initialize => {
                 self.require_empty_buffer(access)?;
-                Ok(Restored::Initialize)
             }
-            Header::Ready(ready) => {
+            State::Ready(ready) => {
                 validate_capacity(ready)?;
                 if !self.recovered {
                     self.validate_buffer(ready, access)?;
                 }
-                Ok(Restored::Ready(ready))
             }
-            Header::Prepared {
-                before,
-                after,
-                encoded_negative_ids,
-            } => self.restore_prepared(before, after, encoded_negative_ids, access),
         }
-    }
-
-    fn restore_prepared(
-        &mut self,
-        before: BufferState,
-        after: BufferState,
-        encoded_negative_ids: &[u8],
-        access: ReadTransactionAccess<'_>,
-    ) -> Result<Restored, OperationError> {
-        validate_capacity(before)?;
-        validate_capacity(after)?;
-        if !self.recovered {
-            self.validate_buffer(before, access)?;
-        }
-        let delivered_events = after
-            .head
-            .event_offset
-            .checked_sub(before.head.event_offset)
-            .filter(|events| *events != 0)
-            .ok_or_else(|| invalid("invalid prepared event settlement"))?;
-        if delivered_events > self.delivery_event_limit() {
-            return Err(invalid("prepared delivery exceeds the event limit"));
-        }
-        let loaded = batch::load(
-            &self.buffer,
-            before,
-            delivery_limits(delivered_events),
-            &mut self.head_cache,
-            &self.codec,
-            access,
-            |change, row| self.target.event_bytes(change, row),
-        )?;
-        if loaded.after != after {
-            return Err(invalid(
-                "prepared settlement does not match its buffered batch",
-            ));
-        }
-        let negative_ids = state::decode_negative_ids(encoded_negative_ids)?;
-        let plan = relation::recover(
-            &loaded.delivery,
-            &negative_ids,
-            (before.head.entry_start, &loaded.first_entry),
-        )?;
-        Ok(Restored::Prepared(Box::new(PlannedPhase {
-            after,
-            delivery: loaded.delivery,
-            plan,
-            consumed_keys: loaded.consumed_keys,
-        })))
+        Ok(Some(state))
     }
 
     fn require_empty_buffer(
@@ -296,24 +220,17 @@ impl<T: RelationTarget> SinkOperation for BufferedSink<T> {
         if self.codec.schema().as_ref() != page.records().schema_ref().as_ref() {
             return Err(invalid("input Schema differs from the bound Schema"));
         }
-        // load validates the complete control before this runtime is serviced.
-        // Our only writer produces canonical states: a value larger than Ready
-        // can only be Prepared, whose ordered negative IDs need not be copied here.
-        let encoded = match self
+        let encoded = self
             .control
             .access(access)?
-            .get_bounded(state::MAX_READY_BYTES)
-        {
-            Ok(encoded) => encoded,
-            Err(StoreError::ItemTooLarge { .. }) => return Ok(false),
-            Err(error) => return Err(error.into()),
-        };
+            .get_bounded(MAX_CONTROL_BYTES)?;
         let Some(encoded) = encoded else {
             return Ok(false);
         };
-        let Header::Ready(ready) = state::decode_header(&encoded)? else {
+        let State::Ready(ready) = state::decode(&encoded)? else {
             return Ok(false);
         };
+        validate_capacity(ready)?;
         let events = batch::event_count(page)?;
         // Permanent event positions cannot be reclaimed by draining the outbox.
         // Exhaustion is terminal and checked before any map or control write.
@@ -331,6 +248,7 @@ impl<T: RelationTarget> SinkOperation for BufferedSink<T> {
             tail,
             retained_bytes: ready.retained_bytes + admission.item_bytes,
         };
+        next.validate()?;
         let mut map = self.buffer.access(access)?;
         if map.get_bounded(&entry_start, 0)?.is_some() {
             return Err(invalid("outbox entry_start already exists"));
@@ -338,21 +256,20 @@ impl<T: RelationTarget> SinkOperation for BufferedSink<T> {
         map.put(&entry_start, &admission.encoded_change)?;
         self.control
             .access(access)?
-            .set(&encode_bounded(&State::Ready(next))?)?;
+            .set(&State::Ready(next).encode())?;
         Ok(true)
     }
     fn load(
         &mut self,
         access: ReadTransactionAccess<'_>,
     ) -> Result<Option<SinkPending>, OperationError> {
-        let expected = self.control.read(access)?.get_bounded(MAX_CONTROL_BYTES)?;
-        let restored = self.decode_restored(expected.as_deref(), access)?;
+        let encoded = self.control.read(access)?.get_bounded(MAX_CONTROL_BYTES)?;
+        let restored = self.decode_restored(encoded.as_deref(), access)?;
         self.recovered = true;
         let kind = match restored {
-            Restored::New => PendingKind::Initialize { fresh: true },
-            Restored::Initialize => PendingKind::Initialize { fresh: false },
-            Restored::Prepared(planned) => PendingKind::Prepared(*planned),
-            Restored::Ready(ready) => {
+            None => PendingKind::Initialize { fresh: true },
+            Some(State::Initialize) => PendingKind::Initialize { fresh: false },
+            Some(State::Ready(ready)) => {
                 if ready.is_empty() {
                     return Ok(None);
                 }
@@ -365,107 +282,102 @@ impl<T: RelationTarget> SinkOperation for BufferedSink<T> {
                     access,
                     |change, row| self.target.event_bytes(change, row),
                 )?;
-                PendingKind::Loaded { ready, batch }
-            }
-        };
-        Ok(Some(SinkPending { expected, kind }))
-    }
-    fn prepare(&mut self, pending: SinkPending) -> Result<SinkPrepared, OperationError> {
-        let SinkPending { expected, kind } = pending;
-        let (encoded, kind) = match kind {
-            PendingKind::Initialize { fresh } => {
-                if fresh {
-                    self.target.require_absent()?;
-                }
-                (State::Initialize.encode(), PreparedKind::Initialize)
-            }
-            PendingKind::Prepared(planned) => (
-                expected
-                    .as_ref()
-                    .expect("restored Prepared has durable control bytes")
-                    .clone(),
-                PreparedKind::Batch(Box::new(planned)),
-            ),
-            PendingKind::Loaded { ready, batch } => {
-                let plan = relation::prepare(
-                    &mut self.target,
-                    &batch.delivery,
-                    (ready.head.entry_start, &batch.first_entry),
-                )?;
-                let prepared = Prepared {
+                PendingKind::Loaded {
                     before: ready,
-                    after: batch.after,
-                    negative_ids: plan.negative_ids(),
-                };
-                (
-                    encode_bounded(&State::Prepared(prepared))?,
-                    PreparedKind::Batch(Box::new(PlannedPhase {
-                        after: batch.after,
-                        delivery: batch.delivery,
-                        plan,
-                        consumed_keys: batch.consumed_keys,
-                    })),
-                )
+                    batch,
+                }
             }
         };
-        Ok(SinkPrepared {
-            expected,
-            encoded,
-            kind,
-        })
+        Ok(Some(SinkPending { kind }))
     }
-    fn persist_prepared(
+    fn prepare_initialize(&mut self, pending: &SinkPending) -> Result<bool, OperationError> {
+        if matches!(pending.kind, PendingKind::Initialize { fresh: true }) {
+            self.target.require_absent()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+    fn persist_initialize(
         &self,
         access: TransactionAccess<'_>,
-        prepared: &SinkPrepared,
+        pending: &SinkPending,
     ) -> Result<(), OperationError> {
+        if !matches!(pending.kind, PendingKind::Initialize { fresh: true }) {
+            return Err(invalid("only fresh initialization requires persistence"));
+        }
         let current = self
             .control
             .access(access)?
             .get_bounded(MAX_CONTROL_BYTES)?;
-        if current != prepared.expected && current.as_deref() != Some(prepared.encoded.as_slice()) {
-            return Err(invalid("outbox front changed during planning"));
+        if let Some(encoded) = current {
+            return match state::decode(&encoded)? {
+                State::Initialize => Ok(()),
+                State::Ready(_) => Err(invalid("outbox front changed during initialization")),
+            };
         }
-        self.control.access(access)?.set(&prepared.encoded)?;
+        self.control
+            .access(access)?
+            .set(&State::Initialize.encode())?;
         Ok(())
     }
-    fn deliver(&mut self, prepared: &SinkPrepared) -> Result<(), OperationError> {
-        match &prepared.kind {
-            PreparedKind::Initialize => self.target.initialize(),
-            PreparedKind::Batch(planned) => self
-                .target
-                .write_batch(planned.delivery.change(), &planned.plan),
+    fn deliver(&mut self, pending: &SinkPending) -> Result<(), OperationError> {
+        match &pending.kind {
+            PendingKind::Initialize { .. } => self.target.initialize(),
+            PendingKind::Loaded { before, batch } => self.target.deliver_prefix(
+                &batch.delivery,
+                before.tail,
+                (before.head.entry_start, &batch.first_entry),
+            ),
         }
     }
     fn settle(
         &mut self,
         access: TransactionAccess<'_>,
-        prepared: &SinkPrepared,
+        pending: &SinkPending,
     ) -> Result<(), OperationError> {
-        if self
+        let encoded = self
             .control
             .access(access)?
             .get_bounded(MAX_CONTROL_BYTES)?
-            .as_deref()
-            != Some(prepared.encoded.as_slice())
-        {
-            return Err(invalid("prepared front differs during settlement"));
-        }
-        let ready = match &prepared.kind {
-            PreparedKind::Initialize => BufferState::EMPTY,
-            PreparedKind::Batch(planned) => {
+            .ok_or_else(|| invalid("outbox control is missing during settlement"))?;
+        let current = state::decode(&encoded)?;
+        let ready = match (&pending.kind, current) {
+            (PendingKind::Initialize { .. }, State::Initialize) => BufferState::EMPTY,
+            (PendingKind::Loaded { before, batch }, State::Ready(current)) => {
+                validate_capacity(current)?;
+                if current.head != before.head
+                    || current.tail < before.tail
+                    || current.retained_bytes < before.retained_bytes
+                {
+                    return Err(invalid("outbox front changed during settlement"));
+                }
+                let consumed_bytes = before
+                    .retained_bytes
+                    .checked_sub(batch.after.retained_bytes)
+                    .ok_or_else(|| invalid("settlement retained-byte count underflow"))?;
+                let next = BufferState {
+                    head: batch.after.head,
+                    tail: current.tail,
+                    retained_bytes: current
+                        .retained_bytes
+                        .checked_sub(consumed_bytes)
+                        .ok_or_else(|| invalid("settlement retained-byte count underflow"))?,
+                };
+                next.validate()?;
                 let mut buffer = self.buffer.access(access)?;
-                for key in &planned.consumed_keys {
+                for key in &batch.consumed_keys {
                     if !buffer.remove(key)? {
                         return Err(invalid("settled outbox entry is missing"));
                     }
                 }
-                planned.after
+                next
             }
+            _ => return Err(invalid("outbox front differs during settlement")),
         };
         self.control
             .access(access)?
-            .set(&encode_bounded(&State::Ready(ready))?)?;
+            .set(&State::Ready(ready).encode())?;
         if self
             .head_cache
             .as_ref()
@@ -549,15 +461,5 @@ fn validate_capacity(buffer: BufferState) -> Result<(), OperationError> {
         Err(invalid("buffer control state exceeds its capacity"))
     } else {
         Ok(())
-    }
-}
-
-fn encode_bounded(state: &State) -> Result<Vec<u8>, OperationError> {
-    state.validate()?;
-    let encoded = state.encode();
-    if encoded.len() > MAX_CONTROL_BYTES {
-        Err(invalid("control state exceeds its byte limit"))
-    } else {
-        Ok(encoded)
     }
 }

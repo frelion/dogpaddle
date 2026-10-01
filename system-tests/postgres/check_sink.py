@@ -254,7 +254,7 @@ class Gate:
                 rows = self.rows()
                 if rows == expected_rows:
                     # Kill after all source pages have committed. The direct
-                    # operation gate below covers the exact Prepared/settle window.
+                    # operation gate below covers the exact target-commit/settle window.
                     host.kill()
                     break
                 if rows != expected_rows[:len(rows)]:
@@ -338,10 +338,10 @@ class Gate:
     def run_operation_gate(self, binary: Path) -> None:
         started = time.monotonic()
         with self.direct_host(binary, "build", "bulk", 1) as host:
-            # Initialization can roll back, then be durably prepared without DDL.
+            # Initialization can roll back, then be durably saved as intent without DDL.
             assert host.command("rollback seed") == {"kind": "rollback", "unchanged": True}
             assert not self.exists("bulk")
-            assert host.command("prepare-only seed") == {"kind": "prepared"}
+            assert host.command("load-only seed") == {"kind": "loaded"}
             assert not self.exists("bulk")
             host.kill()
 
@@ -355,20 +355,18 @@ class Gate:
             assert host.command("rollback seed") == {"kind": "rollback", "unchanged": True}
             self.admit(host, "bulk", "seed")
             assert self.direct_state("bulk") == (0, "")
-            assert host.command("prepare-only -") == {"kind": "prepared"}
+            assert host.command("load-only -") == {"kind": "loaded"}
             assert self.direct_state("bulk") == (0, "")
-            host.kill()  # Fixed-ID Prepared durable, target has not received it.
+            host.kill()  # Durable input remains queued; no target delivery has occurred.
 
         with self.direct_host(binary, "open", "bulk", 4) as host:
             assert host.command("deliver-only -") == {"kind": "delivered"}
             first = self.direct_state("bulk")
             assert first[0] == 1024
-            host.kill()  # Target committed, local Prepared remains unsettled.
+            host.kill()  # Target prefix committed, local outbox head remains unsettled.
 
         with self.direct_host(binary, "open", "bulk", 5) as host:
             assert host.command("advance -") == {"kind": "advance", "outcome": "Commit"}
-            assert self.direct_state("bulk") == first
-            assert host.command("rollback -") == {"kind": "rollback", "unchanged": True}
             assert self.direct_state("bulk") == first
             self.drain(host, "bulk")
             assert self.direct_state("bulk")[0] == 16_385
@@ -396,7 +394,7 @@ class Gate:
             self.drain(host, "bulk")
             self.admit(host, "bulk", "invalid-prefix")
             response = host.command("advance -")
-            assert response["kind"] == "error" and "only 0 exist" in response["message"], response
+            assert response["kind"] == "error" and "too few IDs" in response["message"], response
             assert self.direct_state("bulk") == (0, "")
 
         # Retraction admission is slice-local. Legal early slices remain settled;
@@ -410,7 +408,7 @@ class Gate:
                 assert host.command("advance -")["outcome"] == "Commit"
             assert self.direct_state("bulk_invalid")[0] == 1
             response = host.command("advance -")
-            assert response["kind"] == "error" and "only 1 exist" in response["message"], response
+            assert response["kind"] == "error" and "too few IDs" in response["message"], response
             assert self.direct_state("bulk_invalid")[0] == 1
 
         for scenario, rows in (("types", 2), ("wide", 80), ("empty", 2)):
@@ -454,12 +452,11 @@ class Gate:
             assert self.direct_state("updates") == (0, "")
 
         # Server execution counts are a deterministic batching oracle, not a
-        # throughput benchmark. Idempotent recovery deliberately executes the
-        # same fixed writes again.
+        # throughput benchmark. Covered-prefix recovery skips business writes.
         log = (self.root / "postgres.log").read_text(encoding="utf-8")
         inserts = log.count('INSERT INTO "public"."bulk" (')
         deletes = log.count('DELETE FROM ONLY "public"."bulk" ')
-        assert (inserts, deletes) == (20, 20), (inserts, deletes)
+        assert (inserts, deletes) == (18, 18), (inserts, deletes)
         assert log.count('INSERT INTO "public"."wide" (') == 2
         print(f"PASS 16,385-row insert/retract, initialization replay, both batch "
               f"commit crash windows, rollback, "
@@ -468,6 +465,121 @@ class Gate:
               f"1,000 distinct updates use {update_lookups} lookup/"
               f"{update_inserts} INSERT/{update_deletes} DELETE; "
               f"stable technical IDs ({time.monotonic() - started:.2f}s)")
+
+    def frontier_state(self, scenario: str) -> str:
+        name = f"$dogpaddle.frontier.gate_{scenario}"
+        if not self.exists(name):
+            return "missing"
+        return self.sql(f'SELECT singleton, next_event FROM public."{name}" ORDER BY singleton')
+
+    def run_frontier_gate(self, binary: Path) -> None:
+        # Ready never repairs its missing or altered owned frontier. Each case
+        # reopens a fresh adapter so the real catalog guard is exercised.
+        for suffix, damage in (
+            ("missing", "DROP TABLE {frontier}"),
+            ("type", "ALTER TABLE {frontier} ALTER COLUMN singleton TYPE integer"),
+            ("default", "ALTER TABLE {frontier} ALTER COLUMN next_event SET DEFAULT -9223372036854775807"),
+            ("index", "CREATE INDEX unexpected_frontier_index ON {frontier}(next_event)"),
+            ("domain", 'ALTER TABLE {frontier} DROP CONSTRAINT "$dogpaddle.frontier_next.gate_frontier_domain"'),
+            ("future", "UPDATE {frontier} SET next_event = -9223372036854775803"),
+        ):
+            scenario = f"frontier_{suffix}"
+            with self.direct_host(binary, "build", scenario, 1) as host:
+                self.admit(host, scenario, "seed")
+                self.drain(host, scenario)
+                self.admit(host, scenario, "birth")
+            frontier = f'public."$dogpaddle.frontier.gate_{scenario}"'
+            self.sql(damage.format(frontier=frontier))
+            before = self.direct_state(scenario), self.frontier_state(scenario)
+            with self.direct_host(binary, "open", scenario, 2) as host:
+                response = host.command("advance -")
+                assert response.get("kind") == "error", response
+            assert (self.direct_state(scenario), self.frontier_state(scenario)) == before
+
+        scenario = "frontier_unique"
+        with self.direct_host(binary, "build", scenario, 1) as host:
+            self.admit(host, scenario, "seed")
+            self.drain(host, scenario)
+            self.admit(host, scenario, "collision")
+            # The established session has already verified ownership. Injecting
+            # this forbidden extra constraint proves a real second-tuple UNIQUE
+            # failure, rather than merely rejecting a catalog before writing.
+            self.sql('CREATE UNIQUE INDEX reject_duplicate_value ON public.frontier_unique(value)')
+            before = self.direct_state(scenario), self.frontier_state(scenario)
+            response = host.command("advance -")
+            assert response.get("kind") == "error" and "SQLSTATE 23505" in response["message"], response
+            assert (self.direct_state(scenario), self.frontier_state(scenario)) == before
+
+        scenario = "frontier_fifo"
+        with self.direct_host(binary, "build", scenario, 1) as host:
+            self.admit(host, scenario, "seed")
+            self.drain(host, scenario)
+            self.admit(host, scenario, "pair")
+            assert host.command("deliver-only -") == {"kind": "delivered"}
+            assert self.direct_state(scenario) == (1, str(-(1 << 63) + 2))
+        with self.direct_host(binary, "open", scenario, 2) as host:
+            self.drain(host, scenario)
+            assert self.direct_state(scenario) == (1, str(-(1 << 63) + 2))
+            assert self.frontier_state(scenario) == f"1|{-(1 << 63) + 4}"
+
+        self.sql("ALTER ROLE dogpaddle_gate SET default_transaction_isolation = 'repeatable read'")
+        try:
+            isolation = self.sql("SHOW default_transaction_isolation")
+            assert isolation == "repeatable read", isolation
+            print(f"frontier lock fixture default_transaction_isolation={isolation}")
+            for commit in (False, True):
+                scenario = f"frontier_lock_{'commit' if commit else 'rollback'}"
+                frontier = f'public."$dogpaddle.frontier.gate_{scenario}"'
+                with self.direct_host(binary, "build", scenario, 1) as host:
+                    self.admit(host, scenario, "seed")
+                    self.drain(host, scenario)
+                    self.admit(host, scenario, "birth")
+                    statement = (
+                        f"BEGIN; SELECT singleton FROM {frontier} FOR UPDATE; "
+                        f'INSERT INTO public."{scenario}" SELECT {-(1 << 63) + 2}, '
+                        f'"$dogpaddle.hash", value FROM public."{scenario}"; '
+                        f"UPDATE {frontier} SET next_event = {-(1 << 63) + 3}; "
+                        f"SELECT pg_sleep(2); {'COMMIT' if commit else 'ROLLBACK'}"
+                    )
+                    with (self.root / f"frontier-lock-{commit}.log").open("w", encoding="utf-8") as log:
+                        with subprocess.Popen(
+                            [*self.psql, "-c", statement],
+                            env=dict(self.pg_env, PGAPPNAME="dogpaddle_frontier_lock"),
+                            stdout=log, stderr=log,
+                        ) as locker:
+                            try:
+                                deadline = time.monotonic() + 15
+                                while self.sql("SELECT EXISTS (SELECT 1 FROM pg_locks l JOIN pg_stat_activity a "
+                                               "ON a.pid=l.pid WHERE a.application_name='dogpaddle_frontier_lock' "
+                                               f"AND l.relation='{frontier}'::regclass AND l.mode='RowShareLock' AND l.granted)") != "t":
+                                    if locker.poll() is not None or time.monotonic() >= deadline:
+                                        raise RuntimeError("frontier fixture did not lock its singleton")
+                                    time.sleep(0.01)
+                                assert host.process.stdin is not None
+                                host.process.stdin.write("advance -\n")
+                                host.process.stdin.flush()
+                                while self.sql("SELECT EXISTS (SELECT 1 FROM pg_stat_activity a "
+                                               "WHERE a.wait_event_type='Lock' AND EXISTS (SELECT 1 FROM "
+                                               "pg_stat_activity blocker WHERE blocker.application_name='dogpaddle_frontier_lock' "
+                                               "AND blocker.pid=ANY(pg_blocking_pids(a.pid))))") != "t":
+                                    if locker.poll() is not None or time.monotonic() >= deadline:
+                                        raise RuntimeError("delivery did not wait for the frontier owner")
+                                    time.sleep(0.01)
+                                assert host.responses.empty(), "delivery completed while the frontier was locked"
+                                locker.wait(timeout=10)
+                                assert locker.returncode == 0
+                                assert host.receive() == {"kind": "advance", "outcome": "Commit"}
+                            finally:
+                                if locker.poll() is None:
+                                    self.sql("SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                                             "WHERE application_name='dogpaddle_frontier_lock'")
+                                    locker.wait(timeout=5)
+                    assert self.direct_state(scenario) == (2, f"{-(1 << 63) + 1},{-(1 << 63) + 2}")
+                    assert self.frontier_state(scenario) == f"1|{-(1 << 63) + 3}"
+        finally:
+            self.sql("ALTER ROLE dogpaddle_gate RESET default_transaction_isolation")
+        print("PASS exact owned frontier catalog, fail-closed missing/domain/future F, actual UNIQUE "
+              "rollback, FIFO replay and two-connection lock commit/rollback re-read")
 
 
 def report_stop_failure(root: Path, error: BaseException) -> None:
@@ -578,6 +690,7 @@ def main() -> None:
         gate.start()
         gate.run_gate()
         gate.run_operation_gate(operation_binary)
+        gate.run_frontier_gate(operation_binary)
         passed = True
     except BaseException as error:
         failure = error

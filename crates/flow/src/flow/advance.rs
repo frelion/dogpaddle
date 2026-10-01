@@ -224,20 +224,20 @@ impl Runtime {
         let Some(pending) = sink.load(reads.begin().access())? else {
             return Ok(AdvanceOutcome::Idle);
         };
-        let prepared = sink
-            .prepare(pending)
-            .inspect_err(|_| self.needs_reopen = true)?;
+        if sink
+            .prepare_initialize(&pending)
+            .inspect_err(|_| self.needs_reopen = true)?
         {
             let transaction = batch.begin();
-            sink.persist_prepared(transaction.access(), &prepared)?;
+            sink.persist_initialize(transaction.access(), &pending)?;
             commit(transaction, &mut self.needs_reopen)?;
         }
         sync(batch, &mut self.needs_reopen)?;
-        sink.deliver(&prepared)
+        sink.deliver(&pending)
             .inspect_err(|_| self.needs_reopen = true)?;
         {
             let transaction = batch.begin();
-            sink.settle(transaction.access(), &prepared)
+            sink.settle(transaction.access(), &pending)
                 .inspect_err(|_| self.needs_reopen = true)?;
             commit(transaction, &mut self.needs_reopen)?;
         }

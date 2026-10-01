@@ -229,7 +229,7 @@ fn target_identity_marks_the_event_address_semantics() {
         DorisTargetSpec::try_new("sink", "db", "table", 1)
             .unwrap()
             .marker(),
-        "dogpaddle.doris-sink.event-address.v1:sink"
+        "dogpaddle.doris-sink.occurrence-version.v1:sink"
     );
 }
 

@@ -86,7 +86,7 @@ fn absence_snapshot_rejects_missing_schema_class_and_table_row_type() {
     let target = spec("target");
 
     assert!(matches!(
-        validate_absence_snapshot(&target, false, None, false),
+        validate_absence_snapshot(&target, false, None, None),
         Err(PostgresSinkError::TargetMissing { name }) if name == "Target Schema"
     ));
     assert!(matches!(
@@ -94,16 +94,16 @@ fn absence_snapshot_rejects_missing_schema_class_and_table_row_type() {
             &target,
             true,
             Some("$dogpaddle.hash.sink_1".to_owned()),
-            false,
+            None,
         ),
         Err(PostgresSinkError::TargetExists { name })
             if name == "$dogpaddle.hash.sink_1"
     ));
     assert!(matches!(
-        validate_absence_snapshot(&target, true, None, true),
+        validate_absence_snapshot(&target, true, None, Some("target".into())),
         Err(PostgresSinkError::TargetExists { name }) if name == "target"
     ));
-    assert!(validate_absence_snapshot(&target, true, None, false).is_ok());
+    assert!(validate_absence_snapshot(&target, true, None, None).is_ok());
 }
 
 #[test]
@@ -336,8 +336,6 @@ fn matching_and_batched_writes_bind_exact_typed_values() {
         PostgresRowCodec::try_new(schema).unwrap().schema(),
     );
     let lookup = plan.lookup_statement(2);
-    let mismatch = plan.mismatch_statement(2);
-
     assert!(
         lookup
             .contains("target.\"a\" = request.c0 OR (target.\"a\" IS NULL AND request.c0 IS NULL)")
@@ -347,78 +345,55 @@ fn matching_and_batched_writes_bind_exact_typed_values() {
             .contains("target.\"b\" = request.c1 OR (target.\"b\" IS NULL AND request.c1 IS NULL)")
     );
     assert!(lookup.contains("(0, $1::bigint, $2::bytea, $3::bigint, $4::bytea), (1, $5::bigint, $6::bytea, $7::bigint, $8::bytea)"));
-    assert!(!lookup.contains("count(*)"));
     assert!(lookup.contains("LIMIT request.take"));
-    assert!(!lookup.contains("request.needed"));
+    assert!(!lookup.contains("count(*)"));
     assert!(lookup.ends_with("ORDER BY request.n"));
-    assert!(!lookup.contains("excluded"));
-    assert!(mismatch.contains("$1::bigint[]"));
-    assert!(mismatch.contains("$5::bigint[]"));
-    assert!(mismatch.contains("target.\"$dogpaddle.hash\" IS DISTINCT FROM expected.hash"));
-    assert!(mismatch.contains("target.\"a\" IS DISTINCT FROM expected.c0"));
-    assert!(mismatch.contains("target.\"b\" IS DISTINCT FROM expected.c1"));
-    assert!(mismatch.contains("target.\"$dogpaddle.id\" = ANY(expected.ids)"));
-
     assert_eq!(
         plan.delete,
         "DELETE FROM ONLY \"Target Schema\".\"target\" WHERE \"$dogpaddle.id\" = ANY($1::bigint[])"
     );
     let insert = plan.insert_statement(2);
     assert!(insert.contains("($1::bigint, $2::bytea, $3::bigint, $4::bytea), ($5::bigint, $6::bytea, $7::bigint, $8::bytea)"));
-    assert!(insert.ends_with("ON CONFLICT (\"$dogpaddle.id\") DO NOTHING"));
+    assert!(!insert.contains("ON CONFLICT"));
     assert!(!insert.contains("RETURNING"));
 }
 
 #[test]
 fn statements_handle_empty_and_wide_schemas_within_parameter_limits() {
-    let empty = SqlPlan::new(
-        &spec("empty"),
-        PostgresRowCodec::try_new(Arc::new(Schema::empty()))
-            .unwrap()
-            .schema(),
-    );
-    assert_eq!(empty.insert_batch_size(), 1024);
-    assert_eq!(empty.lookup_batch_size(), 1024);
-    assert!(
-        empty
-            .insert_statement(1)
-            .contains("($1::bigint, $2::bytea)")
-    );
-    assert!(
-        empty
-            .lookup_statement(1)
-            .contains("(0, $1::bigint, $2::bytea)")
-    );
-
-    let fields = (0..1_598)
-        .map(|index| Field::new(format!("f{index}"), DataType::Int64, true))
-        .collect::<Vec<_>>();
-    let wide = SqlPlan::new(
-        &spec("wide"),
-        PostgresRowCodec::try_new(Arc::new(Schema::new(fields)))
-            .unwrap()
-            .schema(),
-    );
-    assert_eq!(wide.insert_batch_size(), 40);
-    assert_eq!(wide.lookup_batch_size(), 40);
-    assert_eq!(wide.mismatch_batch_size(), 40);
-    let insert = wide.insert_statement(40);
-    assert!(insert.contains("$64000::bigint)"));
-    assert!(!insert.contains("$64001"));
-    let lookup = wide.lookup_statement(40);
-    assert!(lookup.contains("$64000::bigint)"));
-    assert!(!lookup.contains("$64001"));
-    let mismatch = wide.mismatch_statement(40);
-    assert!(mismatch.contains("$64000::bigint)"));
-    assert!(!mismatch.contains("$64001"));
+    for (width, batch) in [(0, 1024), (1598, 40)] {
+        let schema = Arc::new(Schema::new(
+            (0..width)
+                .map(|index| Field::new(format!("f{index}"), DataType::Int64, true))
+                .collect::<Vec<_>>(),
+        ));
+        let plan = SqlPlan::new(
+            &spec("rows"),
+            PostgresRowCodec::try_new(schema).unwrap().schema(),
+        );
+        assert_eq!(plan.insert_batch_size(), batch);
+        assert_eq!(plan.lookup_batch_size(), batch);
+        let insert = plan.insert_statement(batch);
+        let lookup = plan.lookup_statement(batch);
+        let last = batch * (width + 2);
+        assert!(insert.contains(&format!("${last}::")));
+        assert!(lookup.contains(&format!("${last}::")));
+        assert!(!insert.contains(&format!("${}::", last + 1)));
+        assert!(!lookup.contains(&format!("${}::", last + 1)));
+    }
 }
 
 #[test]
-fn layout_owns_only_the_target_and_two_indexes() {
+fn layout_owns_business_indexes_and_singleton_frontier_with_max_tail_domain() {
     let target = spec("target");
     assert_eq!(
         target.object_names(),
-        ["target", "$dogpaddle.hash.sink_1", "$dogpaddle.pk.sink_1",]
+        [
+            "target",
+            "$dogpaddle.hash.sink_1",
+            "$dogpaddle.pk.sink_1",
+            "$dogpaddle.frontier.sink_1",
+            "$dogpaddle.frontier_pk.sink_1"
+        ]
     );
     let plan = SqlPlan::new(
         &target,
@@ -426,17 +401,54 @@ fn layout_owns_only_the_target_and_two_indexes() {
             .unwrap()
             .schema(),
     );
-    assert_eq!(plan.initialize.matches("CREATE TABLE").count(), 1);
+    assert_eq!(plan.initialize.matches("CREATE TABLE").count(), 2);
     assert!(
         plan.initialize
-            .contains("dogpaddle.postgres-relation.event-address.v1:")
+            .contains("dogpaddle.postgres-relation.event-prefix.v1:")
     );
     assert!(plan.initialize.contains(&format!(
         "CHECK (\"$dogpaddle.id\" > {} AND \"$dogpaddle.id\" < {})",
         i64::MIN,
         i64::MAX
     )));
-    assert!(!plan.initialize.contains("CHECK (\"$dogpaddle.id\" > 0)"));
+    assert!(
+        plan.initialize
+            .contains(&format!("CHECK (next_event > '{}'::bigint)", i64::MIN))
+    );
+    assert!(plan.initialize.contains("PRIMARY KEY (singleton)"));
+    assert!(plan.initialize.contains("CHECK (singleton = 1)"));
+}
+
+#[test]
+fn frontier_name_or_row_type_conflicts_are_not_treated_as_absent() {
+    let target = spec("target");
+    let error =
+        validate_absence_snapshot(&target, true, None, Some(target.frontier_table())).unwrap_err();
+    assert!(
+        matches!(error,PostgresSinkError::TargetExists{name} if name=="$dogpaddle.frontier.sink_1")
+    );
+    assert!(
+        PostgresTargetSpec::try_new(
+            "sink_1",
+            "database",
+            "schema",
+            "$dogpaddle.frontier.sink_1",
+            "1",
+            2
+        )
+        .is_err()
+    );
+    assert!(
+        PostgresTargetSpec::try_new(
+            "sink_1",
+            "database",
+            "schema",
+            "$dogpaddle.frontier_pk.sink_1",
+            "1",
+            2
+        )
+        .is_err()
+    );
 }
 
 #[test]

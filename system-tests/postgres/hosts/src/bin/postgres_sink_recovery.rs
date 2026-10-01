@@ -3,7 +3,7 @@
 //!
 //! The caller retains the complete input until `Complete`, then drives durable
 //! buffered delivery with explicit no-input steps. Fault boundaries use the
-//! public load/prepare/persist/deliver/settle API.
+//! public load/initialize-intent/deliver/settle API.
 
 use std::{
     env,
@@ -129,32 +129,34 @@ impl Host {
         let Some(pending) = pending else {
             return Ok(json!({"kind": "advance", "outcome": "Idle"}));
         };
-        let prepared = match sink.prepare(pending) {
-            Ok(prepared) => prepared,
-            Err(error) => return Ok(json!({"kind": "error", "message": error.to_string()})),
+        let needs_initialize = match sink.prepare_initialize(&pending) {
+            Ok(value) => value,
+            Err(error) => return Ok(json!({"kind":"error","message":error.to_string()})),
         };
-        {
+        if needs_initialize {
             let txn = self.transactions.begin();
             let before = self.state.access(txn.access())?.get()?;
-            sink.persist_prepared(txn.access(), &prepared)?;
+            sink.persist_initialize(txn.access(), &pending)?;
             if command == "rollback" {
                 drop(txn);
                 return Ok(
-                    json!({"kind": "rollback", "unchanged": self.state.read(self.reads.begin().access())?.get()? == before}),
+                    json!({"kind":"rollback","unchanged":self.state.read(self.reads.begin().access())?.get()?==before}),
                 );
             }
             txn.commit()?;
+        } else if command == "rollback" {
+            return Err("rollback command requires enqueue or fresh initialization intent".into());
         }
-        if command == "prepare-only" {
-            return Ok(json!({"kind": "prepared"}));
+        if command == "load-only" {
+            return Ok(json!({"kind":"loaded"}));
         }
-        sink.deliver(&prepared)?;
+        sink.deliver(&pending)?;
         if command == "deliver-only" {
             return Ok(json!({"kind": "delivered"}));
         }
         {
             let txn = self.transactions.begin();
-            sink.settle(txn.access(), &prepared)?;
+            sink.settle(txn.access(), &pending)?;
             txn.commit()?;
         }
         Ok(json!({"kind": "advance", "outcome": "Commit"}))
@@ -189,6 +191,19 @@ fn fixture(scenario: &str, stage: &str) -> Result<Change, OperationError> {
                 ),
                 "withdraw" => ((1_000..2_000).collect(), vec![-1; 1_000]),
                 _ => return Err("unknown updates fixture".into()),
+            };
+            let records = RecordBatch::try_from_iter([(
+                "value",
+                Arc::new(Int64Array::from(values)) as ArrayRef,
+            )])?;
+            return Ok(Change::try_new(records, Int64Array::from(diffs))?);
+        }
+        scenario if scenario.starts_with("frontier_") => {
+            let (values, diffs) = match stage {
+                "seed" | "birth" => (vec![7], vec![1]),
+                "collision" => (vec![8, 7], vec![1, 1]),
+                "pair" => (vec![7, 7], vec![1, -1]),
+                _ => return Err("unknown frontier fixture".into()),
             };
             let records = RecordBatch::try_from_iter([(
                 "value",
@@ -317,8 +332,7 @@ fn main() -> Result<(), OperationError> {
     for line in io::stdin().lock().lines() {
         let line = line?;
         let mut parts = line.split_ascii_whitespace();
-        let Some(command @ ("advance" | "rollback" | "prepare-only" | "deliver-only")) =
-            parts.next()
+        let Some(command @ ("advance" | "rollback" | "load-only" | "deliver-only")) = parts.next()
         else {
             return Err("unsupported command".into());
         };

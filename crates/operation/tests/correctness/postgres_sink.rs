@@ -302,7 +302,7 @@ fn postgres_sink_load_is_offline_and_target_check_precedes_initialization_intent
         panic!("expected sink");
     };
     let pending = sink.load(reads.begin().access()).unwrap().unwrap();
-    let Err(error) = sink.prepare(pending) else {
+    let Err(error) = sink.prepare_initialize(&pending) else {
         panic!("mismatched target accepted");
     };
     assert!(matches!(

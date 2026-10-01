@@ -1,6 +1,7 @@
+use super::DeliveryBatch;
 use super::runtime::BufferedSink;
-use super::state::{self, BufferState, Header, Position, Prepared, State};
-use crate::operation::sink::relation::{Batch, Lookup, Matches, RelationTarget};
+use super::state::{self, BufferState, Position, State};
+use crate::operation::sink::relation::{RelationTarget, plan};
 use crate::operation::{OperationError, SinkOperation};
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
@@ -17,11 +18,20 @@ impl RelationTarget for EndpointTarget {
     fn initialize(&mut self) -> Result<(), OperationError> {
         unreachable!("tests seed initialized Ready state")
     }
-    fn lookup(&mut self, _: &Change, _: &[Lookup]) -> Result<Vec<Matches>, OperationError> {
-        unreachable!("positive-only delivery must not look up target rows")
-    }
-    fn write_batch(&mut self, input: &Change, batch: &Batch) -> Result<(), OperationError> {
-        assert_eq!(input.diffs().values().as_ref(), &[1]);
+    fn deliver_prefix(
+        &mut self,
+        input: &DeliveryBatch,
+        tail: u64,
+        original_head: (u64, &Change),
+    ) -> Result<(), OperationError> {
+        let batch = plan(
+            input,
+            input.first_event_offset(),
+            tail,
+            original_head,
+            |_| unreachable!("positive-only delivery must not look up target rows"),
+        )?;
+        assert_eq!(input.change().diffs().values().as_ref(), &[1]);
         assert_eq!(batch.inserts.len(), 1);
         assert_eq!(batch.inserts[0].technical_id, u64::MAX - 1);
         assert!(batch.deletes.is_empty());
@@ -60,8 +70,8 @@ fn ready_control_has_fixed_event_interval_layout_including_exhausted_empty_tail(
         0, 0, 0, 30,
     ];
     assert_eq!(State::Ready(initial).encode(), golden);
-    assert_eq!(golden.len(), state::MAX_READY_BYTES);
-    let Header::Ready(decoded) = state::decode_header(&golden).unwrap() else {
+    assert_eq!(golden.len(), state::MAX_CONTROL_BYTES);
+    let State::Ready(decoded) = state::decode(&golden).unwrap() else {
         panic!("expected Ready");
     };
     assert_eq!(decoded, initial);
@@ -72,8 +82,7 @@ fn ready_control_has_fixed_event_interval_layout_including_exhausted_empty_tail(
         retained_bytes: 0,
     };
     exhausted.validate().unwrap();
-    let Header::Ready(decoded) = state::decode_header(&State::Ready(exhausted).encode()).unwrap()
-    else {
+    let State::Ready(decoded) = state::decode(&State::Ready(exhausted).encode()).unwrap() else {
         panic!("expected Ready");
     };
     assert_eq!(decoded, exhausted);
@@ -81,65 +90,27 @@ fn ready_control_has_fixed_event_interval_layout_including_exhausted_empty_tail(
 }
 
 #[test]
-fn prepared_control_stores_only_boundaries_and_ordered_negative_ids() {
-    let before = BufferState {
+fn control_rejects_every_truncation_trailing_bytes_and_unknown_phase() {
+    let ready = State::Ready(BufferState {
         head: Position::entry_start(7),
         tail: 12,
         retained_bytes: 30,
-    };
-    let after = BufferState {
-        head: Position {
-            entry_start: 7,
-            event_offset: 10,
-        },
-        tail: 12,
-        retained_bytes: 30,
-    };
-    let state = State::Prepared(Prepared {
-        before,
-        after,
-        negative_ids: vec![4, 2],
-    });
-    state.validate().unwrap();
-    let golden = [
-        1, 2, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 12, 0, 0, 0, 0,
-        0, 0, 0, 30, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 12, 0,
-        0, 0, 0, 0, 0, 0, 30, 0, 2, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 2,
-    ];
-    assert_eq!(state.encode(), golden);
-    let Header::Prepared {
-        before: decoded_before,
-        after: decoded_after,
-        encoded_negative_ids,
-    } = state::decode_header(&golden).unwrap()
-    else {
-        panic!("expected Prepared");
-    };
-    assert_eq!((decoded_before, decoded_after), (before, after));
-    assert_eq!(
-        state::decode_negative_ids(encoded_negative_ids).unwrap(),
-        [4, 2]
-    );
-    for length in 0..golden.len() {
-        let result = state::decode_header(&golden[..length]).and_then(|header| match header {
-            Header::Prepared {
-                encoded_negative_ids,
-                ..
-            } => state::decode_negative_ids(encoded_negative_ids).map(|_| ()),
-            _ => Ok(()),
-        });
-        assert!(result.is_err(), "accepted truncation at {length}");
+    })
+    .encode();
+    for encoded in [State::Initialize.encode(), ready] {
+        for length in 0..encoded.len() {
+            assert!(
+                state::decode(&encoded[..length]).is_err(),
+                "accepted truncation at {length}"
+            );
+        }
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(state::decode(&trailing).is_err());
     }
-    let mut trailing = golden.to_vec();
-    trailing.push(0);
-    let Header::Prepared {
-        encoded_negative_ids,
-        ..
-    } = state::decode_header(&trailing).unwrap()
-    else {
-        panic!("expected Prepared");
-    };
-    assert!(state::decode_negative_ids(encoded_negative_ids).is_err());
+    for encoded in [[1, 2], [1, 255], [2, 0]] {
+        assert!(state::decode(&encoded).is_err());
+    }
 }
 
 #[test]
@@ -185,11 +156,8 @@ fn control_rejects_reversed_offsets_and_empty_head_disagreement() {
             retained_bytes: 0,
         },
     ] {
-        assert!(state::decode_header(&State::Ready(buffer).encode()).is_err());
+        assert!(state::decode(&State::Ready(buffer).encode()).is_err());
     }
-    assert!(state::decode_negative_ids(&[4, 1]).is_err());
-    assert!(state::decode_negative_ids(&[0, 1, 0, 0, 0, 0, 0, 0, 0, 0]).is_err());
-    assert!(state::decode_negative_ids(&[0, 1, 255, 255, 255, 255, 255, 255, 255, 255]).is_err());
 }
 
 #[test]
@@ -239,26 +207,6 @@ fn recovery_rejects_a_retained_original_entry_that_exceeded_admission_capacity()
 }
 
 #[test]
-fn maximum_control_length_is_the_exact_bounded_negative_id_layout() {
-    let prepared = State::Prepared(Prepared {
-        before: BufferState {
-            head: Position::entry_start(1025),
-            tail: 2049,
-            retained_bytes: 8,
-        },
-        after: BufferState {
-            head: Position::entry_start(2049),
-            tail: 2049,
-            retained_bytes: 0,
-        },
-        negative_ids: (1..=1024).collect(),
-    });
-    prepared.validate().unwrap();
-    assert_eq!(prepared.encode().len(), 8260);
-    assert_eq!(state::MAX_CONTROL_BYTES, 8260);
-}
-
-#[test]
 fn last_event_offset_settles_and_reopens_then_rejects_all_further_events_without_writes() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("store");
@@ -298,17 +246,11 @@ fn last_event_offset_settles_and_reopens_then_rejects_all_further_events_without
         let snapshot = reads.begin();
         sink.load(snapshot.access()).unwrap().unwrap()
     };
-    let prepared = sink.prepare(pending).unwrap();
+    assert!(!sink.prepare_initialize(&pending).unwrap());
+    sink.deliver(&pending).unwrap();
     {
         let transaction = writes.begin();
-        sink.persist_prepared(transaction.access(), &prepared)
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-    sink.deliver(&prepared).unwrap();
-    {
-        let transaction = writes.begin();
-        sink.settle(transaction.access(), &prepared).unwrap();
+        sink.settle(transaction.access(), &pending).unwrap();
         transaction.commit().unwrap();
     }
     let expected = State::Ready(BufferState {
@@ -335,7 +277,7 @@ fn last_event_offset_settles_and_reopens_then_rejects_all_further_events_without
             assert!(buffer.read(access).unwrap().get(&key).unwrap().is_none());
         }
     }
-    drop((sink, prepared, writes, reads));
+    drop((sink, pending, writes, reads));
     let store = Store::open(&path).unwrap();
     let control = store.open_data::<Cell<Vec<u8>>>(super::CONTROL).unwrap();
     let buffer = store

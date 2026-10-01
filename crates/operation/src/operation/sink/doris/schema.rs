@@ -4,7 +4,7 @@ use arrow_schema::{DataType, Field, SchemaRef};
 
 use super::error::DorisSinkSchemaError;
 
-pub(super) const TECHNICAL_DELETED: &str = "__dogpaddle_deleted";
+pub(super) const TECHNICAL_VERSION: &str = "__dogpaddle_version";
 pub(super) const TECHNICAL_HASH: &str = "__dogpaddle_hash";
 pub(super) const TECHNICAL_ID: &str = "__dogpaddle_id";
 pub(super) const PUBLIC_TECHNICAL_HASH: &str = "$dogpaddle.hash";
@@ -82,7 +82,7 @@ fn validate_identifiers(schema: &SchemaRef) -> Result<(), DorisSinkSchemaError> 
         if [
             TECHNICAL_ID,
             TECHNICAL_HASH,
-            TECHNICAL_DELETED,
+            TECHNICAL_VERSION,
             PUBLIC_TECHNICAL_ID,
             PUBLIC_TECHNICAL_HASH,
         ]

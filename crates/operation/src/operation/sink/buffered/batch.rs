@@ -40,6 +40,12 @@ impl DeliveryBatch {
         self.first_event_offset
     }
 
+    pub(crate) fn end_event_offset(&self) -> Result<u64, OperationError> {
+        self.first_event_offset
+            .checked_add(event_count(&self.change)?)
+            .ok_or_else(|| invalid("delivery interval exceeds the event domain"))
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(
         change: Change,

@@ -26,7 +26,7 @@ fn target_identity_marks_the_event_address_semantics() {
         ClickHouseTargetSpec::try_new("sink", "db", "table", DATABASE_UUID)
             .unwrap()
             .marker(),
-        "dogpaddle.clickhouse-sink.event-address.v1:sink"
+        "dogpaddle.clickhouse-sink.occurrence-version.v1:sink"
     );
 }
 

@@ -1,7 +1,7 @@
 //! Concrete durable source capture and target delivery boundaries.
 use super::OperationError;
 pub use super::scan::cdc_runtime::SourceDelivery;
-pub use super::sink::buffered::{SinkPending, SinkPrepared};
+pub use super::sink::buffered::SinkPending;
 use dogpaddle_change::Change;
 use dogpaddle_store::{ReadTransactionAccess, TransactionAccess};
 
@@ -46,7 +46,7 @@ pub trait SourceOperation: Send + 'static {
     fn consume_published(&self, access: TransactionAccess<'_>) -> Result<(), OperationError>;
 }
 
-/// A sink owns its bounded outbox, prepared fixed-ID plan, and ID frontier.
+/// A sink owns its bounded outbox and absolute event positions.
 pub trait SinkOperation: Send + 'static {
     /// Enqueues a page in the same transaction as parent advancement.
     ///
@@ -60,35 +60,40 @@ pub trait SinkOperation: Send + 'static {
         access: TransactionAccess<'_>,
         page: &Change,
     ) -> Result<bool, OperationError>;
-    /// Reads one bounded prefix or the existing prepared front without target I/O.
+    /// Reads one bounded prefix or initialization intent without target I/O.
     /// # Errors
     /// Returns durable-state or storage failures.
     fn load(
         &mut self,
         access: ReadTransactionAccess<'_>,
     ) -> Result<Option<SinkPending>, OperationError>;
-    /// Plans fixed IDs outside a Store transaction, merging the loaded prefix.
+    /// Checks fresh target absence outside a Store transaction.
+    ///
+    /// Returns true only when the caller must persist initialization intent.
+    /// Durable initialization and ordinary loaded prefixes return false.
     /// # Errors
-    /// Returns target lookup or prefix admission failures.
-    fn prepare(&mut self, pending: SinkPending) -> Result<SinkPrepared, OperationError>;
-    /// Persists the prepared front before a commit and WAL barrier.
+    /// Returns target discovery or ownership failures.
+    fn prepare_initialize(&mut self, pending: &SinkPending) -> Result<bool, OperationError>;
+    /// Persists fresh initialization intent before a commit and WAL barrier.
     /// # Errors
     /// Returns storage or inconsistent-front failures.
-    fn persist_prepared(
+    fn persist_initialize(
         &self,
         access: TransactionAccess<'_>,
-        prepared: &SinkPrepared,
+        pending: &SinkPending,
     ) -> Result<(), OperationError>;
-    /// Delivers the exact fixed-ID plan after its durable barrier.
+    /// Delivers the immutable prefix after its durable barrier.
+    ///
+    /// Success guarantees a readable target prefix covering the loaded input.
     /// # Errors
-    /// Returns target errors; reopening replays the same plan.
-    fn deliver(&mut self, prepared: &SinkPrepared) -> Result<(), OperationError>;
-    /// Settles delivered entries and frontier in one short Store transaction.
+    /// Returns target or prefix validation errors; an uncertain result requires reopen.
+    fn deliver(&mut self, pending: &SinkPending) -> Result<(), OperationError>;
+    /// Settles delivered entries in one short Store transaction, preserving appended input.
     /// # Errors
     /// Returns storage or inconsistent-front failures.
     fn settle(
         &mut self,
         access: TransactionAccess<'_>,
-        prepared: &SinkPrepared,
+        pending: &SinkPending,
     ) -> Result<(), OperationError>;
 }

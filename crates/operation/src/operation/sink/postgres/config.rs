@@ -1,4 +1,9 @@
-use std::{fmt, future::Future, net::IpAddr, time::Duration};
+use std::{
+    fmt,
+    future::Future,
+    net::IpAddr,
+    time::{Duration, Instant},
+};
 
 use serde::{Deserialize, Serialize};
 use tokio::runtime::{Builder, Runtime};
@@ -15,14 +20,6 @@ pub(super) struct PgClient {
     pub(super) client: Client,
 }
 
-pub(super) fn bounded<T>(
-    runtime: &Runtime,
-    stage: &'static str,
-    future: impl Future<Output = Result<T, PostgresSinkError>>,
-) -> Result<T, PostgresSinkError> {
-    bounded_with_timeout(runtime, DATABASE_TIMEOUT, stage, future)
-}
-
 fn bounded_with_timeout<T>(
     runtime: &Runtime,
     duration: Duration,
@@ -34,6 +31,23 @@ fn bounded_with_timeout<T>(
             .await
             .map_err(|_| timeout(stage))?
     })
+}
+
+pub(super) fn bounded_until<T>(
+    runtime: &Runtime,
+    deadline: Instant,
+    stage: &'static str,
+    future: impl Future<Output = Result<T, PostgresSinkError>>,
+) -> Result<T, PostgresSinkError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(timeout(stage));
+    }
+    let value = bounded_with_timeout(runtime, remaining, stage, future)?;
+    if Instant::now() >= deadline {
+        return Err(timeout(stage));
+    }
+    Ok(value)
 }
 
 /// Ephemeral credentials and endpoint for one `PostgreSQL` sink.
@@ -112,9 +126,11 @@ impl PostgresSinkConfig {
         };
         validate_names(&spec)?;
 
-        let mut connection = self.connect()?;
+        let deadline = Instant::now() + DATABASE_TIMEOUT;
+        let mut connection =
+            self.connect_with_timeout(deadline.saturating_duration_since(Instant::now()))?;
         let PgClient { runtime, client } = &mut connection;
-        bounded(runtime, "target discovery", async {
+        bounded_until(runtime, deadline, "target discovery", async {
             let transaction = client
                 .build_transaction()
                 .read_only(true)
@@ -153,10 +169,6 @@ impl PostgresSinkConfig {
             Ok(())
         })?;
         Ok(spec)
-    }
-
-    pub(super) fn connect(&self) -> Result<PgClient, PostgresSinkError> {
-        self.connect_with_timeout(DATABASE_TIMEOUT)
     }
 
     pub(super) fn connect_with_timeout(
@@ -207,17 +219,19 @@ const ABSENCE_QUERY: &str = "SELECT \
      JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace \
      WHERE n.nspname = $1 AND c.relname::text = ANY($2::text[]) \
      ORDER BY array_position($2::text[], c.relname::text) LIMIT 1), \
-    EXISTS(SELECT 1 FROM pg_catalog.pg_type AS t \
+    (SELECT t.typname::text FROM pg_catalog.pg_type AS t \
            JOIN pg_catalog.pg_namespace AS n ON n.oid = t.typnamespace \
-           WHERE n.nspname = $1 AND t.typname = $3)";
+           WHERE n.nspname = $1 AND t.typname = ANY($3::text[]) \
+           ORDER BY array_position($3::text[], t.typname::text) LIMIT 1)";
 
 pub(super) async fn require_absent(
     client: &impl GenericClient,
     spec: &PostgresTargetSpec,
 ) -> Result<(), PostgresSinkError> {
     let names = spec.object_names().to_vec();
+    let types = [spec.table().to_owned(), spec.frontier_table()];
     let row = client
-        .query_one(ABSENCE_QUERY, &[&spec.schema(), &names, &spec.table()])
+        .query_one(ABSENCE_QUERY, &[&spec.schema(), &names, &types.as_slice()])
         .await
         .map_err(|error| database_error("inspect target objects", &error))?;
     validate_absence_snapshot(
@@ -232,7 +246,7 @@ pub(super) fn validate_absence_snapshot(
     spec: &PostgresTargetSpec,
     schema_exists: bool,
     class_conflict: Option<String>,
-    row_type_exists: bool,
+    row_type_conflict: Option<String>,
 ) -> Result<(), PostgresSinkError> {
     if !schema_exists {
         return Err(PostgresSinkError::TargetMissing {
@@ -242,10 +256,8 @@ pub(super) fn validate_absence_snapshot(
     if let Some(name) = class_conflict {
         return Err(PostgresSinkError::TargetExists { name });
     }
-    if row_type_exists {
-        return Err(PostgresSinkError::TargetExists {
-            name: spec.table().to_owned(),
-        });
+    if let Some(name) = row_type_conflict {
+        return Err(PostgresSinkError::TargetExists { name });
     }
     Ok(())
 }
@@ -355,11 +367,21 @@ impl PostgresTargetSpec {
         format!("$dogpaddle.hash.{}", self.sink_id)
     }
 
-    pub(super) fn object_names(&self) -> [String; 3] {
+    pub(super) fn frontier_table(&self) -> String {
+        format!("$dogpaddle.frontier.{}", self.sink_id)
+    }
+
+    pub(super) fn frontier_pk(&self) -> String {
+        format!("$dogpaddle.frontier_pk.{}", self.sink_id)
+    }
+
+    pub(super) fn object_names(&self) -> [String; 5] {
         [
             self.table.clone(),
             self.hash_index(),
             format!("$dogpaddle.pk.{}", self.sink_id),
+            self.frontier_table(),
+            self.frontier_pk(),
         ]
     }
 }

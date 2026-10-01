@@ -191,21 +191,24 @@ impl Fixture {
         let Some(pending) = pending else {
             return Step::Idle;
         };
-        let prepared = sink.prepare(pending).expect("plan fixed IDs");
+        if sink
+            .prepare_initialize(&pending)
+            .expect("check initialization")
         {
             let txn = writes.begin();
-            sink.persist_prepared(txn.access(), &prepared)
-                .expect("persist prepared");
-            txn.commit().expect("commit prepared");
+            sink.persist_initialize(txn.access(), &pending)
+                .expect("persist initialization");
+            txn.commit().expect("commit initialization");
+            stats.commits += 1;
         }
-        sink.deliver(&prepared).expect("deliver target");
+        sink.deliver(&pending).expect("deliver target");
         {
             let txn = writes.begin();
-            sink.settle(txn.access(), &prepared).expect("settle prefix");
+            sink.settle(txn.access(), &pending).expect("settle prefix");
             txn.commit().expect("commit settlement");
         }
         stats.steps += 1;
-        stats.commits += 2;
+        stats.commits += 1;
         stats.completions += 1;
         Step::Drained
     }
@@ -313,7 +316,7 @@ fn benchmark_round_trip(
     let warmup = fixture.round_trip(positive, negative);
     let minimum_steps = 2 + 2 * minimum_batches_per_direction;
     assert!(warmup.steps >= minimum_steps);
-    assert_eq!(warmup.commits, warmup.steps + warmup.completions);
+    assert_eq!(warmup.commits, warmup.steps);
     fixture.verify_empty();
     group.bench_function(scenario, |bencher| {
         bencher.iter_custom(|iterations| {
@@ -323,7 +326,7 @@ fn benchmark_round_trip(
                 let stats = fixture.round_trip(positive, negative);
                 elapsed += started.elapsed();
                 assert!(stats.steps >= minimum_steps);
-                assert_eq!(stats.commits, stats.steps + stats.completions);
+                assert_eq!(stats.commits, stats.steps);
                 fixture.verify_empty();
             }
             elapsed
@@ -360,7 +363,7 @@ fn benchmark_multi_entry(group: &mut BenchmarkGroup<'_, WallTime>, root: &RunRoo
                 stats += fixture.drain();
                 elapsed += started.elapsed();
                 assert_eq!(stats.steps, entries_u64 + 1);
-                assert_eq!(stats.commits, stats.steps + stats.completions);
+                assert_eq!(stats.commits, stats.steps);
                 fixture.verify_empty();
             }
             elapsed
@@ -391,7 +394,7 @@ fn benchmark_restore_validation(
     assert!(matches!(fixture.step(None, &mut restored), Step::Drained));
     assert_eq!(
         (restored.steps, restored.commits, restored.completions),
-        (1, 2, 1)
+        (1, 1, 1)
     );
     let drained = fixture.drain();
     assert_eq!(
@@ -414,7 +417,7 @@ fn benchmark_restore_validation(
                 elapsed += started.elapsed();
                 assert_eq!(
                     (restored.steps, restored.commits, restored.completions),
-                    (1, 2, 1)
+                    (1, 1, 1)
                 );
 
                 let drained = fixture.drain();

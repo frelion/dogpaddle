@@ -69,7 +69,7 @@ fn operation_count(path: &std::path::Path, index: usize) -> Option<u64> {
         .unwrap()
 }
 
-use dogpaddle_operation::operation::{SinkOperation, SinkPending, SinkPrepared};
+use dogpaddle_operation::operation::{SinkOperation, SinkPending};
 use dogpaddle_store::ReadTransactionAccess;
 use std::sync::{
     Arc,
@@ -113,25 +113,25 @@ impl SinkOperation for SinkProbe {
         assert!(!self.panic_on_load, "injected boundary panic");
         self.inner.load(access)
     }
-    fn prepare(&mut self, pending: SinkPending) -> Result<SinkPrepared, OperationError> {
-        self.inner.prepare(pending)
+    fn prepare_initialize(&mut self, pending: &SinkPending) -> Result<bool, OperationError> {
+        self.inner.prepare_initialize(pending)
     }
-    fn persist_prepared(
+    fn persist_initialize(
         &self,
         access: TransactionAccess<'_>,
-        prepared: &SinkPrepared,
+        pending: &SinkPending,
     ) -> Result<(), OperationError> {
-        self.inner.persist_prepared(access, prepared)
+        self.inner.persist_initialize(access, pending)
     }
-    fn deliver(&mut self, prepared: &SinkPrepared) -> Result<(), OperationError> {
-        self.inner.deliver(prepared)
+    fn deliver(&mut self, pending: &SinkPending) -> Result<(), OperationError> {
+        self.inner.deliver(pending)
     }
     fn settle(
         &mut self,
         access: TransactionAccess<'_>,
-        prepared: &SinkPrepared,
+        pending: &SinkPending,
     ) -> Result<(), OperationError> {
-        self.inner.settle(access, prepared)
+        self.inner.settle(access, pending)
     }
 }
 fn install_probe(

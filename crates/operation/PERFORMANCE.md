@@ -612,3 +612,31 @@ mode 当 release 性能证据。
 | 统计 + MIN/MAX | 160 B | 136 B | −24 B |
 
 全部结果包含完整 Atomic apply 和同步 `Transaction::commit`；fixture、绑定、完整输出 oracle 与返回输出的释放不计时。新增 NULL/count 与 extrema 小样例、512 行批次检查全部输出列及 diff。新 case 测热运行的记录跨度和稀疏角色遍历，未隔离冷缓存延迟；没有测绑定构造、大量新 group 的统计初始化、allocator 或 RSS，不能据此声称这些方面改善。持久状态和历史保留不增大；COUNT-only 冷态记录增长是本轮保留的明确代价。
+
+## 2026-10-02 Sink 只保留输入与目标进度
+
+本轮删除持久 Prepared、负事件 ID 清单、准备后的恢复重建和普通 drain 的第二次 Store 提交。SQLite/PG 在目标事务中以单例 F 表示下一个未提交事件；ClickHouse/Doris 以 birth/death 的绝对事件位置作 occurrence version。共享协议不再保存第二份执行计划。按七个产品 crate 的 Rust src 与 bridge main Java 统计，排除完整 `cfg(test)` 项和专用测试文件，基线 `49dbde9` 的 33,976 行变为 34,052 行：共享接口/协议净减 310 行，适配器的事务、目录、可见性与 deadline 检查净增 386 行，全产品 **净增 76 行**。本轮减少概念和一次持久提交，不宣称总代码减少。
+
+SQLite owner benchmark 原始证据位于 `/tmp/dogpaddle-occurrence-delivery-performance`。在同一 Rust 1.96/aarch64、lock 和 filesystem 下保存 baseline/candidate release 二进制，reference 顺序为 A1/C1/C2/A2，四次实际退出码均为 0。各七个 case、输入、profile、预热与测量配置相同；基线执行原准备协议，candidate 执行新接口。常规 case 仍计完整 admission、全部同步 Store commit、目标交付与结算，恢复 case 仍计 reopen/bind、完整 buffer 恢复校验及首次交付/结算；没有把剩余业务搬到计时外。初始化与完整关系 oracle 仍在计时外。构建、source/binary/lock SHA、host context、命令、raw samples、估计值与实际退出码保存在 build-context/runs/comparison JSON。原生测试结束后停止本轮自建数据库并恢复原先停止的 Podman VM，再串行测量；未测 allocator 或进程 RSS。Clippy 的三处语法/局部 annotation 修复后重新构建，最终 benchmark 二进制与原实测 candidate 逐字节相同；`/tmp/dogpaddle-occurrence-delivery-performance-v2/measured-binary-postcondition.json` 保留最终源码与 binary SHA 闭环，未把原运行重新标成新测量。
+
+下表为 median 相对耗时，负数表示耗时下降；“CI重叠”分别列两轮 95% median 区间是否相交。
+
+| case | C1/A1 | C2/A2 | CI重叠：第一/第二轮 |
+| --- | ---: | ---: | --- |
+| `high_multiplicity_finite_capacity_churn` | -16.01% | -12.55% | 否/否 |
+| `large_payload_multiplicity_target_slicing` | -19.50% | -25.38% | 是/否 |
+| `large_payload_small_event` | -16.38% | -18.29% | 否/否 |
+| `large_unit_entry` | -30.36% | -30.57% | 是/否 |
+| `multi_entry_batch/64` | +22.93% | -5.15% | 否/是 |
+| `restore_validation/64` | +0.99% | +0.44% | 是/是 |
+| `steady_small_admission_drain` | -36.50% | -43.13% | 否/是 |
+
+高 multiplicity 与大 payload 单事件两轮均改善且 CI 不重叠；其它改善仅描述本机样本。多 entry 合批首轮明确增时、反向方向相反，不能删去首轮负结果，也不能宣称全面无回归。恢复校验仍扫描原完整保留输入，不作恢复提速结论。每个普通交付少一次真实 Store commit，target 多了 F 的原子更新；这不是无代价的机械优化。
+
+warehouse lookup 的单独原生资源对照位于 `/tmp/dp-ch-history-lookup-_1r2jfn0`。使用固定 ClickHouse 25.8.31.9、相同 UInt64-version 物理布局与完整逻辑行，在原 64 MiB/five-second 配额下比较旧 live-only lookup 和新 MAX(version)+live IDs：hot history、64 行 hash collision、8 个 64 KiB 宽行的四次完整查询及独立完整结果 oracle 均成功。新增历史 MAX 让 JOIN build rows 分别从 1→100,001、64→16,704、8→40；两个查询的 SelectedRows/Bytes 相同，不能把有界返回解释成有界扫描或宣称新增物理扫描字节已被测得。宽行首次 candidate 查询峰值约 59.66 MiB，仅剩约 4.34 MiB 配额余量；顺序预热明显影响峰值，单组 ABBA 不支持稳定内存或耗时比例。
+
+固定的更强宽行 history17 保留为负证据：原完整历史 payload control 先触发 64 MiB 拒绝；另一个明确缩小 scope 的独立 lookup 对照保留公共完整 bag 与 domain/count/hash 检查，旧 lookup 和新 lookup 均以实际 241 退出。后者位于 `/tmp/dp-ch-wide17-lookup-5xg5owz4`，不是整体通过，也不是 candidate 独有回归；没有加配额或继续调参掩盖失败。MAX 含删除历史和 tombstone 保留会随关系历史增长，返回最多 1024 IDs 不限制数据库查询内存。
+
+实际产品适配器证据位于 `/tmp/dp-prefix-warehouse-product-5qp72yu_`：ClickHouse/Doris 六项测试全部退出 0，包括 signed-ID/full-row rebinding 拒绝、历史 lookup、宽 SQL 事务分片，以及已提交长前缀重新切短/切后缀的完整 FIFO oracle。真实 PG 17.10 gate 位于 `/tmp/dp-occurrence-postgres-c5x9ise1`，退出 0，覆盖缺失/错布局/越界 F、实际 UNIQUE 回滚、未知提交重开、16,385 行分批和两连接锁后重读；角色默认 Repeatable Read 已读回，adapter 显式 ReadCommitted。
+
+Doris 4.1.3 的独立真实发布故障证据保存在 `/tmp/dogpaddle-doris-occurrence-native`，同 txn/label 的后续状态回读保存在 `/tmp/dp-podman-native-6qytk18x/commands.json`：standalone INSERT 实际 COMMITTED 被拒，随后同 txn/label 发布为 VISIBLE；显式 VALUES 事务 COMMIT 实际客户端超时，随后同 txn/label VISIBLE 且完整关系正确。没有观测到最终显式 COMMIT 的 OK COMMITTED envelope，不能声称覆盖该分支；该故障 harness 也不证明网络故障与产品 Store settlement 的组合。实际产品 strict VISIBLE parser 对空、PREPARE、COMMITTED 与 malformed envelope 拒绝。同步 mysql 驱动的五秒是接受预算及 socket 空闲 timeout，不能保证协议 read、连接 Drop 或产品停止在五秒内返回；未知或迟到结果保留输入并在重开后重新强读。单 FE/BE 验证不代表 follower/failover 或全规模资源保证。

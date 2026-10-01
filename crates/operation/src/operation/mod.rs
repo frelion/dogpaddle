@@ -6,7 +6,7 @@ use thiserror::Error;
 
 mod boundary;
 mod compute;
-pub use boundary::{SinkOperation, SinkPending, SinkPrepared, SourceDelivery, SourceOperation};
+pub use boundary::{SinkOperation, SinkPending, SourceDelivery, SourceOperation};
 pub use compute::{BudgetExceeded, PagedOperation, Progress, Resume, Step, StepBudget};
 pub(crate) use compute::{Cursor, logical_array_bytes, logical_change_bytes};
 

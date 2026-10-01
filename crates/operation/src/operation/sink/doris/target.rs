@@ -13,14 +13,15 @@ use super::{
     error::{DorisSinkError, database, invalid_batch},
     row::{DorisRowCodec, EncodedRow},
     schema::{
-        self, PUBLIC_TECHNICAL_HASH, PUBLIC_TECHNICAL_ID, TECHNICAL_DELETED, TECHNICAL_HASH,
-        TECHNICAL_HASH_INDEX, TECHNICAL_ID,
+        self, PUBLIC_TECHNICAL_HASH, PUBLIC_TECHNICAL_ID, TECHNICAL_HASH, TECHNICAL_HASH_INDEX,
+        TECHNICAL_ID, TECHNICAL_VERSION,
     },
 };
 use crate::operation::{
     OperationError,
+    sink::buffered::DeliveryBatch,
     sink::relation::{
-        Batch, Lookup, Matches, RelationTarget, decode_signed_id, encode_signed_id,
+        Batch, Lookup, Matches, RelationTarget, decode_signed_id, encode_signed_id, plan,
         relation_event_bytes, terminal_mutations, validate_technical_id,
     },
 };
@@ -31,6 +32,93 @@ const MAX_LOOKUP_SQL_BYTES: usize = 4 * 1024 * 1024;
 const MAX_WRITE_SQL_BYTES: usize = 4 * 1024 * 1024;
 const MAX_WRITE_VALUES: usize = 10_000;
 const WORK_UNIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+// The synchronous driver has socket inactivity timeouts. This shared budget
+// rejects late success; it cannot interrupt an in-progress protocol read.
+fn before(deadline: Instant) -> Result<(), DorisSinkError> {
+    if Instant::now() >= deadline {
+        Err(database("deliver input prefix"))
+    } else {
+        Ok(())
+    }
+}
+
+fn execute_visible(connection: &mut Conn, sql: &str) -> Result<(), DorisSinkError> {
+    let mut result = connection
+        .query_iter(sql)
+        .map_err(|_| database("publish relation batch"))?;
+    if !result.columns().as_ref().is_empty() || result.info_ref().len() > 1024 {
+        return Err(database("verify visible commit"));
+    }
+    let info = result.info_ref().to_vec();
+    if result.next().is_some() {
+        return Err(database("verify visible commit"));
+    }
+    drop(result);
+    require_visible(&info, connection.info_ref())
+}
+
+fn ok_token(input: &mut &[u8], token: &[u8]) -> Result<(), DorisSinkError> {
+    *input = input.trim_ascii_start();
+    *input = input
+        .strip_prefix(token)
+        .ok_or_else(|| database("verify visible commit"))?;
+    Ok(())
+}
+
+fn ok_quoted<'a>(input: &mut &'a [u8]) -> Result<&'a [u8], DorisSinkError> {
+    ok_token(input, b"'")?;
+    let end = input
+        .iter()
+        .position(|byte| *byte == b'\'')
+        .ok_or_else(|| database("verify visible commit"))?;
+    let value = &input[..end];
+    *input = &input[end + 1..];
+    Ok(value)
+}
+
+// Doris' pinned OK envelope uses single quotes. Accept exactly its three fields;
+// COMMITTED, PREPARE, an empty COMMIT or malformed data cannot authorize settle.
+fn require_visible(mut input: &[u8], connection_info: &[u8]) -> Result<(), DorisSinkError> {
+    if input != connection_info || input.len() > 1024 {
+        return Err(database("verify visible commit"));
+    }
+    ok_token(&mut input, b"{")?;
+    ok_token(&mut input, b"'label'")?;
+    ok_token(&mut input, b":")?;
+    let label = ok_quoted(&mut input)?;
+    if label.is_empty()
+        || !label
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-.:".contains(byte))
+    {
+        return Err(database("verify visible commit"));
+    }
+    ok_token(&mut input, b",")?;
+    ok_token(&mut input, b"'status'")?;
+    ok_token(&mut input, b":")?;
+    if ok_quoted(&mut input)? != b"VISIBLE" {
+        return Err(database("verify visible commit"));
+    }
+    ok_token(&mut input, b",")?;
+    ok_token(&mut input, b"'txnId'")?;
+    ok_token(&mut input, b":")?;
+    let id = ok_quoted(&mut input)?;
+    if !id.first().is_some_and(|byte| matches!(*byte, b'1'..=b'9'))
+        || !id.iter().all(u8::is_ascii_digit)
+        || std::str::from_utf8(id)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_none()
+    {
+        return Err(database("verify visible commit"));
+    }
+    ok_token(&mut input, b"}")?;
+    if !input.trim_ascii().is_empty() {
+        return Err(database("verify visible commit"));
+    }
+    Ok(())
+}
 
 pub(super) struct DorisTarget {
     config: DorisSinkConfig,
@@ -55,31 +143,53 @@ impl DorisTarget {
         }
     }
 
-    fn connect(&mut self) -> Result<&mut Conn, DorisSinkError> {
+    fn connect(&mut self, deadline: Instant) -> Result<&mut Conn, DorisSinkError> {
         if self.config.database() != self.spec.database() {
             return Err(DorisSinkError::DatabaseMismatch);
         }
         if self.connection.is_none() {
             let mut connection = self.config.connect()?;
-            connection
-                .query_drop("SET query_timeout = 5")
-                .map_err(|_| database("set statement deadline"))?;
-            connection
-                .query_drop("SET exec_mem_limit = 67108864")
-                .map_err(|_| database("set statement memory limit"))?;
+            for (name, value) in [
+                ("enable_strong_consistency_read", "true"),
+                ("enable_sql_cache", "false"),
+                ("enable_query_cache", "false"),
+                ("skip_missing_version", "false"),
+                ("skip_bad_tablet", "false"),
+                ("group_commit", "off_mode"),
+                ("enable_insert_strict", "true"),
+                ("query_timeout", "5"),
+                ("insert_timeout", "5"),
+                ("exec_mem_limit", "67108864"),
+            ] {
+                before(deadline)?;
+                connection
+                    .query_drop(format!("SET {name} = '{value}'"))
+                    .map_err(|_| database("set session guarantees"))?;
+                let rows: Vec<mysql::Row> = connection
+                    .query(format!("SHOW VARIABLES LIKE '{name}'"))
+                    .map_err(|_| database("verify session guarantees"))?;
+                if rows.len() != 1
+                    || rows[0].get::<String, _>(0).as_deref() != Some(name)
+                    || rows[0].get::<String, _>(1).as_deref() != Some(value)
+                {
+                    return Err(database("verify session guarantees"));
+                }
+            }
             let ids: Vec<u64> = connection
                 .query("SELECT DISTINCT ClusterId FROM frontends()")
                 .map_err(|_| database("read cluster identity"))?;
             if ids.as_slice() != [self.spec.cluster_id()] {
                 return Err(DorisSinkError::TargetIdentityChanged);
             }
+            before(deadline)?;
             self.connection = Some(connection);
+            self.verified = false;
         }
         Ok(self.connection.as_mut().expect("connection was installed"))
     }
 
-    fn ensure_ready(&mut self) -> Result<(), DorisSinkError> {
-        self.connect()?;
+    fn ensure_ready(&mut self, deadline: Instant) -> Result<(), DorisSinkError> {
+        self.connect(deadline)?;
         if !self.verified {
             let mut connection = self.connection.take().expect("connection was installed");
             let result = verify_state(&mut connection, &self.spec, self.codec.schema())
@@ -97,7 +207,7 @@ impl RelationTarget for DorisTarget {
         let baseline = relation_event_bytes(input, row_index)?;
         let row = self.codec.encode_row(input.records(), row_index)?;
         // ID 1 maps to i64::MIN + 1: the longest valid signed BIGINT literal.
-        let encoded = mutation_values(1, true, &row)
+        let encoded = mutation_values(1, 1, &row)
             .len()
             .checked_add(insert_prefix(&self.spec, self.codec.schema()).len())
             .and_then(|bytes| u64::try_from(bytes).ok())
@@ -106,29 +216,73 @@ impl RelationTarget for DorisTarget {
     }
 
     fn require_absent(&mut self) -> Result<(), OperationError> {
+        let deadline = Instant::now() + WORK_UNIT_TIMEOUT;
         let spec = self.spec.clone();
-        require_absent(self.connect()?, &spec).map_err(Into::into)
-    }
-
-    fn initialize(&mut self) -> Result<(), OperationError> {
-        self.connect()?;
-        let mut connection = self.connection.take().expect("connection was installed");
-        let result = self.initialize_with(&mut connection);
-        self.connection = Some(connection);
-        if result.is_ok() {
-            self.verified = true;
+        let result = (|| {
+            require_absent(self.connect(deadline)?, &spec)?;
+            before(deadline)
+        })();
+        if result.is_err() {
+            self.connection = None;
+            self.verified = false;
         }
         result.map_err(Into::into)
     }
 
+    fn initialize(&mut self) -> Result<(), OperationError> {
+        let deadline = Instant::now() + WORK_UNIT_TIMEOUT;
+        self.connect(deadline)?;
+        let mut connection = self.connection.take().expect("connection was installed");
+        let result = self
+            .initialize_with(&mut connection)
+            .and_then(|()| before(deadline));
+        if result.is_ok() {
+            self.connection = Some(connection);
+            self.verified = true;
+        } else {
+            self.verified = false;
+        }
+        result.map_err(Into::into)
+    }
+
+    fn deliver_prefix(
+        &mut self,
+        input: &DeliveryBatch,
+        tail: u64,
+        original_head: (u64, &Change),
+    ) -> Result<(), OperationError> {
+        let deadline = Instant::now() + WORK_UNIT_TIMEOUT;
+        let result = (|| {
+            self.ensure_ready(deadline)?;
+            before(deadline)?;
+            let batch = plan(
+                input,
+                input.first_event_offset(),
+                tail,
+                original_head,
+                |requests| self.lookup(input.change(), requests, deadline),
+            )?;
+            before(deadline)?;
+            self.write_relation_batch(input.change(), &batch, tail, deadline)?;
+            before(deadline)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            self.connection = None;
+            self.verified = false;
+        }
+        result
+    }
+}
+
+impl DorisTarget {
     fn lookup(
         &mut self,
         input: &Change,
         requests: &[Lookup],
+        deadline: Instant,
     ) -> Result<Vec<Matches>, OperationError> {
-        self.ensure_ready()?;
         let mut output = Vec::with_capacity(requests.len());
-        let started = Instant::now();
         let mut clauses = Vec::new();
         let mut parameters = Vec::new();
         let mut sql_bytes = 0_usize;
@@ -138,26 +292,34 @@ impl RelationTarget for DorisTarget {
             let clause = lookup_clause(&self.spec, request_index, request, &predicate);
             if !clauses.is_empty()
                 && (clauses.len() == MAX_LOOKUP_CLAUSES
-                    || parameters.len().saturating_add(row_parameters.len())
+                    || parameters
+                        .len()
+                        .saturating_add(row_parameters.len().saturating_mul(2))
                         > MAX_LOOKUP_PARAMETERS
                     || sql_bytes.saturating_add(clause.len()) > MAX_LOOKUP_SQL_BYTES)
             {
-                if started.elapsed() >= WORK_UNIT_TIMEOUT {
+                if Instant::now() >= deadline {
                     return Err(database("match target rows").into());
                 }
-                self.read_lookup_clauses(&clauses, std::mem::take(&mut parameters), &mut output)?;
+                self.read_lookup_clauses(
+                    &clauses,
+                    std::mem::take(&mut parameters),
+                    &mut output,
+                    deadline,
+                )?;
                 clauses.clear();
                 sql_bytes = 0;
             }
+            parameters.extend(row_parameters.iter().cloned());
             parameters.extend(row_parameters);
             sql_bytes = sql_bytes.saturating_add(clause.len());
             clauses.push(clause);
         }
         if !clauses.is_empty() {
-            if started.elapsed() >= WORK_UNIT_TIMEOUT {
+            if Instant::now() >= deadline {
                 return Err(database("match target rows").into());
             }
-            self.read_lookup_clauses(&clauses, parameters, &mut output)?;
+            self.read_lookup_clauses(&clauses, parameters, &mut output, deadline)?;
         }
         if output.len() != requests.len() {
             return Err(database("decode matching rows").into());
@@ -165,46 +327,43 @@ impl RelationTarget for DorisTarget {
         Ok(output)
     }
 
-    fn write_batch(&mut self, input: &Change, batch: &Batch) -> Result<(), OperationError> {
-        self.ensure_ready()?;
-        self.write_relation_batch(input, batch).map_err(Into::into)
-    }
-}
-
-impl DorisTarget {
     fn read_lookup_clauses(
         &mut self,
         clauses: &[String],
         parameters: Vec<Value>,
         output: &mut Vec<Matches>,
+        deadline: Instant,
     ) -> Result<(), DorisSinkError> {
+        before(deadline)?;
         let expected_rows = output.len().saturating_add(clauses.len());
-        let sql = format!("{} ORDER BY n, id IS NULL, id", clauses.join(" UNION ALL "));
-        let result: Result<Vec<(u64, Option<i64>)>, _> =
-            self.connect()?.exec(sql, Params::Positional(parameters));
-        let Ok(rows) = result else {
-            self.connection = None;
-            self.verified = false;
-            return Err(database("match target rows"));
-        };
-        let mut current = None;
-        for (request_index, id) in rows {
+        let sql = format!("{} ORDER BY n, kind, value", clauses.join(" UNION ALL "));
+        let rows: Vec<(u64, u8, Option<i64>)> = self
+            .connect(deadline)?
+            .exec(sql, Params::Positional(parameters))
+            .map_err(|_| database("match target rows"))?;
+        before(deadline)?;
+        for (request_index, kind, value) in rows {
             let request_index = usize::try_from(request_index)
                 .map_err(|_| database("decode matching request index"))?;
-            if current != Some(request_index) {
-                if request_index != output.len() {
-                    return Err(database("decode matching request order"));
-                }
-                output.push(Matches { ids: Vec::new() });
-                current = Some(request_index);
-            }
-            let matched = output
-                .last_mut()
-                .expect("a matching request was installed above");
-            if let Some(id) = id {
-                matched
+            if kind == 0 && request_index == output.len() {
+                let through = value
+                    .map(decode_signed_id)
+                    .transpose()
+                    .map_err(|error| invalid_batch(error.to_string()))?
+                    .unwrap_or(0);
+                output.push(Matches {
+                    through,
+                    ids: Vec::new(),
+                });
+            } else if kind == 1 && request_index.checked_add(1) == Some(output.len()) {
+                let id = value.ok_or_else(|| database("decode matching ID"))?;
+                output
+                    .last_mut()
+                    .expect("a matching request is installed")
                     .ids
                     .push(decode_signed_id(id).map_err(|error| invalid_batch(error.to_string()))?);
+            } else {
+                return Err(database("decode matching request order"));
             }
         }
         if output.len() != expected_rows {
@@ -257,65 +416,57 @@ impl DorisTarget {
         &mut self,
         input: &Change,
         batch: &Batch,
+        tail: u64,
+        deadline: Instant,
     ) -> Result<(), DorisSinkError> {
         let terminal = terminal_mutations(batch);
-        let existing = self.read_ids(terminal.iter().map(|mutation| mutation.technical_id))?;
+        let existing = self.read_ids(
+            terminal.iter().map(|mutation| mutation.technical_id),
+            tail,
+            deadline,
+        )?;
         let mut actions = Vec::new();
         for mutation in terminal {
             let id = mutation.technical_id;
-            let want_deleted = mutation.deleted;
+            let version = mutation.version;
             let row_index = usize::try_from(mutation.row_index)
                 .map_err(|_| invalid_batch("row index exceeds usize"))?;
             let row = self.codec.encode_row(input.records(), row_index)?;
-            match existing.get(&id) {
-                Some(actual) => {
-                    if !same_row(actual, &row) {
-                        return Err(invalid_batch(format!(
-                            "technical ID {id} is bound to another logical row"
-                        )));
-                    }
-                    if actual.deleted && !want_deleted {
-                        return Err(invalid_batch(format!(
-                            "technical ID {id} cannot be resurrected"
-                        )));
-                    }
-                    if actual.deleted != want_deleted {
-                        actions.push((id, want_deleted, row));
-                    }
+            if let Some(actual) = existing.get(&id) {
+                if !same_row(actual, &row) {
+                    return Err(invalid_batch(format!(
+                        "technical ID {id} is bound to another logical row"
+                    )));
                 }
-                None if !want_deleted => actions.push((id, false, row)),
-                None => {}
+                if actual.version >= version {
+                    continue;
+                }
             }
+            actions.push((id, version, row));
         }
         if actions.is_empty() {
             return Ok(());
         }
         let statements = insert_statements(&self.spec, self.codec.schema(), &actions);
         let transactional = statements.len() > 1;
-        let started = Instant::now();
-        let connection = self.connect()?;
+        before(deadline)?;
+        let connection = self.connect(deadline)?;
         if transactional {
             connection
                 .query_drop("BEGIN")
                 .map_err(|_| database("begin relation batch"))?;
             for statement in statements {
-                if started.elapsed() >= WORK_UNIT_TIMEOUT {
-                    let _ = connection.query_drop("ROLLBACK");
-                    return Err(database("apply relation batch"));
-                }
-                if connection.query_drop(statement).is_err() {
-                    let _ = connection.query_drop("ROLLBACK");
-                    return Err(database("apply relation batch"));
-                }
+                before(deadline)?;
+                connection
+                    .query_drop(statement)
+                    .map_err(|_| database("apply relation batch"))?;
             }
-            connection
-                .query_drop("COMMIT")
-                .map_err(|_| database("commit relation batch"))?;
-        } else if let Some(statement) = statements.into_iter().next()
-            && connection.query_drop(statement).is_err()
-        {
-            return Err(database("apply relation batch"));
+            before(deadline)?;
+            execute_visible(connection, "COMMIT")?;
+        } else if let Some(statement) = statements.into_iter().next() {
+            execute_visible(connection, &statement)?;
         }
+        before(deadline)?;
         Ok(())
     }
 }
@@ -323,7 +474,7 @@ impl DorisTarget {
 #[derive(Debug)]
 struct StoredRow {
     hash: Vec<u8>,
-    deleted: bool,
+    version: u64,
     values: Vec<Value>,
 }
 
@@ -331,6 +482,8 @@ impl DorisTarget {
     fn read_ids(
         &mut self,
         ids: impl IntoIterator<Item = u64>,
+        tail: u64,
+        deadline: Instant,
     ) -> Result<BTreeMap<u64, StoredRow>, DorisSinkError> {
         let ids = ids.into_iter().collect::<Vec<_>>();
         if ids.is_empty() {
@@ -354,7 +507,7 @@ impl DorisTarget {
             })
             .collect::<Result<Vec<_>, DorisSinkError>>()?;
         let rows: Vec<mysql::Row> = self
-            .connect()?
+            .connect(deadline)?
             .exec(sql, Params::Positional(parameters))
             .map_err(|_| database("read mutation IDs"))?;
         let mut output = BTreeMap::new();
@@ -366,14 +519,19 @@ impl DorisTarget {
                     .ok_or_else(|| database("decode mutation ID"))?,
             )?;
             let hash = value_bytes(values.next().ok_or_else(|| database("decode row hash"))?)?;
-            let deleted = value_bool(
+            let version = value_id(
                 values
                     .next()
-                    .ok_or_else(|| database("decode delete marker"))?,
+                    .ok_or_else(|| database("decode occurrence version"))?,
             )?;
+            if version < id || version >= tail {
+                return Err(invalid_batch(
+                    "stored version is outside the delivery domain",
+                ));
+            }
             let stored = StoredRow {
                 hash,
-                deleted,
+                version,
                 values: values.collect(),
             };
             if output.insert(id, stored).is_some() {
@@ -425,16 +583,6 @@ fn value_bytes(value: Value) -> Result<Vec<u8>, DorisSinkError> {
     }
 }
 
-fn value_bool(value: Value) -> Result<bool, DorisSinkError> {
-    match value {
-        Value::Int(0) | Value::UInt(0) => Ok(false),
-        Value::Int(1) | Value::UInt(1) => Ok(true),
-        Value::Bytes(value) if value == b"0" => Ok(false),
-        Value::Bytes(value) if value == b"1" => Ok(true),
-        _ => Err(database("decode delete marker")),
-    }
-}
-
 fn row_predicate(schema: &Schema, row: &EncodedRow) -> (String, Vec<Value>) {
     let mut predicates = vec![format!("{} = ?", quote(TECHNICAL_HASH))];
     let mut parameters = vec![Value::Bytes(row.hash.clone())];
@@ -452,16 +600,13 @@ fn lookup_clause(
     predicate: &str,
 ) -> String {
     debug_assert!(request.take > 0);
+    let table = qualified(spec.database(), &spec.state_table());
+    let id = quote(TECHNICAL_ID);
+    let version = quote(TECHNICAL_VERSION);
     format!(
-        "(SELECT {request_index} AS n, id FROM \
-         ((SELECT {} AS id FROM {} WHERE {} = 0 AND {predicate} ORDER BY {} LIMIT {}) \
-         UNION ALL SELECT CAST(NULL AS BIGINT) AS id) AS matched \
-         ORDER BY id IS NULL, id LIMIT {})",
-        quote(TECHNICAL_ID),
-        qualified(spec.database(), &spec.state_table()),
-        quote(TECHNICAL_DELETED),
-        quote(TECHNICAL_ID),
-        request.take,
+        "(SELECT {request_index} AS n, 0 AS kind, MAX({version}) AS value FROM {table} WHERE {predicate}) \
+         UNION ALL (SELECT {request_index} AS n, 1 AS kind, {id} AS value FROM {table} \
+         WHERE {version} = {id} AND {predicate} ORDER BY {id} LIMIT {})",
         request.take
     )
 }
@@ -469,7 +614,7 @@ fn lookup_clause(
 fn insert_prefix(spec: &DorisTargetSpec, schema: &Schema) -> String {
     let columns = std::iter::once(TECHNICAL_ID)
         .chain(std::iter::once(TECHNICAL_HASH))
-        .chain(std::iter::once(TECHNICAL_DELETED))
+        .chain(std::iter::once(TECHNICAL_VERSION))
         .chain(schema.fields().iter().map(|field| field.name().as_str()))
         .map(quote)
         .collect::<Vec<_>>()
@@ -483,15 +628,15 @@ fn insert_prefix(spec: &DorisTargetSpec, schema: &Schema) -> String {
 fn insert_statements(
     spec: &DorisTargetSpec,
     schema: &Schema,
-    actions: &[(u64, bool, EncodedRow)],
+    actions: &[(u64, u64, EncodedRow)],
 ) -> Vec<String> {
     let prefix = insert_prefix(spec, schema);
     let mut statements = Vec::new();
     let mut statement = prefix.clone();
     let mut rows = 0_usize;
     let values_per_row = schema.fields().len().saturating_add(3);
-    for (id, deleted, row) in actions {
-        let values = mutation_values(*id, *deleted, row);
+    for (id, version, row) in actions {
+        let values = mutation_values(*id, *version, row);
         if rows != 0
             && (statement
                 .len()
@@ -515,11 +660,11 @@ fn insert_statements(
     statements
 }
 
-fn mutation_values(id: u64, deleted: bool, row: &EncodedRow) -> String {
+fn mutation_values(id: u64, version: u64, row: &EncodedRow) -> String {
     let mut values = Vec::with_capacity(row.values.len() + 3);
     values.push(encode_signed_id(id).to_string());
     values.push(bytes_literal(&row.hash));
-    values.push(u8::from(deleted).to_string());
+    values.push(encode_signed_id(version).to_string());
     values.extend(row.values.iter().map(value_literal));
     format!("({})", values.join(","))
 }
@@ -552,7 +697,7 @@ fn create_state_sql(spec: &DorisTargetSpec, schema: &Schema) -> String {
     let mut columns = vec![
         format!("{} BIGINT NOT NULL", quote(TECHNICAL_ID)),
         format!("{} CHAR(32) NOT NULL", quote(TECHNICAL_HASH)),
-        format!("{} TINYINT NOT NULL", quote(TECHNICAL_DELETED)),
+        format!("{} BIGINT NOT NULL", quote(TECHNICAL_VERSION)),
     ];
     columns.extend(schema.fields().iter().map(|column| {
         format!(
@@ -581,17 +726,18 @@ fn create_state_sql(spec: &DorisTargetSpec, schema: &Schema) -> String {
         quote(TECHNICAL_ID),
         literal(&spec.marker()),
         quote(TECHNICAL_ID),
-        literal(TECHNICAL_DELETED)
+        literal(TECHNICAL_VERSION)
     )
 }
 
 fn create_view_sql(spec: &DorisTargetSpec, schema: &Schema) -> String {
     format!(
-        "CREATE VIEW {} AS SELECT {} FROM {} WHERE {} = 0",
+        "CREATE VIEW {} AS SELECT {} FROM {} WHERE {} = {}",
         qualified(spec.database(), spec.table()),
         selected_public_columns(schema),
         qualified(spec.database(), &spec.state_table()),
-        quote(TECHNICAL_DELETED)
+        quote(TECHNICAL_VERSION),
+        quote(TECHNICAL_ID)
     )
 }
 
@@ -611,7 +757,7 @@ fn verify_state(
     let mut expected = vec![
         (TECHNICAL_ID.to_owned(), "bigint(20)", "NO"),
         (TECHNICAL_HASH.to_owned(), "char(32)", "NO"),
-        (TECHNICAL_DELETED.to_owned(), "tinyint(4)", "NO"),
+        (TECHNICAL_VERSION.to_owned(), "bigint(20)", "NO"),
     ];
     expected.extend(schema.fields().iter().map(|column| {
         (
@@ -656,7 +802,7 @@ fn verify_state(
             ))
             || !compact.contains("\"enable_unique_key_merge_on_write\"=\"true\"")
             || !compact.contains(&format!(
-                "\"function_column.sequence_col\"=\"{TECHNICAL_DELETED}\""
+                "\"function_column.sequence_col\"=\"{TECHNICAL_VERSION}\""
             ))
             || !compact.contains(&format!(
                 "INDEX{TECHNICAL_HASH_INDEX}({TECHNICAL_HASH})USINGINVERTED"
@@ -719,7 +865,7 @@ fn expected_view_definition(spec: &DorisTargetSpec, schema: &Schema) -> String {
         )
         .collect::<Vec<_>>()
         .join(",");
-    format!("SELECT{columns}FROM{source}WHERE{source}.{TECHNICAL_DELETED}=0")
+    format!("SELECT{columns}FROM{source}WHERE{source}.{TECHNICAL_VERSION}={source}.{TECHNICAL_ID}")
 }
 
 fn compact_sql(sql: &str) -> String {
@@ -750,7 +896,7 @@ fn object_kinds(
 fn selected_columns(schema: &Schema) -> String {
     std::iter::once(TECHNICAL_ID)
         .chain(std::iter::once(TECHNICAL_HASH))
-        .chain(std::iter::once(TECHNICAL_DELETED))
+        .chain(std::iter::once(TECHNICAL_VERSION))
         .chain(schema.fields().iter().map(|field| field.name().as_str()))
         .map(quote)
         .collect::<Vec<_>>()
@@ -793,6 +939,41 @@ mod identity_tests {
     use super::*;
 
     #[test]
+    fn only_complete_visible_ok_envelopes_authorize_settlement() {
+        let visible = b"{'label':'label_a-1.2:3','status':'VISIBLE','txnId':'1'}";
+        assert!(require_visible(visible, visible).is_ok());
+        let maximum =
+            b" \t{ 'label' : 'a' , 'status' : 'VISIBLE' , 'txnId' : '18446744073709551615' }\r\n";
+        assert!(require_visible(maximum, maximum).is_ok());
+        for bad in [
+            b"".as_slice(),
+            b"{}",
+            b"\xff",
+            b"{'label':'a','status':'COMMITTED','txnId':'1'}",
+            b"{'label':'a','status':'PREPARE','txnId':'1'}",
+            b"{\"label\":\"a\",\"status\":\"VISIBLE\",\"txnId\":\"1\"}",
+            b"{'status':'VISIBLE','label':'a','txnId':'1'}",
+            b"{'label':'a','label':'b','status':'VISIBLE','txnId':'1'}",
+            b"{'label':'a','status':'COMMITTED','status':'VISIBLE','txnId':'1'}",
+            b"{'label':'a','status':'VISIBLE','txnId':'1','err':'publish timeout'}",
+            b"{'label':'a','status':'VISIBLE','txnId':'0'}",
+            b"{'label':'a','status':'VISIBLE','txnId':'01'}",
+            b"{'label':'a','status':'VISIBLE','txnId':'-1'}",
+            b"{'label':'a','status':'VISIBLE','txnId':'18446744073709551616'}",
+            b"{'label':'a','status':'VISIBLE','txnId':1}",
+            b"{'label':'','status':'VISIBLE','txnId':'1'}",
+            b"{'label':'a b','status':'VISIBLE','txnId':'1'}",
+            b"{'label':'a\\x','status':'VISIBLE','txnId':'1'}",
+            b"{'label':'a','status':'visible','txnId':'1'}",
+            b"{'label':'a','status':'VISIBLE','txnId':'1'} trailing",
+        ] {
+            assert!(require_visible(bad, bad).is_err(), "accepted {bad:?}");
+        }
+        assert!(require_visible(visible, b"").is_err());
+        assert!(require_visible(b"", visible).is_err());
+    }
+
+    #[test]
     fn target_id_values_decode_signed_driver_representations() {
         for (signed, id) in [
             (i64::MIN + 1, 1),
@@ -825,17 +1006,45 @@ mod identity_tests {
             hash: b"0123456789abcdef0123456789abcdef".to_vec(),
             values: vec![],
         };
-        let bound = mutation_values(1, true, &row).len();
-        assert!(mutation_values(1, false, &row).starts_with("(-9223372036854775807,"));
-        assert!(mutation_values(1_u64 << 63, false, &row).starts_with("(0,"));
+        let bound = mutation_values(1, 1, &row).len();
+        assert!(mutation_values(1, 1, &row).starts_with("(-9223372036854775807,"));
+        assert!(mutation_values(1_u64 << 63, 1_u64 << 63, &row).starts_with("(0,"));
         for id in [1, i64::MAX.unsigned_abs(), 1_u64 << 63, u64::MAX - 1] {
-            assert!(mutation_values(id, true, &row).len() <= bound);
+            assert!(mutation_values(id, id, &row).len() <= bound);
         }
     }
 }
 
 #[cfg(test)]
 mod live_tests {
+    fn config() -> DorisSinkConfig {
+        let port = std::env::var("DOGPADDLE_DORIS_TEST_PORT")
+            .map_or(19030, |value| value.parse().expect("native fixture port"));
+        DorisSinkConfig::new_unencrypted("127.0.0.1", port, "dogpaddle", "root", "").unwrap()
+    }
+
+    fn write(
+        target: &mut DorisTarget,
+        input: &Change,
+        batch: &Batch,
+    ) -> Result<(), OperationError> {
+        let deadline = Instant::now() + WORK_UNIT_TIMEOUT;
+        target.ensure_ready(deadline)?;
+        target
+            .write_relation_batch(input, batch, u64::MAX, deadline)
+            .map_err(Into::into)
+    }
+
+    fn lookup(
+        target: &mut DorisTarget,
+        input: &Change,
+        requests: &[Lookup],
+    ) -> Result<Vec<Matches>, OperationError> {
+        let deadline = Instant::now() + WORK_UNIT_TIMEOUT;
+        target.ensure_ready(deadline)?;
+        target.lookup(input, requests, deadline)
+    }
+
     use std::sync::Arc;
 
     use arrow_array::{ArrayRef, Int64Array, NullArray, RecordBatch};
@@ -848,8 +1057,7 @@ mod live_tests {
     #[ignore = "requires the Doris system-test fixture on 127.0.0.1:19030"]
     #[allow(clippy::too_many_lines)]
     fn adapter_replay_is_convergent_and_rejects_id_rebinding() {
-        let config =
-            DorisSinkConfig::new_unencrypted("127.0.0.1", 19030, "dogpaddle", "root", "").unwrap();
+        let config = config();
         cleanup(&config);
         let spec = config.discover_target("rust_live", "rust_live").unwrap();
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -876,23 +1084,23 @@ mod live_tests {
             }],
             deletes: vec![],
         };
-        target.write_batch(&input, &insert).unwrap();
-        target.write_batch(&input, &insert).unwrap();
-        let found = target
-            .lookup(
-                &input,
-                &[
-                    Lookup {
-                        row_index: 0,
-                        take: 1,
-                    },
-                    Lookup {
-                        row_index: 1,
-                        take: 1,
-                    },
-                ],
-            )
-            .unwrap();
+        write(&mut target, &input, &insert).unwrap();
+        write(&mut target, &input, &insert).unwrap();
+        let found = lookup(
+            &mut target,
+            &input,
+            &[
+                Lookup {
+                    row_index: 0,
+                    take: 1,
+                },
+                Lookup {
+                    row_index: 1,
+                    take: 1,
+                },
+            ],
+        )
+        .unwrap();
         assert_eq!(found[0].ids.len() as u64, 1);
         assert_eq!(found[0].ids, [1]);
         assert_eq!(found[1].ids.len() as u64, 0);
@@ -905,7 +1113,7 @@ mod live_tests {
             }],
             deletes: vec![],
         };
-        assert!(target.write_batch(&input, &rebound).is_err());
+        assert!(write(&mut target, &input, &rebound).is_err());
         let upper_ids = [1_u64 << 63, u64::MAX - 1];
         let upper = Batch {
             inserts: upper_ids
@@ -917,44 +1125,45 @@ mod live_tests {
                 .collect(),
             deletes: vec![],
         };
-        target.write_batch(&input, &upper).unwrap();
-        target.write_batch(&input, &upper).unwrap();
-        let upper_found = target
-            .lookup(
-                &input,
-                &[Lookup {
-                    row_index: 1,
-                    take: 2,
-                }],
-            )
-            .unwrap();
+        write(&mut target, &input, &upper).unwrap();
+        write(&mut target, &input, &upper).unwrap();
+        let upper_found = lookup(
+            &mut target,
+            &input,
+            &[Lookup {
+                row_index: 1,
+                take: 2,
+            }],
+        )
+        .unwrap();
         assert_eq!(upper_found[0].ids, upper_ids);
         let delete = Batch {
             inserts: vec![],
             deletes: vec![Delete {
                 row_index: 0,
                 technical_id: 1,
+                event_offset: 2,
             }],
         };
-        target.write_batch(&input, &delete).unwrap();
-        target.write_batch(&input, &delete).unwrap();
+        write(&mut target, &input, &delete).unwrap();
+        write(&mut target, &input, &delete).unwrap();
         let stale_row = target.codec.encode_row(input.records(), 0).unwrap();
         let stale = format!(
             "{}{}",
             insert_prefix(&target.spec, target.codec.schema()),
-            mutation_values(1, false, &stale_row)
+            mutation_values(1, 1, &stale_row)
         );
         target.config.connect().unwrap().query_drop(stale).unwrap();
         assert_eq!(
-            target
-                .lookup(
-                    &input,
-                    &[Lookup {
-                        row_index: 0,
-                        take: 1,
-                    }],
-                )
-                .unwrap()[0]
+            lookup(
+                &mut target,
+                &input,
+                &[Lookup {
+                    row_index: 0,
+                    take: 1,
+                }],
+            )
+            .unwrap()[0]
                 .ids
                 .len(),
             0
@@ -968,22 +1177,97 @@ mod live_tests {
             .unwrap();
         connection
             .query_drop(
-                create_view_sql(&target.spec, target.codec.schema()).replace(" = 0", " = 1"),
+                create_view_sql(&target.spec, target.codec.schema())
+                    .replace("WHERE", "WHERE 1 = 0 AND"),
             )
             .unwrap();
         target.connection = Some(connection);
         target.verified = false;
         assert!(
-            target
-                .lookup(
-                    &input,
-                    &[Lookup {
-                        row_index: 0,
-                        take: 1,
-                    }],
-                )
-                .is_err()
+            lookup(
+                &mut target,
+                &input,
+                &[Lookup {
+                    row_index: 0,
+                    take: 1,
+                }],
+            )
+            .is_err()
         );
+        cleanup(&target.config);
+    }
+
+    #[test]
+    #[ignore = "requires the doris system-test fixture"]
+    fn committed_weighted_prefix_can_be_recut_without_repeating_fifo_deaths() {
+        let config = config();
+        cleanup(&config);
+        let spec = config.discover_target("rust_live", "rust_live").unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let input = Change::try_new(
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(vec![7, 7, 8, 7, 7, 8, 7]))],
+            )
+            .unwrap(),
+            Int64Array::from(vec![3, -2, 2, -1, 1, -2, 2]),
+        )
+        .unwrap();
+        let mut target =
+            DorisTarget::new_bound(config, spec, DorisRowCodec::try_new(schema).unwrap());
+        target.initialize().unwrap();
+        let full = DeliveryBatch::for_test(input.clone(), 1).unwrap();
+        target.deliver_prefix(&full, 14, (1, &input)).unwrap();
+        let short = DeliveryBatch::for_test(
+            Change::try_new(input.records().slice(0, 2), Int64Array::from(vec![3, -2])).unwrap(),
+            1,
+        )
+        .unwrap();
+        let suffix = DeliveryBatch::for_test(
+            Change::try_new(
+                input.records().slice(2, 5),
+                Int64Array::from(vec![2, -1, 1, -2, 2]),
+            )
+            .unwrap(),
+            6,
+        )
+        .unwrap();
+        for delivery in [&full, &short, &suffix] {
+            target.deliver_prefix(delivery, 14, (1, &input)).unwrap();
+            let rows: Vec<(i64, i64)> = target
+                .connect(Instant::now() + WORK_UNIT_TIMEOUT)
+                .unwrap()
+                .query("SELECT `$dogpaddle.id`, value FROM rust_live ORDER BY `$dogpaddle.id`")
+                .unwrap();
+            let rows = rows
+                .into_iter()
+                .map(|(id, value)| (decode_signed_id(id).unwrap(), value))
+                .collect::<Vec<_>>();
+            assert_eq!(rows, [(9, 7), (12, 7), (13, 7)]);
+        }
+        let matches = lookup(
+            &mut target,
+            &input,
+            &[
+                Lookup {
+                    row_index: 0,
+                    take: 3,
+                },
+                Lookup {
+                    row_index: 2,
+                    take: 1,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(matches[0].through, 13);
+        assert_eq!(matches[0].ids, [9, 12, 13]);
+        assert_eq!(matches[1].through, 11);
+        assert!(matches[1].ids.is_empty());
         cleanup(&target.config);
     }
 
@@ -1000,8 +1284,7 @@ mod live_tests {
     #[test]
     #[ignore = "requires the Doris system-test fixture on 127.0.0.1:19030"]
     fn wide_batch_is_split_inside_one_explicit_transaction() {
-        let config =
-            DorisSinkConfig::new_unencrypted("127.0.0.1", 19030, "dogpaddle", "root", "").unwrap();
+        let config = config();
         cleanup(&config);
         let spec = config.discover_target("rust_live", "rust_live").unwrap();
         let fields = (0..100)
@@ -1029,17 +1312,17 @@ mod live_tests {
             inserts,
             deletes: vec![],
         };
-        target.write_batch(&input, &batch).unwrap();
-        target.write_batch(&input, &batch).unwrap();
-        let found = target
-            .lookup(
-                &input,
-                &[Lookup {
-                    row_index: 0,
-                    take: 1024,
-                }],
-            )
-            .unwrap();
+        write(&mut target, &input, &batch).unwrap();
+        write(&mut target, &input, &batch).unwrap();
+        let found = lookup(
+            &mut target,
+            &input,
+            &[Lookup {
+                row_index: 0,
+                take: 1024,
+            }],
+        )
+        .unwrap();
         assert_eq!(found[0].ids.len() as u64, 1024);
         assert_eq!(found[0].ids.len(), 1024);
         cleanup(&target.config);

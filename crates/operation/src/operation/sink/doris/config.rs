@@ -1,4 +1,8 @@
-use std::{fmt, net::IpAddr, time::Duration};
+use std::{
+    fmt,
+    net::IpAddr,
+    time::{Duration, Instant},
+};
 
 use mysql::{Conn, OptsBuilder, params, prelude::Queryable};
 use serde::{Deserialize, Serialize};
@@ -73,6 +77,7 @@ impl DorisSinkConfig {
             cluster_id: 0,
         };
         spec.validate_names()?;
+        let deadline = Instant::now() + DATABASE_TIMEOUT;
         let mut connection = self.connect()?;
         let exists: Option<u8> = connection
             .exec_first(
@@ -94,6 +99,9 @@ impl DorisSinkConfig {
         spec.cluster_id = *cluster_id;
         spec.validate()?;
         require_absent(&mut connection, &spec)?;
+        if Instant::now() >= deadline {
+            return Err(database("discover target"));
+        }
         Ok(spec)
     }
 
@@ -229,7 +237,10 @@ impl DorisTargetSpec {
     }
 
     pub(super) fn marker(&self) -> String {
-        format!("dogpaddle.doris-sink.event-address.v1:{}", self.sink_id)
+        format!(
+            "dogpaddle.doris-sink.occurrence-version.v1:{}",
+            self.sink_id
+        )
     }
 }
 

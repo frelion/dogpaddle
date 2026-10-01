@@ -1,12 +1,9 @@
 use super::invalid;
 use crate::operation::OperationError;
-use crate::operation::sink::relation::MAX_MUTATIONS_PER_BATCH;
 
 const VERSION: u8 = 1;
 const BUFFER_BYTES: usize = 4 * size_of::<u64>();
-pub(super) const MAX_READY_BYTES: usize = 2 + BUFFER_BYTES;
-pub(super) const MAX_CONTROL_BYTES: usize =
-    2 + 2 * BUFFER_BYTES + size_of::<u16>() + MAX_MUTATIONS_PER_BATCH * size_of::<u64>();
+pub(super) const MAX_CONTROL_BYTES: usize = 2 + BUFFER_BYTES;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct Position {
@@ -61,50 +58,12 @@ impl BufferState {
     }
 }
 
-pub(super) struct Prepared {
-    pub(super) before: BufferState,
-    pub(super) after: BufferState,
-    pub(super) negative_ids: Vec<u64>,
-}
-
 pub(super) enum State {
     Initialize,
     Ready(BufferState),
-    Prepared(Prepared),
-}
-
-pub(super) enum Header<'input> {
-    Initialize,
-    Ready(BufferState),
-    Prepared {
-        before: BufferState,
-        after: BufferState,
-        encoded_negative_ids: &'input [u8],
-    },
 }
 
 impl State {
-    pub(super) fn validate(&self) -> Result<(), OperationError> {
-        match self {
-            Self::Initialize => Ok(()),
-            Self::Ready(buffer) => buffer.validate(),
-            Self::Prepared(prepared) => {
-                validate_settlement(prepared.before, prepared.after)?;
-                if prepared.negative_ids.len() > MAX_MUTATIONS_PER_BATCH
-                    || prepared.negative_ids.len() as u64
-                        > prepared.after.head.event_offset - prepared.before.head.event_offset
-                    || prepared
-                        .negative_ids
-                        .iter()
-                        .any(|id| *id == 0 || *id == u64::MAX)
-                {
-                    return Err(invalid("invalid prepared negative IDs"));
-                }
-                Ok(())
-            }
-        }
-    }
-
     pub(super) fn encode(&self) -> Vec<u8> {
         let mut output = vec![VERSION];
         match self {
@@ -113,66 +72,27 @@ impl State {
                 output.push(1);
                 encode_buffer(*buffer, &mut output);
             }
-            Self::Prepared(prepared) => {
-                output.push(2);
-                encode_buffer(prepared.before, &mut output);
-                encode_buffer(prepared.after, &mut output);
-                output.extend(
-                    u16::try_from(prepared.negative_ids.len())
-                        .expect("negative IDs are bounded")
-                        .to_be_bytes(),
-                );
-                for id in &prepared.negative_ids {
-                    output.extend(id.to_be_bytes());
-                }
-            }
         }
         output
     }
 }
 
-pub(super) fn decode_header(mut input: &[u8]) -> Result<Header<'_>, OperationError> {
+pub(super) fn decode(mut input: &[u8]) -> Result<State, OperationError> {
     if read::<1>(&mut input)? != [VERSION] {
         return Err(invalid("unknown control-state version"));
     }
     match read::<1>(&mut input)?[0] {
         0 => {
             require_end(input)?;
-            Ok(Header::Initialize)
+            Ok(State::Initialize)
         }
         1 => {
             let buffer = decode_buffer(&mut input)?;
             require_end(input)?;
-            Ok(Header::Ready(buffer))
-        }
-        2 => {
-            let before = decode_buffer(&mut input)?;
-            let after = decode_buffer(&mut input)?;
-            validate_settlement(before, after)?;
-            Ok(Header::Prepared {
-                before,
-                after,
-                encoded_negative_ids: input,
-            })
+            Ok(State::Ready(buffer))
         }
         _ => Err(invalid("unknown control-state phase")),
     }
-}
-
-pub(super) fn decode_negative_ids(mut input: &[u8]) -> Result<Vec<u64>, OperationError> {
-    let count = usize::from(u16::from_be_bytes(read(&mut input)?));
-    if count > MAX_MUTATIONS_PER_BATCH || input.len() != count * size_of::<u64>() {
-        return Err(invalid("invalid prepared negative-ID count"));
-    }
-    let mut ids = Vec::with_capacity(count);
-    for _ in 0..count {
-        let id = u64::from_be_bytes(read(&mut input)?);
-        if id == 0 || id == u64::MAX {
-            return Err(invalid("prepared negative ID is outside the event domain"));
-        }
-        ids.push(id);
-    }
-    Ok(ids)
 }
 
 fn encode_buffer(buffer: BufferState, output: &mut Vec<u8>) {
@@ -193,24 +113,6 @@ fn decode_buffer(input: &mut &[u8]) -> Result<BufferState, OperationError> {
     };
     buffer.validate()?;
     Ok(buffer)
-}
-
-fn validate_settlement(before: BufferState, after: BufferState) -> Result<(), OperationError> {
-    before.validate()?;
-    after.validate()?;
-    if before.is_empty()
-        || before.tail != after.tail
-        || after.head.event_offset <= before.head.event_offset
-        || after.head.entry_start < before.head.entry_start
-        || after.retained_bytes > before.retained_bytes
-        || (after.head.entry_start == before.head.entry_start
-            && after.retained_bytes != before.retained_bytes)
-        || (after.head.entry_start > before.head.entry_start
-            && after.retained_bytes >= before.retained_bytes)
-    {
-        return Err(invalid("invalid prepared settlement"));
-    }
-    Ok(())
 }
 
 fn require_end(input: &[u8]) -> Result<(), OperationError> {

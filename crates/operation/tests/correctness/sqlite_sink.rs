@@ -10,7 +10,7 @@ use dogpaddle_change::Change;
 use dogpaddle_operation::{
     OperationBindError, OperationDefinition, OperationKind, OperationSetupError, RuntimeResource,
     operation::{
-        Operation, OperationError, SinkPrepared,
+        Operation, OperationError, SinkPending,
         sink::{SqliteSinkDefinition, SqliteSinkDefinitionError, SqliteSinkSchemaError},
     },
 };
@@ -371,6 +371,7 @@ struct Fixture {
     root: TestStore,
     definition: OperationDefinition,
     sink: Box<dyn dogpaddle_operation::operation::SinkOperation>,
+    control: Cell<Vec<u8>>,
     writes: Transactions,
     reads: ReadTransactions,
 }
@@ -393,7 +394,19 @@ impl Fixture {
             )
             .unwrap()
             .into_parts();
-        let (writes, reads) = setup.commit(root.path(), |_| Ok(())).unwrap().split();
+        drop(operation);
+        drop(setup.commit(root.path(), |_| Ok(())).unwrap());
+        let store = Store::open(root.path()).unwrap();
+        let (operation, _) = definition
+            .construct(
+                &[Arc::clone(&input_schema)],
+                &mut store.data_scope().scoped("operation"),
+                RuntimeResource::none(),
+            )
+            .unwrap()
+            .into_parts();
+        let control = store.open_data("operation/sink.control").unwrap();
+        let (writes, reads) = store.into_transactions().split();
         let Operation::Sink(sink) = operation else {
             panic!("expected sink");
         };
@@ -402,6 +415,7 @@ impl Fixture {
             root,
             definition,
             sink,
+            control,
             writes,
             reads,
         }
@@ -412,10 +426,11 @@ impl Fixture {
             root,
             definition,
             sink,
+            control,
             writes,
             reads,
         } = self;
-        drop((sink, writes, reads));
+        drop((sink, control, writes, reads));
         let store = Store::open(root.path()).unwrap();
         let (operation, _) = definition
             .construct(
@@ -425,6 +440,7 @@ impl Fixture {
             )
             .unwrap()
             .into_parts();
+        let control = store.open_data("operation/sink.control").unwrap();
         let (writes, reads) = store.into_transactions().split();
         let Operation::Sink(sink) = operation else {
             panic!("expected sink");
@@ -434,6 +450,7 @@ impl Fixture {
             root,
             definition,
             sink,
+            control,
             writes,
             reads,
         }
@@ -446,31 +463,28 @@ impl Fixture {
         }
         Ok(admitted)
     }
-    fn plan(&mut self) -> Result<Option<SinkPrepared>, OperationError> {
-        let pending = {
-            let snapshot = self.reads.begin();
-            self.sink.load(snapshot.access())?
-        };
-        pending
-            .map(|pending| self.sink.prepare(pending))
-            .transpose()
+    fn load(&mut self) -> Result<Option<SinkPending>, OperationError> {
+        let snapshot = self.reads.begin();
+        self.sink.load(snapshot.access())
     }
-    fn persist(&mut self, prepared: &SinkPrepared) {
-        let txn = self.writes.begin();
-        self.sink.persist_prepared(txn.access(), prepared).unwrap();
-        txn.commit().unwrap();
+    fn persist_initialize(&mut self, pending: &SinkPending) {
+        if self.sink.prepare_initialize(pending).unwrap() {
+            let txn = self.writes.begin();
+            self.sink.persist_initialize(txn.access(), pending).unwrap();
+            txn.commit().unwrap();
+        }
     }
-    fn settle(&mut self, prepared: &SinkPrepared) {
+    fn settle(&mut self, pending: &SinkPending) {
         let txn = self.writes.begin();
-        self.sink.settle(txn.access(), prepared).unwrap();
+        self.sink.settle(txn.access(), pending).unwrap();
         txn.commit().unwrap();
     }
     fn drain(&mut self) -> usize {
         let mut batches = 0;
-        while let Some(prepared) = self.plan().unwrap() {
-            self.persist(&prepared);
-            self.sink.deliver(&prepared).unwrap();
-            self.settle(&prepared);
+        while let Some(pending) = self.load().unwrap() {
+            self.persist_initialize(&pending);
+            self.sink.deliver(&pending).unwrap();
+            self.settle(&pending);
             batches += 1;
         }
         batches
@@ -508,23 +522,24 @@ fn change(values: &[i64], diffs: &[i64]) -> Change {
 fn initialization_intent_survives_reopen_and_is_idempotent() {
     let mut fixture = Fixture::new();
     assert!(!fixture.enqueue(&change(&[7], &[1])).unwrap());
-    let prepared = fixture.plan().unwrap().unwrap();
+    let pending = fixture.load().unwrap().unwrap();
+    assert!(fixture.sink.prepare_initialize(&pending).unwrap());
     {
         let txn = fixture.writes.begin();
         fixture
             .sink
-            .persist_prepared(txn.access(), &prepared)
+            .persist_initialize(txn.access(), &pending)
             .unwrap();
     }
     assert!(
         !fixture.root.path().with_extension("sqlite").exists()
             || fixture.rows_if_initialized().is_none()
     );
-    fixture.persist(&prepared);
+    fixture.persist_initialize(&pending);
     fixture = fixture.reopen();
-    let prepared = fixture.plan().unwrap().unwrap();
-    fixture.persist(&prepared);
-    fixture.sink.deliver(&prepared).unwrap();
+    let pending = fixture.load().unwrap().unwrap();
+    fixture.persist_initialize(&pending);
+    fixture.sink.deliver(&pending).unwrap();
     fixture = fixture.reopen();
     assert_eq!(fixture.drain(), 1);
     assert!(fixture.rows().is_empty());
@@ -550,20 +565,20 @@ fn capture_parent_and_enqueue_roll_back_together() {
                 .unwrap()
         );
     }
-    assert!(fixture.plan().unwrap().is_none());
+    assert!(fixture.load().unwrap().is_none());
     assert!(fixture.rows().is_empty());
 }
 #[test]
-fn prepared_replay_before_and_after_target_commit_keeps_fixed_ids() {
+fn loaded_prefix_replay_before_and_after_target_commit_keeps_event_ids() {
     let mut fixture = Fixture::new();
     fixture.drain();
     assert!(fixture.enqueue(&change(&[7], &[3])).unwrap());
-    let prepared = fixture.plan().unwrap().unwrap();
-    fixture.persist(&prepared);
+    let pending = fixture.load().unwrap().unwrap();
+    fixture.persist_initialize(&pending);
     fixture = fixture.reopen();
-    let prepared = fixture.plan().unwrap().unwrap();
-    fixture.persist(&prepared);
-    fixture.sink.deliver(&prepared).unwrap();
+    let pending = fixture.load().unwrap().unwrap();
+    fixture.persist_initialize(&pending);
+    fixture.sink.deliver(&pending).unwrap();
     assert_eq!(
         fixture.rows(),
         [(i64::MIN + 1, 7), (i64::MIN + 2, 7), (i64::MIN + 3, 7)]
@@ -577,35 +592,80 @@ fn prepared_replay_before_and_after_target_commit_keeps_fixed_ids() {
 }
 
 #[test]
-fn prepared_batch_backpressure_writes_nothing_when_the_parent_transaction_commits() {
+fn loaded_prefix_allows_tail_append_and_settlement_preserves_it() {
     let mut fixture = Fixture::new();
     fixture.drain();
     assert!(fixture.enqueue(&change(&[7], &[1024])).unwrap());
-    let prepared = fixture.plan().unwrap().unwrap();
-    fixture.persist(&prepared);
-    fixture = fixture.reopen();
-    // Restore validates the complete durable plan before input is serviced.
-    assert!(fixture.plan().unwrap().is_some());
-    {
-        let txn = fixture.writes.begin();
-        assert!(
-            !fixture
-                .sink
-                .try_enqueue(txn.access(), &change(&[99], &[1]))
-                .unwrap()
-        );
-        // A caller may commit its own pending-page progress after a false result.
-        txn.commit().unwrap();
-    }
+    let pending = fixture.load().unwrap().unwrap();
+    assert!(fixture.enqueue(&change(&[99], &[1])).unwrap());
+    fixture.sink.deliver(&pending).unwrap();
+    fixture.settle(&pending);
     fixture = fixture.reopen();
     assert_eq!(fixture.drain(), 1);
     assert_eq!(
         fixture.rows(),
-        (1..=1024).map(|id| (i64::MIN + id, 7)).collect::<Vec<_>>()
+        (1..=1024)
+            .map(|id| (i64::MIN + id, 7))
+            .chain([(i64::MIN + 1025, 99)])
+            .collect::<Vec<_>>()
     );
-    assert!(fixture.enqueue(&change(&[99], &[1])).unwrap());
+}
+
+#[test]
+fn partial_weighted_settlement_retains_old_entry_and_appended_tail() {
+    let mut fixture = Fixture::new();
+    fixture.drain();
+    assert!(fixture.enqueue(&change(&[7], &[1025])).unwrap());
+    let pending = fixture.load().unwrap().unwrap();
+    assert!(fixture.enqueue(&change(&[99], &[2])).unwrap());
+    fixture.sink.deliver(&pending).unwrap();
+    fixture.settle(&pending);
+    fixture = fixture.reopen();
     assert_eq!(fixture.drain(), 1);
-    assert_eq!(fixture.rows().last(), Some(&(i64::MIN + 1025, 99)));
+    assert_eq!(
+        fixture.rows(),
+        (1..=1025)
+            .map(|id| (i64::MIN + id, 7))
+            .chain([(i64::MIN + 1026, 99), (i64::MIN + 1027, 99)])
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn settlement_rollback_then_append_reloads_and_stale_head_settle_is_rejected() {
+    let mut fixture = Fixture::new();
+    fixture.drain();
+    assert!(fixture.enqueue(&change(&[7], &[1])).unwrap());
+    let pending = fixture.load().unwrap().unwrap();
+    fixture.sink.deliver(&pending).unwrap();
+    {
+        let txn = fixture.writes.begin();
+        fixture.sink.settle(txn.access(), &pending).unwrap();
+    }
+    assert!(fixture.enqueue(&change(&[99], &[1])).unwrap());
+    fixture = fixture.reopen();
+    assert_eq!(fixture.drain(), 1);
+    assert_eq!(fixture.rows(), [(i64::MIN + 1, 7), (i64::MIN + 2, 99)]);
+    let before = fixture
+        .control
+        .read(fixture.reads.begin().access())
+        .unwrap()
+        .get()
+        .unwrap();
+    {
+        let txn = fixture.writes.begin();
+        assert!(fixture.sink.settle(txn.access(), &pending).is_err());
+        txn.commit().unwrap();
+    }
+    assert_eq!(
+        fixture
+            .control
+            .read(fixture.reads.begin().access())
+            .unwrap()
+            .get()
+            .unwrap(),
+        before
+    );
 }
 
 #[test]
@@ -617,10 +677,11 @@ fn restoring_oversized_ready_control_fails_without_rewriting_it() {
         root,
         definition,
         sink,
+        control,
         writes,
         reads,
     } = fixture;
-    drop((sink, writes, reads));
+    drop((sink, control, writes, reads));
     let store = Store::open(root.path()).unwrap();
     let control: Cell<Vec<u8>> = store.open_data("operation/sink.control").unwrap();
     let mut invalid = control
@@ -668,7 +729,8 @@ fn small_entries_merge_into_one_target_batch_and_mixed_prefixes_use_new_ids() {
     assert_eq!(fixture.drain(), 1);
     assert!(fixture.rows().is_empty());
     assert!(fixture.enqueue(&change(&[7, 7], &[3, -4])).unwrap());
-    assert!(fixture.plan().is_err());
+    let pending = fixture.load().unwrap().unwrap();
+    assert!(fixture.sink.deliver(&pending).is_err());
     assert!(fixture.rows().is_empty());
 }
 #[test]
@@ -678,13 +740,14 @@ fn invalid_later_negative_slice_keeps_previously_settled_slices() {
     assert!(fixture.enqueue(&change(&[7], &[1025])).unwrap());
     fixture.drain();
     assert!(fixture.enqueue(&change(&[7], &[-1026])).unwrap());
-    let prepared = fixture.plan().unwrap().unwrap();
-    fixture.persist(&prepared);
-    fixture.sink.deliver(&prepared).unwrap();
-    fixture.settle(&prepared);
+    let pending = fixture.load().unwrap().unwrap();
+    fixture.persist_initialize(&pending);
+    fixture.sink.deliver(&pending).unwrap();
+    fixture.settle(&pending);
     assert_eq!(fixture.rows().len(), 1);
     fixture = fixture.reopen();
-    assert!(fixture.plan().is_err());
+    let pending = fixture.load().unwrap().unwrap();
+    assert!(fixture.sink.deliver(&pending).is_err());
     assert_eq!(fixture.rows().len(), 1);
 }
 #[test]
@@ -694,7 +757,7 @@ fn schema_and_oversized_multiplicity_fail_before_enqueue() {
     assert!(fixture.enqueue(&change(&[7], &[i64::MAX])).is_err());
     let wrong = super::support::change(&[1]);
     assert!(fixture.enqueue(&wrong).is_err());
-    assert!(fixture.plan().unwrap().is_none());
+    assert!(fixture.load().unwrap().is_none());
 }
 
 #[test]
@@ -702,9 +765,9 @@ fn event_positions_keep_negative_gaps_and_survive_an_empty_reopen() {
     let mut fixture = Fixture::new();
     fixture.drain();
     assert!(fixture.enqueue(&change(&[7, 7, 9], &[2, -1, 1])).unwrap());
-    let prepared = fixture.plan().unwrap().unwrap();
-    fixture.persist(&prepared);
-    fixture.sink.deliver(&prepared).unwrap();
+    let pending = fixture.load().unwrap().unwrap();
+    fixture.persist_initialize(&pending);
+    fixture.sink.deliver(&pending).unwrap();
     fixture = fixture.reopen();
     assert_eq!(fixture.drain(), 1);
     assert_eq!(fixture.rows(), [(i64::MIN + 2, 7), (i64::MIN + 4, 9)]);
@@ -713,7 +776,7 @@ fn event_positions_keep_negative_gaps_and_survive_an_empty_reopen() {
     fixture.drain();
     assert!(fixture.rows().is_empty());
     fixture = fixture.reopen();
-    assert!(fixture.plan().unwrap().is_none());
+    assert!(fixture.load().unwrap().is_none());
     assert!(fixture.enqueue(&change(&[42], &[1])).unwrap());
     fixture.drain();
     assert_eq!(fixture.rows(), [(i64::MIN + 7, 42)]);
@@ -724,21 +787,21 @@ fn repeated_load_and_rolled_back_settlement_follow_the_store_head() {
     let mut fixture = Fixture::new();
     fixture.drain();
     assert!(fixture.enqueue(&change(&[7, 8, 9], &[1023, 2, 2])).unwrap());
-    drop(fixture.plan().unwrap().unwrap());
-    let prepared = fixture.plan().unwrap().unwrap();
-    fixture.persist(&prepared);
-    fixture.sink.deliver(&prepared).unwrap();
+    drop(fixture.load().unwrap().unwrap());
+    let pending = fixture.load().unwrap().unwrap();
+    fixture.persist_initialize(&pending);
+    fixture.sink.deliver(&pending).unwrap();
     {
         let txn = fixture.writes.begin();
-        fixture.sink.settle(txn.access(), &prepared).unwrap();
+        fixture.sink.settle(txn.access(), &pending).unwrap();
     }
     assert_eq!(fixture.rows().len(), 1024);
-    drop(fixture.plan().unwrap().unwrap());
+    drop(fixture.load().unwrap().unwrap());
     fixture = fixture.reopen();
-    let prepared = fixture.plan().unwrap().unwrap();
-    fixture.persist(&prepared);
-    fixture.sink.deliver(&prepared).unwrap();
-    fixture.settle(&prepared);
+    let pending = fixture.load().unwrap().unwrap();
+    fixture.persist_initialize(&pending);
+    fixture.sink.deliver(&pending).unwrap();
+    fixture.settle(&pending);
     assert_eq!(fixture.drain(), 1);
     let rows = fixture.rows();
     assert_eq!(rows.len(), 1027);
@@ -774,13 +837,13 @@ fn retained_birth_comparison_replays_wide_rows_without_duplicate_payload_budget(
     let mut fixture = Fixture::with_schema(input_schema);
     fixture.drain();
     assert!(fixture.enqueue(&change).unwrap());
-    let prepared = fixture.plan().unwrap().unwrap();
-    fixture.persist(&prepared);
-    fixture.sink.deliver(&prepared).unwrap();
-    fixture.settle(&prepared);
-    let prepared = fixture.plan().unwrap().unwrap();
-    fixture.persist(&prepared);
-    fixture.sink.deliver(&prepared).unwrap();
+    let pending = fixture.load().unwrap().unwrap();
+    fixture.persist_initialize(&pending);
+    fixture.sink.deliver(&pending).unwrap();
+    fixture.settle(&pending);
+    let pending = fixture.load().unwrap().unwrap();
+    fixture.persist_initialize(&pending);
+    fixture.sink.deliver(&pending).unwrap();
     fixture = fixture.reopen();
     assert_eq!(fixture.drain(), 1);
     let connection = Connection::open(fixture.root.path().with_extension("sqlite")).unwrap();

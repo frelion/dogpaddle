@@ -12,15 +12,13 @@ use super::{
     config::{ClickHouseSinkConfig, ClickHouseTargetSpec, require_absent, string_literal},
     error::{ClickHouseSinkError, database, invalid_batch, invalid_response},
     row::{ClickHouseRowCodec, EncodedRow},
-    schema::{
-        self, TECHNICAL_DELETED, TECHNICAL_HASH, TECHNICAL_HASH_INDEX, TECHNICAL_ID,
-        TECHNICAL_VERSION,
-    },
+    schema::{self, TECHNICAL_HASH, TECHNICAL_HASH_INDEX, TECHNICAL_ID, TECHNICAL_VERSION},
 };
 use crate::operation::{
     OperationError,
+    sink::buffered::DeliveryBatch,
     sink::relation::{
-        Batch, Lookup, Matches, RelationTarget, relation_event_bytes, terminal_mutations,
+        Batch, Lookup, Matches, RelationTarget, plan, relation_event_bytes, terminal_mutations,
         validate_technical_id,
     },
 };
@@ -49,11 +47,11 @@ impl ClickHouseTarget {
         }
     }
 
-    fn verify_identity(&self) -> Result<(), ClickHouseSinkError> {
+    fn verify_identity(&self, deadline: Instant) -> Result<(), ClickHouseSinkError> {
         if self.config.database() != self.spec.database() {
             return Err(ClickHouseSinkError::DatabaseMismatch);
         }
-        let uuid = self.config.command(
+        let uuid = self.config.command_before(deadline,
             &format!(
                 "SELECT toString(uuid) FROM system.databases WHERE name = {} FORMAT TabSeparatedRaw",
                 string_literal(self.spec.database())
@@ -66,11 +64,11 @@ impl ClickHouseTarget {
         Ok(())
     }
 
-    fn ensure_ready(&mut self) -> Result<(), ClickHouseSinkError> {
-        self.verify_identity()?;
+    fn ensure_ready(&mut self, deadline: Instant) -> Result<(), ClickHouseSinkError> {
+        self.verify_identity(deadline)?;
         if !self.verified {
-            verify_state(&self.config, &self.spec, self.codec.schema())?;
-            verify_view(&self.config, &self.spec, self.codec.schema())?;
+            verify_state(&self.config, &self.spec, self.codec.schema(), deadline)?;
+            verify_view(&self.config, &self.spec, self.codec.schema(), deadline)?;
             self.verified = true;
         }
         Ok(())
@@ -84,8 +82,7 @@ impl RelationTarget for ClickHouseTarget {
         let mut values = vec![
             Value::from(u64::MAX - 1),
             Value::String(row.hash),
-            Value::from(1),
-            Value::from(1),
+            Value::from(u64::MAX - 1),
         ];
         values.extend(row.values);
         let row_bytes = serde_json::to_vec(&Value::Array(values))
@@ -107,17 +104,20 @@ impl RelationTarget for ClickHouseTarget {
     }
 
     fn require_absent(&mut self) -> Result<(), OperationError> {
-        self.verify_identity()?;
-        require_absent(&self.config, &self.spec).map_err(Into::into)
+        let deadline = Instant::now() + WORK_UNIT_TIMEOUT;
+        self.verify_identity(deadline)?;
+        require_absent(&self.config, &self.spec, deadline).map_err(Into::into)
     }
 
     fn initialize(&mut self) -> Result<(), OperationError> {
-        self.verify_identity()?;
+        let deadline = Instant::now() + WORK_UNIT_TIMEOUT;
+        self.verify_identity(deadline)?;
         let state = self.spec.state_table();
-        let objects = object_kinds(&self.config, &self.spec)?;
+        let objects = object_kinds(&self.config, &self.spec, deadline)?;
         match (objects.get(&state), objects.get(self.spec.table())) {
             (None, None) => {
-                self.config.command(
+                self.config.command_before(
+                    deadline,
                     &create_state_sql(&self.spec, self.codec.schema()),
                     "create state table",
                 )?;
@@ -131,17 +131,19 @@ impl RelationTarget for ClickHouseTarget {
             }
             (Some(_), Some(_)) => {}
         }
-        verify_state(&self.config, &self.spec, self.codec.schema())?;
-        let objects = object_kinds(&self.config, &self.spec)?;
+        verify_state(&self.config, &self.spec, self.codec.schema(), deadline)?;
+        let objects = object_kinds(&self.config, &self.spec, deadline)?;
         if !objects.contains_key(self.spec.table()) {
-            self.config.command(
+            self.config.command_before(
+                deadline,
                 &create_view_sql(&self.spec, self.codec.schema()),
                 "create target view",
             )?;
         }
-        verify_view(&self.config, &self.spec, self.codec.schema())?;
+        verify_view(&self.config, &self.spec, self.codec.schema(), deadline)?;
         let count = scalar_u64(
-            &self.config.command(
+            &self.config.command_before(
+                deadline,
                 &format!(
                     "SELECT count() FROM {} FORMAT TabSeparatedRaw",
                     qualified(self.spec.database(), &state)
@@ -157,45 +159,32 @@ impl RelationTarget for ClickHouseTarget {
         Ok(())
     }
 
-    fn lookup(
+    fn deliver_prefix(
         &mut self,
-        input: &Change,
-        requests: &[Lookup],
-    ) -> Result<Vec<Matches>, OperationError> {
-        self.ensure_ready()?;
-        let mut output = Vec::with_capacity(requests.len());
-        let started = Instant::now();
-        let mut rows = Vec::new();
-        let mut sql_bytes = 0_usize;
-        for (request_index, request) in requests.iter().enumerate() {
-            let row = self.codec.encode_row(input.records(), request.row_index)?;
-            let encoded = lookup_row(request_index, request, &row);
-            if !rows.is_empty() && sql_bytes.saturating_add(encoded.len()) > MAX_LOOKUP_SQL_BYTES {
-                if started.elapsed() >= WORK_UNIT_TIMEOUT {
-                    return Err(database("match target rows").into());
-                }
-                self.read_lookup_rows(&rows, &mut output)?;
-                rows.clear();
-                sql_bytes = 0;
+        input: &DeliveryBatch,
+        tail: u64,
+        original_head: (u64, &Change),
+    ) -> Result<(), OperationError> {
+        let deadline = Instant::now() + WORK_UNIT_TIMEOUT;
+        let result = (|| {
+            self.ensure_ready(deadline)?;
+            let batch = plan(
+                input,
+                input.first_event_offset(),
+                tail,
+                original_head,
+                |requests| self.lookup(input.change(), requests, deadline),
+            )?;
+            self.write_relation_batch(input.change(), &batch, tail, deadline)?;
+            if Instant::now() >= deadline {
+                return Err(database("deliver input prefix").into());
             }
-            sql_bytes = sql_bytes.saturating_add(encoded.len());
-            rows.push(encoded);
+            Ok(())
+        })();
+        if result.is_err() {
+            self.verified = false;
         }
-        if !rows.is_empty() {
-            if started.elapsed() >= WORK_UNIT_TIMEOUT {
-                return Err(database("match target rows").into());
-            }
-            self.read_lookup_rows(&rows, &mut output)?;
-        }
-        if output.len() != requests.len() {
-            return Err(invalid_response("match target rows").into());
-        }
-        Ok(output)
-    }
-
-    fn write_batch(&mut self, input: &Change, batch: &Batch) -> Result<(), OperationError> {
-        self.ensure_ready()?;
-        self.write_relation_batch(input, batch).map_err(Into::into)
+        result
     }
 }
 
@@ -211,10 +200,46 @@ fn lookup_row(request_index: usize, request: &Lookup, row: &EncodedRow) -> Strin
 }
 
 impl ClickHouseTarget {
+    fn lookup(
+        &mut self,
+        input: &Change,
+        requests: &[Lookup],
+        deadline: Instant,
+    ) -> Result<Vec<Matches>, OperationError> {
+        let mut output = Vec::with_capacity(requests.len());
+        let mut rows = Vec::new();
+        let mut sql_bytes = 0_usize;
+        for (request_index, request) in requests.iter().enumerate() {
+            let row = self.codec.encode_row(input.records(), request.row_index)?;
+            let encoded = lookup_row(request_index, request, &row);
+            if !rows.is_empty() && sql_bytes.saturating_add(encoded.len()) > MAX_LOOKUP_SQL_BYTES {
+                if Instant::now() >= deadline {
+                    return Err(database("match target rows").into());
+                }
+                self.read_lookup_rows(&rows, &mut output, deadline)?;
+                rows.clear();
+                sql_bytes = 0;
+            }
+            sql_bytes = sql_bytes.saturating_add(encoded.len());
+            rows.push(encoded);
+        }
+        if !rows.is_empty() {
+            if Instant::now() >= deadline {
+                return Err(database("match target rows").into());
+            }
+            self.read_lookup_rows(&rows, &mut output, deadline)?;
+        }
+        if output.len() != requests.len() {
+            return Err(invalid_response("match target rows").into());
+        }
+        Ok(output)
+    }
+
     fn read_lookup_rows(
         &self,
         rows: &[String],
         output: &mut Vec<Matches>,
+        deadline: Instant,
     ) -> Result<(), ClickHouseSinkError> {
         let request_columns = std::iter::once("n UInt64".to_owned())
             .chain(std::iter::once("take UInt64".to_owned()))
@@ -232,27 +257,29 @@ impl ClickHouseTarget {
         let join = lookup_join_predicate(self.codec.schema());
         let sql = format!(
             "WITH requests AS (SELECT * FROM values({}, {})) \
-             SELECT r.n, \
-             arraySlice(groupArraySortedIf(1024)(assumeNotNull(s.id), isNotNull(s.id)), 1, any(r.take)) AS ids \
+             SELECT r.n, maxIf(assumeNotNull(s.v), isNotNull(s.id)) AS p, \
+             arraySlice(groupArraySortedIf(1024)(assumeNotNull(s.id), isNotNull(s.id) AND s.v = s.id), 1, any(r.take)) AS ids \
              FROM requests AS r LEFT JOIN \
-             (SELECT {} AS id, {} AS hash{} FROM {} FINAL WHERE {} = 0 AND {} IN (SELECT hash FROM requests)) AS s ON {} \
+             (SELECT {} AS id, {} AS v, {} AS hash{} FROM {} FINAL WHERE {} IN (SELECT hash FROM requests)) AS s ON {} \
              GROUP BY r.n ORDER BY r.n SETTINGS join_use_nulls = 1, max_execution_time = 5, timeout_overflow_mode = 'throw', max_memory_usage = 67108864 FORMAT JSONCompactEachRow",
             string_literal(&request_columns),
             rows.join(","),
             quote(TECHNICAL_ID),
+            quote(TECHNICAL_VERSION),
             quote(TECHNICAL_HASH),
             lookup_state_columns(self.codec.schema()),
             qualified(self.spec.database(), &self.spec.state_table()),
-            quote(TECHNICAL_DELETED),
             quote(TECHNICAL_HASH),
             join,
         );
-        let body = self.config.command(&sql, "match target rows")?;
+        let body = self
+            .config
+            .command_before(deadline, &sql, "match target rows")?;
         let expected_rows = output.len().saturating_add(rows.len());
         for line in body.lines().filter(|line| !line.is_empty()) {
             let values: Vec<Value> =
                 serde_json::from_str(line).map_err(|_| invalid_response("match target rows"))?;
-            let [n, ids] = values.as_slice() else {
+            let [n, through, ids] = values.as_slice() else {
                 return Err(invalid_response("match target rows"));
             };
             if value_ref_u64(n, "match target rows")?
@@ -270,7 +297,10 @@ impl ClickHouseTarget {
                     Ok(id)
                 })
                 .collect::<Result<Vec<_>, ClickHouseSinkError>>()?;
-            output.push(Matches { ids });
+            output.push(Matches {
+                through: value_ref_u64(through, "match target rows")?,
+                ids,
+            });
         }
         if output.len() != expected_rows {
             return Err(invalid_response("match target rows"));
@@ -282,35 +312,33 @@ impl ClickHouseTarget {
         &self,
         input: &Change,
         batch: &Batch,
+        tail: u64,
+        deadline: Instant,
     ) -> Result<(), ClickHouseSinkError> {
         let terminal = terminal_mutations(batch);
-        let existing = self.read_ids(terminal.iter().map(|mutation| mutation.technical_id))?;
+        let existing = self.read_ids(
+            terminal.iter().map(|mutation| mutation.technical_id),
+            tail,
+            deadline,
+        )?;
         let mut actions = Vec::new();
         for mutation in terminal {
             let id = mutation.technical_id;
-            let want_deleted = mutation.deleted;
+            let version = mutation.version;
             let row_index = usize::try_from(mutation.row_index)
                 .map_err(|_| invalid_batch("row index exceeds usize"))?;
             let row = self.codec.encode_row(input.records(), row_index)?;
-            match existing.get(&id) {
-                Some(actual) => {
-                    if !same_row(actual, &row) {
-                        return Err(invalid_batch(format!(
-                            "technical ID {id} is bound to another logical row"
-                        )));
-                    }
-                    if actual.deleted && !want_deleted {
-                        return Err(invalid_batch(format!(
-                            "technical ID {id} cannot be resurrected"
-                        )));
-                    }
-                    if actual.deleted != want_deleted {
-                        actions.push((id, want_deleted, row));
-                    }
+            if let Some(actual) = existing.get(&id) {
+                if !same_row(actual, &row) {
+                    return Err(invalid_batch(format!(
+                        "technical ID {id} is bound to another logical row"
+                    )));
                 }
-                None if !want_deleted => actions.push((id, false, row)),
-                None => {}
+                if actual.version >= version {
+                    continue;
+                }
             }
+            actions.push((id, version, row));
         }
         if actions.is_empty() {
             return Ok(());
@@ -320,25 +348,27 @@ impl ClickHouseTarget {
             qualified(self.spec.database(), &self.spec.state_table()),
             selected_columns(self.codec.schema())
         );
-        for (id, deleted, row) in actions {
+        for (id, version, row) in actions {
             let mut values = vec![
                 Value::from(id),
                 Value::String(row.hash),
-                Value::from(u8::from(deleted)),
-                Value::from(u8::from(deleted)),
+                Value::from(version),
             ];
             values.extend(row.values);
             serde_json::to_writer(string_writer(&mut payload), &Value::Array(values))
                 .expect("JSON serialization into String is infallible");
             payload.push('\n');
         }
-        self.config.command(&payload, "apply relation batch")?;
+        self.config
+            .command_before(deadline, &payload, "apply relation batch")?;
         Ok(())
     }
 
     fn read_ids(
         &self,
         ids: impl IntoIterator<Item = u64>,
+        tail: u64,
+        deadline: Instant,
     ) -> Result<BTreeMap<u64, StoredRow>, ClickHouseSinkError> {
         let ids = ids.into_iter().collect::<Vec<_>>();
         for id in &ids {
@@ -347,7 +377,8 @@ impl ClickHouseTarget {
         if ids.is_empty() {
             return Ok(BTreeMap::new());
         }
-        let body = self.config.command(
+        let body = self.config.command_before(
+            deadline,
             &format!(
                 "SELECT {} FROM {} FINAL WHERE {} IN ({}) ORDER BY {} FORMAT JSONCompactEachRow",
                 selected_columns(self.codec.schema()),
@@ -362,7 +393,7 @@ impl ClickHouseTarget {
         for line in body.lines().filter(|line| !line.is_empty()) {
             let values: Vec<Value> =
                 serde_json::from_str(line).map_err(|_| invalid_response("read mutation IDs"))?;
-            if values.len() != self.codec.schema().fields().len() + 4 {
+            if values.len() != self.codec.schema().fields().len() + 3 {
                 return Err(invalid_response("read mutation IDs"));
             }
             let mut values = values.into_iter();
@@ -370,8 +401,7 @@ impl ClickHouseTarget {
             validate_technical_id(id).map_err(|error| invalid_batch(error.to_string()))?;
             let hash = value_string(values.next(), "read mutation IDs")?;
             let version = value_u64(values.next(), "read mutation IDs")?;
-            let deleted = value_u64(values.next(), "read mutation IDs")?;
-            if version != deleted || version > 1 {
+            if version < id || version >= tail {
                 return Err(ClickHouseSinkError::TargetLayoutMismatch {
                     name: self.spec.state_table(),
                 });
@@ -382,7 +412,7 @@ impl ClickHouseTarget {
                     id,
                     StoredRow {
                         hash,
-                        deleted: deleted == 1,
+                        version,
                         values,
                     },
                 )
@@ -400,7 +430,7 @@ impl ClickHouseTarget {
 #[derive(Debug)]
 struct StoredRow {
     hash: String,
-    deleted: bool,
+    version: u64,
     values: Vec<Value>,
 }
 
@@ -458,8 +488,7 @@ fn create_state_sql(spec: &ClickHouseTargetSpec, schema: &Schema) -> String {
     let mut columns = vec![
         format!("{} UInt64", quote(TECHNICAL_ID)),
         format!("{} FixedString(32)", quote(TECHNICAL_HASH)),
-        format!("{} UInt8", quote(TECHNICAL_VERSION)),
-        format!("{} UInt8", quote(TECHNICAL_DELETED)),
+        format!("{} UInt64", quote(TECHNICAL_VERSION)),
     ];
     columns.extend(
         schema
@@ -485,11 +514,12 @@ fn create_state_sql(spec: &ClickHouseTargetSpec, schema: &Schema) -> String {
 
 fn create_view_sql(spec: &ClickHouseTargetSpec, schema: &Schema) -> String {
     format!(
-        "CREATE VIEW {} AS SELECT {} FROM {} FINAL WHERE {} = 0",
+        "CREATE VIEW {} AS SELECT {} FROM {} FINAL WHERE {} = {}",
         qualified(spec.database(), spec.table()),
         selected_public_columns(schema),
         qualified(spec.database(), &spec.state_table()),
-        quote(TECHNICAL_DELETED)
+        quote(TECHNICAL_VERSION),
+        quote(TECHNICAL_ID)
     )
 }
 
@@ -497,14 +527,14 @@ fn verify_state(
     config: &ClickHouseSinkConfig,
     spec: &ClickHouseTargetSpec,
     schema: &Schema,
+    deadline: Instant,
 ) -> Result<(), ClickHouseSinkError> {
     let expected = std::iter::once((TECHNICAL_ID, "UInt64".to_owned()))
         .chain(std::iter::once((
             TECHNICAL_HASH,
             "FixedString(32)".to_owned(),
         )))
-        .chain(std::iter::once((TECHNICAL_VERSION, "UInt8".to_owned())))
-        .chain(std::iter::once((TECHNICAL_DELETED, "UInt8".to_owned())))
+        .chain(std::iter::once((TECHNICAL_VERSION, "UInt64".to_owned())))
         .chain(
             schema
                 .fields()
@@ -512,7 +542,7 @@ fn verify_state(
                 .map(|column| (column.name().as_str(), schema::sql_type(column))),
         )
         .collect::<Vec<_>>();
-    let body = config.command(
+    let body = config.command_before(deadline,
         &format!(
             "SELECT name, type FROM system.columns WHERE database = {} AND table = {} ORDER BY position FORMAT JSONEachRow",
             string_literal(spec.database()),
@@ -550,7 +580,7 @@ fn verify_state(
             name: spec.state_table(),
         });
     }
-    let metadata = object_metadata(config, spec, &spec.state_table())?;
+    let metadata = object_metadata(config, spec, &spec.state_table(), deadline)?;
     let expected_engine_full = format!(
         "ReplacingMergeTree({}) ORDER BY {} SETTINGS fsync_after_insert = 1, \
          fsync_part_directory = 1, index_granularity = 8192",
@@ -562,7 +592,7 @@ fn verify_state(
         || metadata.sorting_key != quote(TECHNICAL_ID)
         || metadata.primary_key != quote(TECHNICAL_ID)
         || metadata.engine_full != expected_engine_full
-        || !has_exact_hash_index(config, spec)?
+        || !has_exact_hash_index(config, spec, deadline)?
     {
         return Err(ClickHouseSinkError::TargetLayoutMismatch {
             name: spec.state_table(),
@@ -574,8 +604,10 @@ fn verify_state(
 fn has_exact_hash_index(
     config: &ClickHouseSinkConfig,
     spec: &ClickHouseTargetSpec,
+    deadline: Instant,
 ) -> Result<bool, ClickHouseSinkError> {
-    let body = config.command(
+    let body = config.command_before(
+        deadline,
         &format!(
             "SELECT name, type_full, expr, granularity FROM system.data_skipping_indices \
              WHERE database = {} AND table = {} FORMAT JSONEachRow",
@@ -605,8 +637,9 @@ fn verify_view(
     config: &ClickHouseSinkConfig,
     spec: &ClickHouseTargetSpec,
     schema: &Schema,
+    deadline: Instant,
 ) -> Result<(), ClickHouseSinkError> {
-    let metadata = object_metadata(config, spec, spec.table())?;
+    let metadata = object_metadata(config, spec, spec.table(), deadline)?;
     if metadata.engine != "View"
         || select_tail(&metadata.create_query) != select_tail(&create_view_sql(spec, schema))
     {
@@ -615,7 +648,7 @@ fn verify_view(
         });
     }
     let count = scalar_u64(
-        &config.command(
+        &config.command_before(deadline,
             &format!(
                 "SELECT count() FROM system.columns WHERE database = {} AND table = {} FORMAT TabSeparatedRaw",
                 string_literal(spec.database()),
@@ -649,8 +682,9 @@ fn object_metadata(
     config: &ClickHouseSinkConfig,
     spec: &ClickHouseTargetSpec,
     name: &str,
+    deadline: Instant,
 ) -> Result<ObjectMetadata, ClickHouseSinkError> {
-    let body = config.command(
+    let body = config.command_before(deadline,
         &format!(
             "SELECT engine, comment, create_table_query, sorting_key, primary_key, engine_full FROM system.tables WHERE database = {} AND name = {} FORMAT JSONEachRow",
             string_literal(spec.database()),
@@ -674,8 +708,9 @@ fn select_tail(sql: &str) -> Option<String> {
 fn object_kinds(
     config: &ClickHouseSinkConfig,
     spec: &ClickHouseTargetSpec,
+    deadline: Instant,
 ) -> Result<BTreeMap<String, String>, ClickHouseSinkError> {
-    let body = config.command(
+    let body = config.command_before(deadline,
         &format!(
             "SELECT name, engine FROM system.tables WHERE database = {} AND name IN ({}, {}) FORMAT JSONEachRow",
             string_literal(spec.database()),
@@ -709,7 +744,6 @@ fn selected_columns(schema: &Schema) -> String {
     std::iter::once(TECHNICAL_ID)
         .chain(std::iter::once(TECHNICAL_HASH))
         .chain(std::iter::once(TECHNICAL_VERSION))
-        .chain(std::iter::once(TECHNICAL_DELETED))
         .chain(schema.fields().iter().map(|field| field.name().as_str()))
         .map(quote)
         .collect::<Vec<_>>()
@@ -778,6 +812,41 @@ fn string_writer(output: &mut String) -> impl std::io::Write + '_ {
 
 #[cfg(test)]
 mod live_tests {
+    fn config() -> ClickHouseSinkConfig {
+        let port = std::env::var("DOGPADDLE_CLICKHOUSE_TEST_PORT")
+            .map_or(18123, |value| value.parse().expect("native fixture port"));
+        ClickHouseSinkConfig::new_unencrypted(
+            "127.0.0.1",
+            port,
+            "dogpaddle",
+            "dogpaddle",
+            "dogpaddle",
+        )
+        .unwrap()
+    }
+
+    fn write(
+        target: &mut ClickHouseTarget,
+        input: &Change,
+        batch: &Batch,
+    ) -> Result<(), OperationError> {
+        let deadline = Instant::now() + WORK_UNIT_TIMEOUT;
+        target.ensure_ready(deadline)?;
+        target
+            .write_relation_batch(input, batch, u64::MAX, deadline)
+            .map_err(Into::into)
+    }
+
+    fn lookup(
+        target: &mut ClickHouseTarget,
+        input: &Change,
+        requests: &[Lookup],
+    ) -> Result<Vec<Matches>, OperationError> {
+        let deadline = Instant::now() + WORK_UNIT_TIMEOUT;
+        target.ensure_ready(deadline)?;
+        target.lookup(input, requests, deadline)
+    }
+
     use std::sync::Arc;
 
     use arrow_array::{Int64Array, RecordBatch};
@@ -790,14 +859,7 @@ mod live_tests {
     #[ignore = "requires the ClickHouse system-test fixture on 127.0.0.1:18123"]
     #[allow(clippy::too_many_lines)]
     fn adapter_replay_is_convergent_and_rejects_id_rebinding() {
-        let config = ClickHouseSinkConfig::new_unencrypted(
-            "127.0.0.1",
-            18123,
-            "dogpaddle",
-            "dogpaddle",
-            "dogpaddle",
-        )
-        .unwrap();
+        let config = config();
         cleanup(&config);
         let spec = config.discover_target("rust_live", "rust_live").unwrap();
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -824,23 +886,23 @@ mod live_tests {
             }],
             deletes: vec![],
         };
-        target.write_batch(&input, &insert).unwrap();
-        target.write_batch(&input, &insert).unwrap();
-        let found = target
-            .lookup(
-                &input,
-                &[
-                    Lookup {
-                        row_index: 0,
-                        take: 1,
-                    },
-                    Lookup {
-                        row_index: 1,
-                        take: 1,
-                    },
-                ],
-            )
-            .unwrap();
+        write(&mut target, &input, &insert).unwrap();
+        write(&mut target, &input, &insert).unwrap();
+        let found = lookup(
+            &mut target,
+            &input,
+            &[
+                Lookup {
+                    row_index: 0,
+                    take: 1,
+                },
+                Lookup {
+                    row_index: 1,
+                    take: 1,
+                },
+            ],
+        )
+        .unwrap();
         assert_eq!(found[0].ids.len() as u64, 1);
         assert_eq!(found[0].ids, [1]);
         assert_eq!(found[1].ids.len() as u64, 0);
@@ -853,7 +915,7 @@ mod live_tests {
             }],
             deletes: vec![],
         };
-        assert!(target.write_batch(&input, &rebound).is_err());
+        assert!(write(&mut target, &input, &rebound).is_err());
         let upper_ids = [1_u64 << 63, u64::MAX - 1];
         let upper = Batch {
             inserts: upper_ids
@@ -865,27 +927,28 @@ mod live_tests {
                 .collect(),
             deletes: vec![],
         };
-        target.write_batch(&input, &upper).unwrap();
-        target.write_batch(&input, &upper).unwrap();
-        let upper_found = target
-            .lookup(
-                &input,
-                &[Lookup {
-                    row_index: 1,
-                    take: 2,
-                }],
-            )
-            .unwrap();
+        write(&mut target, &input, &upper).unwrap();
+        write(&mut target, &input, &upper).unwrap();
+        let upper_found = lookup(
+            &mut target,
+            &input,
+            &[Lookup {
+                row_index: 1,
+                take: 2,
+            }],
+        )
+        .unwrap();
         assert_eq!(upper_found[0].ids, upper_ids);
         let delete = Batch {
             inserts: vec![],
             deletes: vec![Delete {
                 row_index: 0,
                 technical_id: 1,
+                event_offset: 2,
             }],
         };
-        target.write_batch(&input, &delete).unwrap();
-        target.write_batch(&input, &delete).unwrap();
+        write(&mut target, &input, &delete).unwrap();
+        write(&mut target, &input, &delete).unwrap();
         let stale_row = target.codec.encode_row(input.records(), 0).unwrap();
         let stale = format!(
             "INSERT INTO {} ({}) FORMAT JSONCompactEachRow\n{}\n",
@@ -894,8 +957,7 @@ mod live_tests {
             serde_json::to_string(&serde_json::json!([
                 1,
                 stale_row.hash,
-                0,
-                0,
+                1,
                 stale_row.values[0]
             ]))
             .unwrap()
@@ -905,15 +967,15 @@ mod live_tests {
             .command(&stale, "inject stale replay")
             .unwrap();
         assert_eq!(
-            target
-                .lookup(
-                    &input,
-                    &[Lookup {
-                        row_index: 0,
-                        take: 1,
-                    }],
-                )
-                .unwrap()[0]
+            lookup(
+                &mut target,
+                &input,
+                &[Lookup {
+                    row_index: 0,
+                    take: 1,
+                }],
+            )
+            .unwrap()[0]
                 .ids
                 .len(),
             0
@@ -931,21 +993,22 @@ mod live_tests {
         target
             .config
             .command(
-                &create_view_sql(&target.spec, target.codec.schema()).replace(" = 0", " = 1"),
+                &create_view_sql(&target.spec, target.codec.schema())
+                    .replace("WHERE", "WHERE 1 = 0 AND"),
                 "replace target view",
             )
             .unwrap();
         target.verified = false;
         assert!(
-            target
-                .lookup(
-                    &input,
-                    &[Lookup {
-                        row_index: 0,
-                        take: 1,
-                    }],
-                )
-                .is_err()
+            lookup(
+                &mut target,
+                &input,
+                &[Lookup {
+                    row_index: 0,
+                    take: 1,
+                }],
+            )
+            .is_err()
         );
         cleanup(&target.config);
     }
@@ -956,14 +1019,7 @@ mod live_tests {
         const ROWS: usize = 16 * 1024;
         const LOOKUPS: usize = 1024;
 
-        let config = ClickHouseSinkConfig::new_unencrypted(
-            "127.0.0.1",
-            18123,
-            "dogpaddle",
-            "dogpaddle",
-            "dogpaddle",
-        )
-        .unwrap();
+        let config = config();
         cleanup(&config);
         let spec = config.discover_target("rust_live", "rust_live").unwrap();
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -995,18 +1051,98 @@ mod live_tests {
                     .collect(),
                 deletes: vec![],
             };
-            target.write_batch(&input, &batch).unwrap();
+            write(&mut target, &input, &batch).unwrap();
         }
         let first = ROWS - LOOKUPS;
         let requests = (first..ROWS)
             .map(|row_index| Lookup { row_index, take: 1 })
             .collect::<Vec<_>>();
-        let found = target.lookup(&input, &requests).unwrap();
+        let found = lookup(&mut target, &input, &requests).unwrap();
         assert_eq!(found.len(), LOOKUPS);
         for (offset, matches) in found.into_iter().enumerate() {
             assert_eq!(matches.ids.len() as u64, 1);
             assert_eq!(matches.ids, [u64::try_from(first + offset + 1).unwrap()]);
         }
+        cleanup(&target.config);
+    }
+
+    #[test]
+    #[ignore = "requires the clickhouse system-test fixture"]
+    fn committed_weighted_prefix_can_be_recut_without_repeating_fifo_deaths() {
+        let config = config();
+        cleanup(&config);
+        let spec = config.discover_target("rust_live", "rust_live").unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let input = Change::try_new(
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(vec![7, 7, 8, 7, 7, 8, 7]))],
+            )
+            .unwrap(),
+            Int64Array::from(vec![3, -2, 2, -1, 1, -2, 2]),
+        )
+        .unwrap();
+        let mut target =
+            ClickHouseTarget::new_bound(config, spec, ClickHouseRowCodec::try_new(schema).unwrap());
+        target.initialize().unwrap();
+        let full = DeliveryBatch::for_test(input.clone(), 1).unwrap();
+        target.deliver_prefix(&full, 14, (1, &input)).unwrap();
+        let short = DeliveryBatch::for_test(
+            Change::try_new(input.records().slice(0, 2), Int64Array::from(vec![3, -2])).unwrap(),
+            1,
+        )
+        .unwrap();
+        let suffix = DeliveryBatch::for_test(
+            Change::try_new(
+                input.records().slice(2, 5),
+                Int64Array::from(vec![2, -1, 1, -2, 2]),
+            )
+            .unwrap(),
+            6,
+        )
+        .unwrap();
+        for delivery in [&full, &short, &suffix] {
+            target.deliver_prefix(delivery, 14, (1, &input)).unwrap();
+            let body = target.config.command(
+                "SELECT `$dogpaddle.id`, value FROM dogpaddle.rust_live ORDER BY `$dogpaddle.id` FORMAT JSONCompactEachRow",
+                "read complete prefix oracle",
+            ).unwrap();
+            let rows = body
+                .lines()
+                .map(|line| {
+                    let row: Vec<serde_json::Value> = serde_json::from_str(line).unwrap();
+                    assert_eq!(row.len(), 2);
+                    (
+                        value_ref_u64(&row[0], "prefix oracle").unwrap(),
+                        row[1].as_i64().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(rows, [(9, 7), (12, 7), (13, 7)]);
+        }
+        let matches = lookup(
+            &mut target,
+            &input,
+            &[
+                Lookup {
+                    row_index: 0,
+                    take: 3,
+                },
+                Lookup {
+                    row_index: 2,
+                    take: 1,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(matches[0].through, 13);
+        assert_eq!(matches[0].ids, [9, 12, 13]);
+        assert_eq!(matches[1].through, 11);
+        assert!(matches[1].ids.is_empty());
         cleanup(&target.config);
     }
 

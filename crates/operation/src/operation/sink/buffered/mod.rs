@@ -17,7 +17,7 @@ use super::relation::RelationTarget;
 
 pub(crate) use batch::DeliveryBatch;
 pub(crate) use runtime::BufferedSink;
-pub use runtime::{SinkPending, SinkPrepared};
+pub use runtime::SinkPending;
 
 pub(crate) const CONTROL: &str = "sink.control";
 pub(crate) const BUFFER: &str = "sink.buffer";

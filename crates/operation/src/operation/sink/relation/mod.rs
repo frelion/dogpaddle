@@ -1,8 +1,8 @@
-//! Fixed-ID relation planning shared by SQL database sink adapters.
+//! Absolute-event relation planning shared by SQL database sink adapters.
 
 mod plan;
 
-pub(crate) use plan::{prepare, recover};
+pub(crate) use plan::plan;
 
 use std::collections::BTreeMap;
 
@@ -31,6 +31,7 @@ pub(crate) struct Insert {
 pub(crate) struct Delete {
     pub row_index: u64,
     pub technical_id: u64,
+    pub event_offset: u64,
 }
 
 /// Immutable work: insert these IDs, then delete these IDs, atomically.
@@ -38,15 +39,6 @@ pub(crate) struct Delete {
 pub(crate) struct Batch {
     pub inserts: Vec<Insert>,
     pub deletes: Vec<Delete>,
-}
-
-impl Batch {
-    pub(crate) fn negative_ids(&self) -> Vec<u64> {
-        self.deletes
-            .iter()
-            .map(|delete| delete.technical_id)
-            .collect()
-    }
 }
 
 /// Maps unsigned event positions to SQL BIGINT values while preserving order.
@@ -69,60 +61,11 @@ pub(crate) fn validate_technical_id(id: u64) -> Result<(), OperationError> {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
-pub(super) struct MutationGroup {
-    pub(super) row_index: u64,
-    pub(super) insert_ids: Vec<u64>,
-    pub(super) mutation_ids: Vec<u64>,
-}
-
-#[derive(Debug, Eq, PartialEq)]
-pub(super) struct MutationGroups {
-    pub(super) rows: Vec<MutationGroup>,
-    pub(super) delete_ids: Vec<u64>,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct TerminalMutation {
     pub(super) row_index: u64,
     pub(super) technical_id: u64,
-    pub(super) deleted: bool,
-}
-
-/// Groups a validated plan by logical input row without applying backend rules.
-pub(super) fn group_mutations(batch: &Batch) -> MutationGroups {
-    #[derive(Default)]
-    struct Ids {
-        inserts: Vec<u64>,
-        mutations: Vec<u64>,
-    }
-
-    let mut by_row = BTreeMap::<u64, Ids>::new();
-    for insert in &batch.inserts {
-        let group = by_row.entry(insert.row_index).or_default();
-        group.inserts.push(insert.technical_id);
-        group.mutations.push(insert.technical_id);
-    }
-    let mut delete_ids = Vec::with_capacity(batch.deletes.len());
-    for delete in &batch.deletes {
-        by_row
-            .entry(delete.row_index)
-            .or_default()
-            .mutations
-            .push(delete.technical_id);
-        delete_ids.push(delete.technical_id);
-    }
-    MutationGroups {
-        rows: by_row
-            .into_iter()
-            .map(|(row_index, ids)| MutationGroup {
-                row_index,
-                insert_ids: ids.inserts,
-                mutation_ids: ids.mutations,
-            })
-            .collect(),
-        delete_ids,
-    }
+    pub(super) version: u64,
 }
 
 /// Returns the final mutation for each technical ID in a validated plan.
@@ -134,7 +77,7 @@ pub(super) fn terminal_mutations(batch: &Batch) -> Vec<TerminalMutation> {
             TerminalMutation {
                 row_index: insert.row_index,
                 technical_id: insert.technical_id,
-                deleted: false,
+                version: insert.technical_id,
             },
         );
         debug_assert!(replaced.is_none(), "validated insert IDs are unique");
@@ -145,12 +88,12 @@ pub(super) fn terminal_mutations(batch: &Batch) -> Vec<TerminalMutation> {
             .and_modify(|mutation| {
                 // Equal canonical rows can occur at different input indexes.
                 mutation.row_index = delete.row_index;
-                mutation.deleted = true;
+                mutation.version = delete.event_offset;
             })
             .or_insert(TerminalMutation {
                 row_index: delete.row_index,
                 technical_id: delete.technical_id,
-                deleted: true,
+                version: delete.event_offset,
             });
     }
     by_id.into_values().collect()
@@ -165,11 +108,13 @@ pub(crate) struct Lookup {
 
 #[derive(Debug)]
 pub(crate) struct Matches {
+    // One snapshot: progress includes deaths, IDs contain only live occurrences.
+    pub through: u64,
     pub ids: Vec<u64>,
 }
 
 /// Target layout and I/O for the single buffered relation sink protocol.
-/// Buffering, fixed-ID planning, durable state and replay belong to shared code.
+/// Buffering and durable input belong to shared code; target progress belongs to the adapter.
 pub(crate) trait RelationTarget: Send + 'static {
     /// Deterministic, nonzero byte charge for one target mutation.
     /// This must be pure and perform no target I/O: admission and delivery slicing
@@ -184,20 +129,16 @@ pub(crate) trait RelationTarget: Send + 'static {
     /// Reopen may repeat this call after an uncertain result, so it must be
     /// idempotent and reject incompatible ownership or layout.
     fn initialize(&mut self) -> Result<(), OperationError>;
-    /// Read-only exact matches in request order; return at most `take` ascending
-    /// IDs per request. No full-remaining cardinality query is permitted.
-    /// A failed read must leave the target session ready for a retry of the same
-    /// loaded batch, resetting a poisoned connection before returning the error.
-    fn lookup(
+    /// Validates and atomically delivers the unprocessed part of this immutable prefix.
+    /// The adapter reads progress and exact-row IDs together, then calls `plan`
+    /// before any business write. Success requires readable target publication.
+    /// Failed or uncertain I/O discards the session; input remains for reopen.
+    fn deliver_prefix(
         &mut self,
-        input: &Change,
-        requests: &[Lookup],
-    ) -> Result<Vec<Matches>, OperationError>;
-    /// Atomically deliver one durably prepared plan in one target transaction.
-    /// Reopen may repeat the exact plan after process exit or an uncertain commit:
-    /// matching duplicate IDs and already deleted IDs are successful replay,
-    /// while an ID bound to a different complete logical row must fail.
-    fn write_batch(&mut self, input: &Change, batch: &Batch) -> Result<(), OperationError>;
+        input: &super::buffered::DeliveryBatch,
+        tail: u64,
+        original_head: (u64, &Change),
+    ) -> Result<(), OperationError>;
 }
 
 /// Encodes each field once and projects its fresh canonical bytes to a target value.

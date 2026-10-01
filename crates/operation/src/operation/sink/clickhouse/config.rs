@@ -1,4 +1,9 @@
-use std::{fmt, fmt::Write as _, net::IpAddr, time::Duration};
+use std::{
+    fmt,
+    fmt::Write as _,
+    net::IpAddr,
+    time::{Duration, Instant},
+};
 
 use serde::{Deserialize, Serialize};
 use ureq::Agent;
@@ -85,7 +90,9 @@ impl ClickHouseSinkConfig {
             database_uuid: String::new(),
         };
         spec.validate_names()?;
-        self.command(
+        let deadline = Instant::now() + DATABASE_TIMEOUT;
+        self.command_before(
+                deadline,
                 &format!(
                     "SELECT toString(uuid) FROM system.databases WHERE name = {} FORMAT TabSeparatedRaw",
                     string_literal(&spec.database)
@@ -95,29 +102,50 @@ impl ClickHouseSinkConfig {
             .trim()
             .clone_into(&mut spec.database_uuid);
         spec.validate()?;
-        require_absent(self, &spec)?;
+        require_absent(self, &spec, deadline)?;
         Ok(spec)
     }
 
+    #[cfg(test)]
     pub(super) fn command(
         &self,
         sql: &str,
         stage: &'static str,
     ) -> Result<String, ClickHouseSinkError> {
+        self.command_before(Instant::now() + DATABASE_TIMEOUT, sql, stage)
+    }
+
+    pub(super) fn command_before(
+        &self,
+        deadline: Instant,
+        sql: &str,
+        stage: &'static str,
+    ) -> Result<String, ClickHouseSinkError> {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|duration| !duration.is_zero())
+            .ok_or_else(|| database(stage))?;
         let mut response = self
             .agent
             .post(self.endpoint()?.as_str())
+            .config()
+            .timeout_global(Some(remaining))
+            .build()
             .header("X-ClickHouse-User", &self.user)
             .header("X-ClickHouse-Key", &self.password)
             .header("Content-Type", "text/plain; charset=utf-8")
             .send(sql.as_bytes())
             .map_err(|_| database(stage))?;
-        response
+        let body = response
             .body_mut()
             .with_config()
             .limit(MAX_RESPONSE_BYTES)
             .read_to_string()
-            .map_err(|_| invalid_response(stage))
+            .map_err(|_| invalid_response(stage))?;
+        if Instant::now() >= deadline {
+            return Err(database(stage));
+        }
+        Ok(body)
     }
 
     fn endpoint(&self) -> Result<Url, ClickHouseSinkError> {
@@ -265,7 +293,7 @@ impl ClickHouseTargetSpec {
 
     pub(super) fn marker(&self) -> String {
         format!(
-            "dogpaddle.clickhouse-sink.event-address.v1:{}",
+            "dogpaddle.clickhouse-sink.occurrence-version.v1:{}",
             self.sink_id
         )
     }
@@ -274,6 +302,7 @@ impl ClickHouseTargetSpec {
 pub(super) fn require_absent(
     config: &ClickHouseSinkConfig,
     spec: &ClickHouseTargetSpec,
+    deadline: Instant,
 ) -> Result<(), ClickHouseSinkError> {
     let sql = format!(
         "SELECT name FROM system.tables WHERE database = {} AND name IN ({}, {}) ORDER BY name FORMAT TabSeparatedRaw",
@@ -281,7 +310,7 @@ pub(super) fn require_absent(
         string_literal(spec.table()),
         string_literal(&spec.state_table())
     );
-    let body = config.command(&sql, "inspect target absence")?;
+    let body = config.command_before(deadline, &sql, "inspect target absence")?;
     if let Some(name) = body.lines().next().filter(|name| !name.is_empty()) {
         Err(ClickHouseSinkError::TargetExists {
             name: name.to_owned(),
