@@ -101,3 +101,37 @@ DOGPADDLE_PERF_PROFILE=reference DOGPADDLE_PERF_ROOT=/absolute/perf-root \
 `flow-reference-baseline-fused.jsonl` 及相邻统计摘要。临时默认融合基线源码保存在工作树的
 `target/baseline-fused-countchain/`，只依赖旧仓库的产品 crate 与性能上下文；原仓库 tracked
 文件没有修改。这些本地临时证据不属于持久格式或仓库测试协议。
+
+## Tagged Operation plan：2026-10-01 启动对照
+
+Operation Definition 统一为稳定名称标记的 canonical JSON，删除数字 tag 目录、逐算子
+decode 与 Payload 镜像；Flow 的图格式及运行状态协议保持原有机制，嵌入的 Operation
+字节属于开发期 v1 变化，旧状态直接重建。该简化不意味着启动时间必然降低。
+
+同机 Apple M5、aarch64 Darwin 25.6、APFS、Rust 1.96.0 release，
+`flow_lifecycle` reference 使用 30 samples、2 s warmup、5 s measurement。
+baseline 产品为 `a3dc2dc`（benchmark-only 快照 `75febde`），candidate 为 `35e9662`
+加 ASOF 页内复用与 Aggregate API 收敛；生命周期 workload 不执行 ASOF。
+构建/重开单独计时，fixture 和结果验证在计时外；两轮无并发 Cargo、容器或归档。
+
+整轮中位数如下，单位 ms；变化为 candidate / baseline - 1。
+
+| 场景 / Operation 数 | baseline | candidate | 变化 |
+| --- | ---: | ---: | ---: |
+| fresh_durable_build / 2 | 4.4797 | 4.6088 | +2.9% |
+| fresh_durable_build / 64 | 4.6786 | 4.8567 | +3.8% |
+| fresh_durable_build / 1024 | 7.6577 | 8.0396 | +5.0% |
+| warm_reopen / 2 | 5.8089 | 5.8704 | +1.1% |
+| warm_reopen / 64 | 6.0327 | 5.5462 | -8.1% |
+| warm_reopen / 1024 | 7.6393 | 7.6750 | +0.5% |
+
+fresh build 的中位数 95% CI：2 个 Operation 为旧 `[4.4461,4.5363]`、
+新 `[4.5950,4.6219]`；1024 个为旧 `[7.5981,7.6905]`、新 `[8.0070,8.0583]`。
+保留本轮 0.13–0.38 ms 的启动回归。warm reopen 的各自区间大体重叠，不宣称普遍
+提速或完全无回归；未测构建分配/RSS，也不据此推断 steady-state throughput。
+
+原始 context、samples、estimates 位于 `/tmp/dogpaddle-definition-performance/`：
+`before/dogpaddle-flow-lifecycle-run-naFgvB` 与
+`after/dogpaddle-flow-lifecycle-run-0kNpR1`，相邻日志保留全部输出。
+完整工作区 debug/release correctness、benchmark test mode、Clippy、Rustdoc 和最终
+构建通过；独立审查覆盖 raw plan 的 owner 上限、纯 binding 前置拒绝与只读恢复。
