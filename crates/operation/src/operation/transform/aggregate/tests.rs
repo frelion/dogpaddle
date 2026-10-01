@@ -10,14 +10,14 @@ fn repeated_calls_share_one_argument_statistic_and_extrema_layout() {
     let definition = AggregateDefinition::try_new(
         [("group", col("group"))],
         [
-            ("rows", AggregateCall::count_all()),
-            ("count", AggregateCall::count(col("value"))),
-            ("sum", AggregateCall::sum(col("value"))),
-            ("avg", AggregateCall::avg(col("value"))),
-            ("count_again", AggregateCall::count(col("value"))),
-            ("min", AggregateCall::min(col("value"))),
-            ("max", AggregateCall::max(col("value"))),
-            ("min_again", AggregateCall::min(col("value"))),
+            ("rows", AggregateCall::CountAll),
+            ("count", AggregateCall::Count(col("value"))),
+            ("sum", AggregateCall::Sum(col("value"))),
+            ("avg", AggregateCall::Avg(col("value"))),
+            ("count_again", AggregateCall::Count(col("value"))),
+            ("min", AggregateCall::Min(col("value"))),
+            ("max", AggregateCall::Max(col("value"))),
+            ("min_again", AggregateCall::Min(col("value"))),
         ],
     )
     .unwrap();

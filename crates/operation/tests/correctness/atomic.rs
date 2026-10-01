@@ -37,7 +37,7 @@ fn transform_kind_declares_atomic_execution_explicitly() {
         .into(),
         RunningEventCountDefinition::new().into(),
         DistinctDefinition::new().into(),
-        AggregateDefinition::try_new([("id", col("id"))], [("count", AggregateCall::count_all())])
+        AggregateDefinition::try_new([("id", col("id"))], [("count", AggregateCall::CountAll)])
             .unwrap()
             .into(),
     ];
@@ -60,14 +60,14 @@ fn every_expression_owner_rejects_unbound_parameters_at_definition_time() {
     assert!(
         AggregateDefinition::try_new(
             [("parameter", parameter.clone())],
-            [("count", AggregateCall::count_all())],
+            [("count", AggregateCall::CountAll)],
         )
         .is_err()
     );
     assert!(
         AggregateDefinition::try_new(
             [("id", col("id"))],
-            [("count", AggregateCall::count(parameter))]
+            [("count", AggregateCall::Count(parameter))]
         )
         .is_err()
     );

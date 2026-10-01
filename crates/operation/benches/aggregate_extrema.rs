@@ -51,9 +51,9 @@ impl Fixture {
                 [
                     (
                         format!("min_{index}"),
-                        AggregateCall::min(expression.clone()),
+                        AggregateCall::Min(expression.clone()),
                     ),
-                    (format!("max_{index}"), AggregateCall::max(expression)),
+                    (format!("max_{index}"), AggregateCall::Max(expression)),
                 ]
             }),
         )

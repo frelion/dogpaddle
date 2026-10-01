@@ -47,12 +47,12 @@ fn definition() -> AggregateDefinition {
     AggregateDefinition::try_new(
         [("department", col("department"))],
         [
-            ("rows", AggregateCall::count_all()),
-            ("values", AggregateCall::count(col("value"))),
-            ("sum", AggregateCall::sum(col("value"))),
-            ("avg", AggregateCall::avg(col("value"))),
-            ("min", AggregateCall::min(col("value"))),
-            ("max", AggregateCall::max(col("value"))),
+            ("rows", AggregateCall::CountAll),
+            ("values", AggregateCall::Count(col("value"))),
+            ("sum", AggregateCall::Sum(col("value"))),
+            ("avg", AggregateCall::Avg(col("value"))),
+            ("min", AggregateCall::Min(col("value"))),
+            ("max", AggregateCall::Max(col("value"))),
         ],
     )
     .unwrap()
@@ -371,7 +371,7 @@ fn count_sum_average_and_extrema_follow_ordered_group_transitions() {
 fn unchanged_extrema_do_not_emit_redundant_rows() {
     let definition = AggregateDefinition::try_new(
         [("department", col("department"))],
-        [("min", AggregateCall::min(col("value")))],
+        [("min", AggregateCall::Min(col("value")))],
     )
     .unwrap();
     let root = TestStore::new();
@@ -393,8 +393,8 @@ fn extrema_order_signed_values_by_value() {
     let definition = AggregateDefinition::try_new(
         [("department", col("department"))],
         [
-            ("min", AggregateCall::min(col("value"))),
-            ("max", AggregateCall::max(col("value"))),
+            ("min", AggregateCall::Min(col("value"))),
+            ("max", AggregateCall::Max(col("value"))),
         ],
     )
     .unwrap();
@@ -451,10 +451,10 @@ fn extrema_preserve_byte_order_for_empty_and_prefix_values() {
     let definition = AggregateDefinition::try_new(
         [("department", col("department"))],
         [
-            ("min_text", AggregateCall::min(col("text"))),
-            ("max_text", AggregateCall::max(col("text"))),
-            ("min_bytes", AggregateCall::min(col("bytes"))),
-            ("max_bytes", AggregateCall::max(col("bytes"))),
+            ("min_text", AggregateCall::Min(col("text"))),
+            ("max_text", AggregateCall::Max(col("text"))),
+            ("min_bytes", AggregateCall::Min(col("bytes"))),
+            ("max_bytes", AggregateCall::Max(col("bytes"))),
         ],
     )
     .unwrap();
@@ -533,11 +533,11 @@ fn distinct_extrema_layouts_refresh_interleaved_groups_across_reopen() {
     let definition = AggregateDefinition::try_new(
         [("department", col("department"))],
         [
-            ("min_text", AggregateCall::min(col("text"))),
-            ("min_bytes", AggregateCall::min(col("bytes"))),
-            ("max_text", AggregateCall::max(col("text"))),
-            ("max_bytes", AggregateCall::max(col("bytes"))),
-            ("min_text_again", AggregateCall::min(col("text"))),
+            ("min_text", AggregateCall::Min(col("text"))),
+            ("min_bytes", AggregateCall::Min(col("bytes"))),
+            ("max_text", AggregateCall::Max(col("text"))),
+            ("max_bytes", AggregateCall::Max(col("bytes"))),
+            ("min_text_again", AggregateCall::Min(col("text"))),
         ],
     )
     .unwrap();
@@ -703,8 +703,8 @@ fn extrema_multiplicity_and_group_partitions_are_independent() {
     let definition = AggregateDefinition::try_new(
         [("department", col("department"))],
         [
-            ("min", AggregateCall::min(col("value"))),
-            ("max", AggregateCall::max(col("value"))),
+            ("min", AggregateCall::Min(col("value"))),
+            ("max", AggregateCall::Max(col("value"))),
         ],
     )
     .unwrap();
@@ -959,8 +959,8 @@ fn unsigned_sum_and_average_use_input_multiplicity() {
     let definition = AggregateDefinition::try_new(
         [("department", col("department"))],
         [
-            ("sum", AggregateCall::sum(col("value"))),
-            ("avg", AggregateCall::avg(col("value"))),
+            ("sum", AggregateCall::Sum(col("value"))),
+            ("avg", AggregateCall::Avg(col("value"))),
         ],
     )
     .unwrap();
@@ -1003,8 +1003,8 @@ fn unknown_extrema_argument_rolls_back_the_whole_change() {
     let definition = AggregateDefinition::try_new(
         [("department", col("department"))],
         [
-            ("rows", AggregateCall::count_all()),
-            ("min", AggregateCall::min(col("value"))),
+            ("rows", AggregateCall::CountAll),
+            ("min", AggregateCall::Min(col("value"))),
         ],
     )
     .unwrap();
@@ -1039,8 +1039,8 @@ fn cached_extrema_underflow_poisons_commit_and_preserves_durable_state() {
     let definition = AggregateDefinition::try_new(
         [("department", col("department"))],
         [
-            ("min", AggregateCall::min(col("value"))),
-            ("max", AggregateCall::max(col("value"))),
+            ("min", AggregateCall::Min(col("value"))),
+            ("max", AggregateCall::Max(col("value"))),
         ],
     )
     .unwrap();
@@ -1093,7 +1093,7 @@ fn cached_extrema_underflow_poisons_commit_and_preserves_durable_state() {
 fn first_extrema_event_underflow_poisons_commit_after_read_only_lookup() {
     let definition = AggregateDefinition::try_new(
         [("department", col("department"))],
-        [("min", AggregateCall::min(col("value")))],
+        [("min", AggregateCall::Min(col("value")))],
     )
     .unwrap();
     let root = TestStore::new();
@@ -1139,7 +1139,7 @@ fn first_extrema_event_underflow_poisons_commit_after_read_only_lookup() {
 fn cached_extrema_overflow_poisons_commit() {
     let definition = AggregateDefinition::try_new(
         [("department", col("department"))],
-        [("min", AggregateCall::min(col("value")))],
+        [("min", AggregateCall::Min(col("value")))],
     )
     .unwrap();
     let root = TestStore::new();
@@ -1181,7 +1181,7 @@ fn cached_extrema_overflow_poisons_commit() {
 fn group_weight_underflow_rolls_back_the_turn() {
     let definition = AggregateDefinition::try_new(
         [("department", col("department"))],
-        [("rows", AggregateCall::count_all())],
+        [("rows", AggregateCall::CountAll)],
     )
     .unwrap();
     let root = TestStore::new();
@@ -1226,8 +1226,8 @@ fn retraction_of_an_unused_column_is_accepted() {
     let definition = AggregateDefinition::try_new(
         [("department", col("department"))],
         [
-            ("min", AggregateCall::min(col("value"))),
-            ("max", AggregateCall::max(col("value"))),
+            ("min", AggregateCall::Min(col("value"))),
+            ("max", AggregateCall::Max(col("value"))),
         ],
     )
     .unwrap();
@@ -1282,7 +1282,7 @@ fn retraction_of_an_unused_column_is_accepted() {
 fn non_null_count_underflow_rolls_back_the_turn() {
     let definition = AggregateDefinition::try_new(
         [("department", col("department"))],
-        [("values", AggregateCall::count(col("value")))],
+        [("values", AggregateCall::Count(col("value")))],
     )
     .unwrap();
     let root = TestStore::new();
@@ -1310,7 +1310,7 @@ fn non_null_count_underflow_rolls_back_the_turn() {
 fn count_overflow_rolls_back_the_whole_turn() {
     let definition = AggregateDefinition::try_new(
         [("department", col("department"))],
-        [("rows", AggregateCall::count_all())],
+        [("rows", AggregateCall::CountAll)],
     )
     .unwrap();
     let root = TestStore::new();
@@ -1345,7 +1345,7 @@ fn decoded_definition_reopens_group_and_index_state() {
     let root = TestStore::new();
     let definition = AggregateDefinition::try_new(
         [("department", col("department"))],
-        [("min", AggregateCall::min(col("value")))],
+        [("min", AggregateCall::Min(col("value")))],
     )
     .unwrap();
     let encoded = encode_definition(&definition.clone().into());
@@ -1379,8 +1379,8 @@ fn cached_extrema_follow_duplicate_retraction_across_reopen() {
     let definition = AggregateDefinition::try_new(
         [("department", col("department"))],
         [
-            ("min", AggregateCall::min(col("value"))),
-            ("max", AggregateCall::max(col("value"))),
+            ("min", AggregateCall::Min(col("value"))),
+            ("max", AggregateCall::Max(col("value"))),
         ],
     )
     .unwrap();
@@ -1436,7 +1436,7 @@ fn schema_binding_rejects_float_keys_float_extrema_and_uncoerced_sum() {
     assert!(matches!(
         AggregateDefinition::try_new(
             std::iter::empty::<(&str, dogpaddle_operation::Expr)>(),
-            [("rows", AggregateCall::count_all())],
+            [("rows", AggregateCall::CountAll)],
         ),
         Err(AggregateDefinitionError::EmptyGroupBy)
     ));
@@ -1448,7 +1448,7 @@ fn schema_binding_rejects_float_keys_float_extrema_and_uncoerced_sum() {
     )]));
     let float_group = AggregateDefinition::try_new(
         [("value", col("value"))],
-        [("rows", AggregateCall::count_all())],
+        [("rows", AggregateCall::CountAll)],
     )
     .unwrap();
     let Err(error) = construct_checked(&float_group, std::slice::from_ref(&float_schema)) else {
@@ -1465,8 +1465,8 @@ fn schema_binding_rejects_float_keys_float_extrema_and_uncoerced_sum() {
         Field::new("value", DataType::Float32, false),
     ]));
     for call in [
-        AggregateCall::min(col("value")),
-        AggregateCall::sum(col("value")),
+        AggregateCall::Min(col("value")),
+        AggregateCall::Sum(col("value")),
     ] {
         let definition =
             AggregateDefinition::try_new([("key", col("key"))], [("result", call)]).unwrap();
@@ -1600,10 +1600,10 @@ fn emitted_relation_matches_a_multiset_model_under_retraction() {
     let definition = AggregateDefinition::try_new(
         [("department", col("department"))],
         [
-            ("rows", AggregateCall::count_all()),
-            ("sum", AggregateCall::sum(col("value"))),
-            ("min", AggregateCall::min(col("value"))),
-            ("max", AggregateCall::max(col("value"))),
+            ("rows", AggregateCall::CountAll),
+            ("sum", AggregateCall::Sum(col("value"))),
+            ("min", AggregateCall::Min(col("value"))),
+            ("max", AggregateCall::Max(col("value"))),
         ],
     )
     .unwrap();
@@ -1631,9 +1631,9 @@ fn emitted_relation_matches_a_multiset_model_under_retraction() {
 #[test]
 fn zero_group_rejects_unretracted_statistics_and_extrema_and_preserves_reopen() {
     for calls in [
-        vec![("avg", AggregateCall::avg(col("value")))],
-        vec![("min", AggregateCall::min(col("value")))],
-        vec![("count", AggregateCall::count(col("value")))],
+        vec![("avg", AggregateCall::Avg(col("value")))],
+        vec![("min", AggregateCall::Min(col("value")))],
+        vec![("count", AggregateCall::Count(col("value")))],
     ] {
         let definition =
             AggregateDefinition::try_new([("department", col("department"))], calls).unwrap();
@@ -1665,7 +1665,7 @@ fn zero_group_rejects_unretracted_statistics_and_extrema_and_preserves_reopen() 
 fn zero_group_rejects_a_zero_count_with_nonzero_wide_sum() {
     let definition = AggregateDefinition::try_new(
         [("department", col("department"))],
-        [("avg", AggregateCall::avg(col("value")))],
+        [("avg", AggregateCall::Avg(col("value")))],
     )
     .unwrap();
     let root = TestStore::new();
@@ -1684,7 +1684,7 @@ fn zero_group_rejects_a_zero_count_with_nonzero_wide_sum() {
 fn average_keeps_a_wide_sum_and_shared_sum_still_checks_every_event() {
     let average = AggregateDefinition::try_new(
         [("department", col("department"))],
-        [("avg", AggregateCall::avg(col("value")))],
+        [("avg", AggregateCall::Avg(col("value")))],
     )
     .unwrap();
     let root = TestStore::new();
@@ -1716,9 +1716,9 @@ fn average_keeps_a_wide_sum_and_shared_sum_still_checks_every_event() {
     let shared = AggregateDefinition::try_new(
         [("department", col("department"))],
         [
-            ("avg", AggregateCall::avg(col("value"))),
-            ("sum", AggregateCall::sum(col("value"))),
-            ("count", AggregateCall::count(col("value"))),
+            ("avg", AggregateCall::Avg(col("value"))),
+            ("sum", AggregateCall::Sum(col("value"))),
+            ("count", AggregateCall::Count(col("value"))),
         ],
     )
     .unwrap();

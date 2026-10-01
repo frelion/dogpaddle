@@ -33,7 +33,7 @@ pub(crate) struct AggregateLayout {
 
 /// One built-in aggregate invocation without its output field name.
 ///
-/// Constructors are infallible. The enclosing [`AggregateDefinition`] owns
+/// Each variant fixes its argument count. The enclosing [`AggregateDefinition`] owns
 /// canonical expression persistence and reports any encoding failure once.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -79,37 +79,6 @@ struct NamedCall {
 }
 
 impl<E> AggregateCall<E> {
-    /// Creates `COUNT(*)`.
-    #[must_use]
-    pub const fn count_all() -> Self {
-        Self::CountAll
-    }
-    /// Creates `COUNT(expression)`.
-    #[must_use]
-    pub fn count(expression: E) -> Self {
-        Self::Count(expression)
-    }
-    /// Creates `SUM(expression)`.
-    #[must_use]
-    pub fn sum(expression: E) -> Self {
-        Self::Sum(expression)
-    }
-    /// Creates `AVG(expression)`.
-    #[must_use]
-    pub fn avg(expression: E) -> Self {
-        Self::Avg(expression)
-    }
-    /// Creates `MIN(expression)`.
-    #[must_use]
-    pub fn min(expression: E) -> Self {
-        Self::Min(expression)
-    }
-    /// Creates `MAX(expression)`.
-    #[must_use]
-    pub fn max(expression: E) -> Self {
-        Self::Max(expression)
-    }
-
     fn try_map<T, F>(self, mut map: impl FnMut(E) -> Result<T, F>) -> Result<AggregateCall<T>, F> {
         Ok(match self {
             Self::CountAll => AggregateCall::CountAll,
