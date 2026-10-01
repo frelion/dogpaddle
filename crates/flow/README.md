@@ -32,7 +32,7 @@ Definition 或生命周期。持久 Definition 始终保存完整逻辑 DAG，�
 
 ## 源与目标仍有自己的恢复边界
 
-Source 拥有已发布输入 Queue、bootstrap spool、phase 和 checkpoint。完整 Delivery 先持久捕获，
+Source 拥有单一输入 Queue、phase 和 checkpoint，快照封口前隐藏、封口后直接可消费。完整 Delivery 先持久捕获，
 真实 CDC Delivery 完成 WAL barrier 后才消费原始 ACK 凭证；内部序列和维护动作共用本轮最终 barrier。未封口快照不会被计算提前看见。
 
 Sink 拥有有界 outbox；事件位置同时表示消费进度和正事件身份，Prepared 只持久化边界与删除 IDs。准备在 Store 事务外进行；Prepared

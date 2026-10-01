@@ -27,7 +27,7 @@ use serde_json::{Value, json};
 const OPERATION_PREFIX: &str = "operation";
 const SCAN_CHECKPOINT: &str = "operation/mysql_cdc_scan.checkpoint";
 const SCAN_PHASE: &str = "operation/mysql_cdc_scan.phase";
-const SCAN_SPOOL: &str = "operation/mysql_cdc_scan.bootstrap_spool";
+const SCAN_INPUT: &str = "operation/mysql_cdc_scan.input";
 const DIAGNOSTIC_OUTPUT_ITEMS: usize = 16;
 const DIAGNOSTIC_OUTPUT_BYTES: usize = 1024 * 1024;
 const DIAGNOSTIC_OUTPUT_ROWS: usize = 64;
@@ -86,7 +86,9 @@ fn main() -> Result<(), OperationError> {
         }
         let response = match command.as_str() {
             "read" => scan.read(),
-            "advance" | "crash-terminal-capture" | "crash-before-ack" => scan.advance(&command),
+            "advance" | "consume" | "crash-terminal-capture" | "crash-before-ack" => {
+                scan.advance(&command)
+            }
             _ => Err("unsupported gate command".into()),
         };
         match response {
@@ -113,7 +115,7 @@ struct DirectScan {
     codec: SchemaBoundChangeCodec,
     phase: Cell<u32>,
     checkpoint: Cell<Vec<u8>>,
-    spool: Queue<Vec<u8>>,
+    input: Queue<Vec<u8>>,
     output: OrderedMap<u64, Vec<u8>>,
     output_tail: Cell<u64>,
     transactions: Transactions,
@@ -149,14 +151,14 @@ impl DirectScan {
         let checkpoint = store.open_data(SCAN_CHECKPOINT)?;
         let output = store.open_data("output")?;
         let output_tail = store.open_data("output-tail")?;
-        let spool = store.open_data(SCAN_SPOOL)?;
+        let input = store.open_data(SCAN_INPUT)?;
         let (transactions, reads) = store.into_transactions().split();
         Ok(Self {
             scan,
             codec,
             phase,
             checkpoint,
-            spool,
+            input,
             output,
             output_tail,
             transactions,
@@ -193,7 +195,11 @@ impl DirectScan {
         };
         source.restore(self.reads.begin().access())?;
         let before = self.checkpoint.read(self.reads.begin().access())?.get()?;
-        let mut delivery = source.poll()?;
+        let mut delivery = if command == "consume" {
+            None
+        } else {
+            source.poll()?
+        };
         let mut commits = 0;
         if let Some(delivery) = delivery.as_mut() {
             let transaction = self.transactions.begin();
@@ -210,7 +216,7 @@ impl DirectScan {
         if command == "crash-terminal-capture"
             && checkpoint_present
             && phase == Some(2)
-            && !self.spool.read(self.reads.begin().access())?.is_empty()?
+            && !self.input.read(self.reads.begin().access())?.is_empty()?
         {
             respond(&json!({
                 "kind": "durable-terminal-capture", "checkpoint_present": checkpoint_present,
@@ -304,11 +310,11 @@ impl DirectScan {
             .get()?
             .is_some();
         let phase = self.phase.access(transaction.access())?.get()?;
-        let spool_nonempty = !self.spool.access(transaction.access())?.is_empty()?;
+        let input_nonempty = !self.input.access(transaction.access())?.is_empty()?;
         Ok(json!({
             "kind": "rows", "rows": rows,
             "checkpoint_present": checkpoint_present,
-            "phase": phase, "spool_nonempty": spool_nonempty,
+            "phase": phase, "input_nonempty": input_nonempty,
         }))
     }
 }

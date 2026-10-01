@@ -56,7 +56,7 @@ Aggregate 或 ASOF 产生的一对 `-old,+new` 在其本页和尾链中原子，
 ## 预算与调度
 
 捕获 Delivery 的 envelope/row/slot/编码限制由 Source 执行；完整转换 Change 与 checkpoint 合计最多 8 MiB，
-不拆分一个真实 Delivery。捕获和 bootstrap 发布分别受 24 MiB 逻辑工作界约束。
+不拆分一个真实 Delivery。捕获受 24 MiB 逻辑工作界约束；bootstrap 封口只改变控制，不搬运输入 payload。
 后代 input 和所有 pending output 最多 1 MiB、256 物理行、16,384 顶层标量槽。
 
 每个计算 attempt 使用共享 4 MiB StepBudget，head work items 初始 256，尾链只扣逻辑字节而不重复扣 head items。
@@ -69,9 +69,9 @@ Aggregate 或 ASOF 产生的一对 `-old,+new` 在其本页和尾链中原子，
 普通 drain 读取有界前缀并持久化 Prepared；此额外工作按 Sink owner 契约计，不冒称整轮 128 MiB 硬界。
 Source、root 选择与 Sink 跨轮轮转；空栈在本轮剩余额度内检查 Source 的已发布队列，空队列不阻止检查后续 Source。
 
-每个 Source 的已发布 Queue、私有 bootstrap spool 和未确认 Delivery 单独计容量；每个 Sink 的 outbox 单独有界。
+每个 Source 的 input Queue 按捕获/封口与 Streaming 阶段计容量，未确认 Delivery 另计；每个 Sink 的 outbox 单独有界。
 栈层保留槽不与祖先或 outbox 共用容量，因此 child 不会等待祖先释放自己必须依赖的同一池。
-编码栈 pending payload 最多 `D` MiB，D ≤ 64；root 输入仍计入 Source 的 64 MiB 队列容量。
+编码栈 pending payload 最多 `D` MiB，D ≤ 64；root 输入仍计入 Source 的阶段容量（详见 CDC owner 契约）。
 关系历史和外部日志保留不在此界内。
 
 `advance()` 轮转服务一个 Source、有限栈工作、一个 Sink。长 root 允许后续 root 计算头部阻塞。

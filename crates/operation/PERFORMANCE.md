@@ -82,3 +82,78 @@ candidate 是相同基线加本次事件位置产品 diff，测量时为未提�
 本次结果证明确定性的控制数据缩减与正式场景可执行，未证明全面无性能回归。
 四库恢复与重放行为另由 correctness 和系统验收覆盖；本表只量化 SQLite，未对
 PostgreSQL、Doris、ClickHouse 的吞吐或 native memory 作性能保证。
+
+## 单 Queue CDC bootstrap：2026-10-01 reference 对照
+
+已封口快照现在直接消费原 input Queue，删除 spool → published 的逐 entry 搬运。
+对 N 个 bootstrap entries，确定性地消除 N 次逻辑 payload 读取、N 次 payload 重写和
+N 笔 publication 事务；消费及其事务仍保留。本 owner benchmark 对每笔事务同步提交，
+但生产 Flow 的维护事务可共享 WAL barrier，不能推导出减少 N 次 WAL sync。
+封口与原真实 Delivery 的数据、
+checkpoint 同事务提交，额外只更新 phase，不把整个快照放进一个大事务。
+
+`cdc_bootstrap` 的历史 case 名 `publish` 保留用于配对，它计时一次只读 restore、
+全部 front 读取/Change 解码和消费者同步提交。旧版还计入每条 input 的搬运、
+publication 同步提交及维护 ACK；新版直接读取原队列。构造、encoding/seed、
+关系及持久状态 oracle、teardown 都不计时。没有外部 connector I/O，不能解释为
+capture、真实 ACK、Flow 计算或端到端 CDC 吞吐的提速。
+
+窄场景为 32 entries × 256 rows，同步提交由 64 次降为 32 次；wide 场景为
+1 entry × 32,768 rows，由 2 次降为 1 次。reset 仍是每事务 discard 至多 256
+entries；257-entry 场景两次提交，wide reset 一次提交，算法没有改变。
+
+```bash
+DOGPADDLE_PERF_PROFILE=reference \
+  DOGPADDLE_PERF_ROOT=/absolute/path/to/results \
+  cargo bench --locked -p dogpaddle-operation --bench cdc_bootstrap
+```
+
+Apple M5、aarch64 macOS/Darwin 25.6、APFS、Rust 1.96.0，release build；每场景
+10 samples、20 ms warmup、5 秒目标 measurement，前后顺序执行全套八个场景。
+两轮测量期间没有并发构建、容器验收或 worktree 归档；MySQL VM 在测量前已停止。
+baseline 是干净的 `e97f63bcea927df1f735e40a4bbd48767f0e2ed8`，candidate 是同一
+基线加本次单 Queue diff，测量时未提交。workload、schema-bound entry 编码和
+结果 oracle 相同；恢复后的终态分别为 Streaming 和空 Sealed，后者直到首份
+成功的 streaming record 才写入 Streaming。
+
+原始 context、samples、estimates 与日志保存在
+`/tmp/dogpaddle-sealed-source-performance/before`、`after` 及同级日志；run 目录
+分别为 `dogpaddle-cdc-bootstrap-run-mWyji0` 和 `dogpaddle-cdc-bootstrap-run-yVT2ua`。
+下表是整轮中位数，单位 µs；变化为 candidate / baseline - 1。
+
+| 场景 | baseline | candidate | 变化 |
+| --- | ---: | ---: | ---: |
+| postgres / publish | 2404.395 | 1042.125 | -56.7% |
+| postgres / publish_wide | 361.173 | 99.575 | -72.4% |
+| postgres / reset | 421.516 | 408.106 | -3.2% |
+| postgres / reset_wide | 61.093 | 55.226 | -9.6% |
+| mysql / publish | 2533.787 | 1043.424 | -58.8% |
+| mysql / publish_wide | 328.245 | 102.023 | -68.9% |
+| mysql / reset | 420.982 | 411.250 | -2.3% |
+| mysql / reset_wide | 67.842 | 56.532 | -16.7% |
+
+publication 中位数的 95% bootstrap CI，单位 µs：
+
+| 场景 | baseline CI | candidate CI |
+| --- | ---: | ---: |
+| postgres / publish | [2338.506, 2560.304] | [1016.677, 1063.768] |
+| postgres / publish_wide | [336.104, 392.222] | [95.185, 108.625] |
+| mysql / publish | [2441.670, 2701.947] | [1024.758, 1092.433] |
+| mysql / publish_wide | [325.856, 343.999] | [97.247, 110.177] |
+
+本次八个场景未见耗时回归；reset 变化仍应结合样本与恢复读取成本理解，不能从
+未变的删除算法推出普遍 reset 提速。这里没有直接测量 WAL、总磁盘、heap 或 RSS，
+也未测量新增 phase 控制读写对常规 streaming 吞吐的影响。
+
+新增私有行为证据覆盖封口事务回滚、restore 前的持久可见性、隐藏 input 消费拒绝、
+大于 64 MiB 的 Sealed backlog、data/heartbeat 背压零写、首份 Streaming phase
+与 checkpoint 回滚、较小 bootstrap 配额下的 Streaming restore，以及提前启动
+源失败不改 input。真实 PostgreSQL CDC/SQL 与 MySQL CDC gate 均通过，包括
+terminal commit-before-ACK、消费者回滚、部分快照 reset 和重开的有序后继事件；
+MySQL 还证明已封口 input 无需 poll/record 即可在一次消费者事务中提交。
+
+三个独立 Agent 分别复审了完整 diff 的抽象、恢复/事务与性能/资源风险；确认的问题
+已修复，并通过 `cargo xtask check` 与 `cargo build --workspace --locked`。
+唯一 input resource 是开发期 v1 layout 变化，受影响状态必须重建。提前 poll
+streaming 可能更早遇到源错误并 fail-stop，原封口 input/checkpoint 保留；
+具体恢复与容量边界见 [CDC 契约](docs/cdc.md)。

@@ -17,8 +17,7 @@ pub(super) const CONNECTOR_CLASS: &str = "io.debezium.connector.mysql.MySqlConne
 const MAX_DEFINITION_BYTES: usize = 1024 * 1024;
 pub(super) const PHASE: &str = "mysql_cdc_scan.phase";
 pub(super) const CHECKPOINT: &str = "mysql_cdc_scan.checkpoint";
-pub(super) const PUBLISHED: &str = "mysql_cdc_scan.published";
-pub(super) const BOOTSTRAP_SPOOL: &str = "mysql_cdc_scan.bootstrap_spool";
+pub(super) const INPUT: &str = "mysql_cdc_scan.input";
 
 /// Non-sensitive identity and ordered logical columns discovered before building a Flow.
 ///
@@ -48,8 +47,9 @@ pub struct MySqlCdcScanSpec {
 /// Credentials and runtime bundle paths are supplied separately through
 /// [`super::MySqlCdcScanConfig`]. Build and open perform no `MySQL` or JVM I/O. On its
 /// first advance the Scan captures a consistent full table snapshot into its
-/// private durable spool, publishes that spool, and then continues from the
-/// snapshot's sealed checkpoint. No source-write gate is required. Online
+/// durable input queue and makes that input visible when sealed. Streaming
+/// resumes from the sealed checkpoint while Flow consumes that input, with
+/// streaming capture bounded by its queue capacity. No source-write gate is required. Online
 /// Schema evolution is not supported.
 #[derive(Clone, Debug, Serialize)]
 pub struct MySqlCdcScanDefinition {
@@ -59,12 +59,12 @@ pub struct MySqlCdcScanDefinition {
 }
 
 impl MySqlCdcScanDefinition {
-    /// Freezes a discovered source and its private bootstrap spool capacity.
+    /// Freezes a discovered source and the input queue's bootstrap capacity.
     ///
     /// The capacity is an exact logical retained-byte ceiling: each Change
     /// contributes its actual schema-bound encoded-entry length plus the
     /// queue's private eight-byte sequence key. It must hold the complete
-    /// initial snapshot until publication.
+    /// initial snapshot until it is sealed and becomes visible.
     ///
     /// # Errors
     ///
@@ -90,7 +90,7 @@ impl MySqlCdcScanDefinition {
     /// `output_projection` contains strictly increasing zero-based indexes into
     /// the complete ordered [`MySqlCdcScanSpec::columns`]. An empty projection
     /// preserves row counts and differences without retaining source columns in
-    /// the bootstrap spool or public output.
+    /// the input queue or public output.
     ///
     /// The complete source Schema remains in the specification and is still
     /// validated against every Debezium envelope and row image.
@@ -133,7 +133,7 @@ impl MySqlCdcScanDefinition {
         &self.output_projection
     }
 
-    /// Returns the exact logical retained-byte limit of the bootstrap spool.
+    /// Returns the input queue's bootstrap capacity in logical bytes.
     #[must_use]
     pub const fn bootstrap_spool_bytes(&self) -> NonZeroU64 {
         self.bootstrap_spool_bytes
@@ -157,16 +157,14 @@ impl MySqlCdcScanDefinition {
         let output = output_schema(&self.spec, &self.output_projection).map_err(schema_error)?;
         let phase = scope.data::<Cell<u32>>(PHASE)?;
         let checkpoint = scope.data::<Cell<Vec<u8>>>(CHECKPOINT)?;
-        let spool = scope.data::<Queue<Vec<u8>>>(BOOTSTRAP_SPOOL)?;
-        let published = scope.data::<Queue<Vec<u8>>>(PUBLISHED)?;
+        let input = scope.data::<Queue<Vec<u8>>>(INPUT)?;
         let config = resource.take::<MySqlCdcScanConfig>()?;
         let operation = MySqlCdcScanOperation::new_bound(
             self,
             Arc::clone(&output),
             phase,
             checkpoint,
-            spool,
-            published,
+            input,
             config,
         )
         .map_err(schema_error)?;

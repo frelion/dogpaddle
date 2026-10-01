@@ -18,8 +18,7 @@ pub(crate) const TAG: u16 = 11;
 const MAX_DEFINITION_BYTES: usize = 1024 * 1024;
 pub(super) const PHASE: &str = "postgres_cdc_scan.phase";
 pub(super) const CHECKPOINT: &str = "postgres_cdc_scan.checkpoint";
-pub(super) const PUBLISHED: &str = "postgres_cdc_scan.published";
-pub(super) const BOOTSTRAP_SPOOL: &str = "postgres_cdc_scan.bootstrap_spool";
+pub(super) const INPUT: &str = "postgres_cdc_scan.input";
 
 /// Non-sensitive identity and ordered logical columns discovered before building a Flow.
 ///
@@ -58,9 +57,9 @@ pub struct PostgresCdcScanSpec {
 /// Credentials and runtime bundle paths are supplied separately through
 /// [`super::PostgresCdcScanConfig`]. Construction, binding, build, and open perform no
 /// `PostgreSQL` or JVM I/O. Online Schema evolution is not supported. The
-/// initial snapshot remains private until it is complete, then drains through
-/// the ordinary Flow output before WAL streaming resumes from the snapshot's
-/// sealed checkpoint.
+/// initial snapshot remains private until sealed, then becomes visible in the
+/// input queue. WAL streaming resumes from the sealed checkpoint while Flow
+/// consumes that input, with streaming capture bounded by its queue capacity.
 #[derive(Clone, Debug, Serialize)]
 pub struct PostgresCdcScanDefinition {
     spec: PostgresCdcScanSpec,
@@ -75,10 +74,10 @@ impl PostgresCdcScanDefinition {
     /// constructing a Flow. Runtime checks also protect manually supplied specs.
     ///
     /// `bootstrap_spool_bytes` is the maximum logical bytes retained by the
-    /// private initial-snapshot spool. Each Change contributes its actual
+    /// input queue during bootstrap. Each Change contributes its actual
     /// schema-bound encoded-entry length plus the queue's private eight-byte
     /// sequence key. It must hold the complete snapshot plus WAL changes
-    /// observed before snapshot publication finishes.
+    /// observed before the snapshot is sealed and becomes visible.
     ///
     /// # Errors
     ///
@@ -103,7 +102,7 @@ impl PostgresCdcScanDefinition {
     /// `output_projection` contains strictly increasing zero-based indexes into
     /// the complete ordered [`PostgresCdcScanSpec::columns`]. An empty
     /// projection preserves row counts and differences without retaining any
-    /// source column in the bootstrap spool or public output.
+    /// source column in the input queue or public output.
     ///
     /// The complete source Schema remains in the specification and is still
     /// validated against every Debezium envelope and row image.
@@ -146,7 +145,7 @@ impl PostgresCdcScanDefinition {
         &self.output_projection
     }
 
-    /// Returns the private initial-snapshot spool capacity in logical bytes.
+    /// Returns the input queue's bootstrap capacity in logical bytes.
     #[must_use]
     pub const fn bootstrap_spool_bytes(&self) -> NonZeroU64 {
         self.bootstrap_spool_bytes
@@ -170,16 +169,14 @@ impl PostgresCdcScanDefinition {
         let output = output_schema(&self.spec, &self.output_projection).map_err(schema_error)?;
         let phase = scope.data::<Cell<u32>>(PHASE)?;
         let checkpoint = scope.data::<Cell<Vec<u8>>>(CHECKPOINT)?;
-        let spool = scope.data::<Queue<Vec<u8>>>(BOOTSTRAP_SPOOL)?;
-        let published = scope.data::<Queue<Vec<u8>>>(PUBLISHED)?;
+        let input = scope.data::<Queue<Vec<u8>>>(INPUT)?;
         let config = resource.take::<PostgresCdcScanConfig>()?;
         let operation = PostgresCdcScanOperation::new_bound(
             self,
             Arc::clone(&output),
             phase,
             checkpoint,
-            spool,
-            published,
+            input,
             config,
         )
         .map_err(schema_error)?;

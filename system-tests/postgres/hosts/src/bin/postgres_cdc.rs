@@ -138,6 +138,7 @@ impl Runner {
             (
                 Self::Direct(scan),
                 "advance"
+                | "consume"
                 | "rollback"
                 | "crash-before-ack"
                 | "crash-partial-capture"
@@ -271,7 +272,11 @@ impl DirectScan {
         };
         source.restore(self.reads.begin().access())?;
         let before = self.checkpoint.read(self.reads.begin().access())?.get()?;
-        let mut delivery = source.poll()?;
+        let mut delivery = if command == "consume" {
+            None
+        } else {
+            source.poll()?
+        };
         let mut commits = 0;
         if let Some(delivery) = delivery.as_mut() {
             let transaction = self.transactions.begin();

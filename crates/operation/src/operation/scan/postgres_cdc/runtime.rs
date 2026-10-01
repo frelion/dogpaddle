@@ -22,8 +22,7 @@ impl PostgresCdcScanOperation {
         output_schema: SchemaRef,
         phase_cell: Cell<u32>,
         checkpoint: Cell<Vec<u8>>,
-        bootstrap_spool: Queue<Vec<u8>>,
-        published: Queue<Vec<u8>>,
+        input: Queue<Vec<u8>>,
         config: PostgresCdcScanConfig,
     ) -> Result<Self, dogpaddle_change::CodecError> {
         Self::new(
@@ -35,8 +34,7 @@ impl PostgresCdcScanOperation {
             output_schema,
             phase_cell,
             checkpoint,
-            bootstrap_spool,
-            published,
+            input,
             definition.bootstrap_spool_bytes(),
         )
     }
@@ -102,10 +100,10 @@ impl Source for PostgresSource {
         &self,
         phase: Phase,
         bytes: Option<Vec<u8>>,
-        _spool_empty: bool,
+        _input_empty: bool,
     ) -> Result<Option<Checkpoint>, OperationError> {
         match phase {
-            Phase::Publishing | Phase::Streaming => Ok(Some(parse_checkpoint(
+            Phase::Sealed | Phase::Streaming => Ok(Some(parse_checkpoint(
                 bytes.ok_or(PostgresCdcScanError::InvalidState(
                     "sealed CDC scan has no checkpoint",
                 ))?,

@@ -129,8 +129,8 @@ fn postgres_cdc_scan_build_and_open_need_neither_postgres_nor_jvm() {
     let checkpoint: dogpaddle_store::Cell<Vec<u8>> = store
         .open_data("operation/00000000/postgres_cdc_scan.checkpoint")
         .unwrap();
-    let spool: dogpaddle_store::Queue<Vec<u8>> = store
-        .open_data("operation/00000000/postgres_cdc_scan.bootstrap_spool")
+    let input: dogpaddle_store::Queue<Vec<u8>> = store
+        .open_data("operation/00000000/postgres_cdc_scan.input")
         .unwrap();
     {
         let transaction = store.read_transaction();
@@ -165,7 +165,7 @@ fn postgres_cdc_scan_build_and_open_need_neither_postgres_nor_jvm() {
     let mut transactions = store.into_transactions();
     let transaction = transactions.begin();
     assert!(
-        spool
+        input
             .access(transaction.access())
             .unwrap()
             .is_empty()

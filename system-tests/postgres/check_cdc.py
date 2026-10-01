@@ -263,7 +263,7 @@ class Fixture:
         with self.host("direct", table, 2) as host:
             if host.request("read") != {"kind": "rows", "rows": [],
                                         "checkpoint_present": True}:
-                raise RuntimeError("sealed initial snapshot became public before Publishing")
+                raise RuntimeError("sealed initial snapshot was consumed without a consumer transaction")
             until("published front consumer rollback", lambda: rejected_delivery(host, "rollback"))
             if host.request("read")["rows"]:
                 raise RuntimeError("rolled-back consumer emitted durable output")

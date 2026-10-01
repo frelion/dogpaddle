@@ -221,11 +221,14 @@ class Host:
         return self.receive()
 
 
-def assert_rows(host: Host, expected: list[list[Any]], *, phase: int,
-                spool_nonempty: bool = False) -> None:
+def assert_rows(host: Host, expected: list[list[Any]], *, phase: int | tuple[int, ...],
+                input_nonempty: bool = False) -> None:
     result = host.request("read")
+    phases = (phase,) if isinstance(phase, int) else phase
+    if result.get("phase") not in phases:
+        raise RuntimeError(f"unexpected durable scan phase: {result!r}")
     wanted = {"kind": "rows", "rows": expected, "checkpoint_present": True,
-              "phase": phase, "spool_nonempty": spool_nonempty}
+              "phase": result["phase"], "input_nonempty": input_nonempty}
     if result != wanted:
         raise RuntimeError(f"unexpected durable scan rows/phase: {result!r}")
 
@@ -262,18 +265,18 @@ def gate(container: Container, binary: Path, root: Path, bundle: Path) -> None:
             raise RuntimeError("terminal capture did not exit at the pre-ACK boundary (76)")
 
     with Host(binary, root, bundle, container.port, container.password, 2) as host:
-        assert_rows(host, [], phase=2, spool_nonempty=True)
-        def publish() -> bool:
-            response = host.request("advance")
+        assert_rows(host, [], phase=2, input_nonempty=True)
+        def consume_sealed() -> bool:
+            response = host.request("consume")
             if response.get("output"):
                 if response != {"kind": "advance", "output": True,
-                                "checkpoint_present": True, "commits": 2}:
-                    raise RuntimeError(f"snapshot publication and consumption were not durable: {response}")
+                                "checkpoint_present": True, "commits": 1}:
+                    raise RuntimeError(f"sealed input was not consumed in one transaction: {response}")
                 return True
             return False
 
-        until("private snapshot spool publishes one initial row", publish)
-        assert_rows(host, INITIAL, phase=3)
+        until("sealed snapshot input is consumed once", consume_sealed)
+        assert_rows(host, INITIAL, phase=2)
         # Update produces [-1 old, +1 new] and INSERT follows in this transaction.
         container.sql(f"START TRANSACTION; UPDATE {DATABASE}.{TABLE} "
                       "SET tx_seq=11,payload='updated' WHERE id=10; "
@@ -286,7 +289,7 @@ def gate(container: Container, binary: Path, root: Path, bundle: Path) -> None:
                     raise RuntimeError("streaming output committed without the requested pre-ACK crash")
                 if response.get("kind") not in ("idle", "advance"):
                     raise RuntimeError(f"unexpected streaming response: {response}")
-                assert_rows(host, INITIAL, phase=3)
+                assert_rows(host, INITIAL, phase=(2, 3))
                 return False
             if response != {"kind": "durable-before-ack", "output": True,
                             "checkpoint_present": True, "commits": 2}:
@@ -302,7 +305,7 @@ def gate(container: Container, binary: Path, root: Path, bundle: Path) -> None:
         prefix = state.get("rows")
         expected = INITIAL + STREAMING
         if (state.get("kind") != "rows" or state.get("phase") != 3
-                or not state.get("checkpoint_present") or state.get("spool_nonempty")
+                or not state.get("checkpoint_present") or state.get("input_nonempty")
                 or not isinstance(prefix, list) or not 1 < len(prefix) <= len(expected)
                 or prefix != expected[:len(prefix)]):
             raise RuntimeError(f"streaming pre-ACK prefix is not durable and ordered: {state}")
@@ -319,7 +322,7 @@ def gate(container: Container, binary: Path, root: Path, bundle: Path) -> None:
             state = host.request("read")
             rows = state.get("rows")
             if (state.get("kind") != "rows" or state.get("phase") != 3
-                    or state.get("spool_nonempty") or not state.get("checkpoint_present")
+                    or state.get("input_nonempty") or not state.get("checkpoint_present")
                     or not isinstance(rows, list) or rows != expected[:len(rows)]):
                 raise RuntimeError(f"CDC restart duplicated, reordered or skipped an event: {state}")
             return rows == expected
@@ -327,7 +330,7 @@ def gate(container: Container, binary: Path, root: Path, bundle: Path) -> None:
         until("streaming replay and successor follow without missing or duplicate rows",
               replay_and_follow)
         assert_rows(host, expected, phase=3)
-    print("PASS MySQL snapshot private spool, terminal pre-ACK recovery, "
+    print("PASS MySQL sealed snapshot input, terminal pre-ACK recovery, "
           "streaming pre-ACK UPDATE/INSERT replay and successor")
 
 

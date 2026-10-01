@@ -1,4 +1,4 @@
-//! CDC spool publication and reset, including synchronous commits but no external I/O.
+//! CDC sealed input consumption and reset, including synchronous commits but no external I/O.
 use std::{
     num::NonZeroU64,
     sync::Arc,
@@ -103,7 +103,7 @@ struct Fixture {
     reads: ReadTransactions,
     phase: Cell<u32>,
     checkpoint: Cell<Vec<u8>>,
-    spool: Queue<Vec<u8>>,
+    input: Queue<Vec<u8>>,
     expected: Vec<Change>,
     expected_checkpoint: Vec<u8>,
     _root: TempDir,
@@ -129,9 +129,7 @@ impl Fixture {
         let prefix = format!("operation/{}_cdc_scan", source.name());
         let phase: Cell<u32> = store.open_data(&format!("{prefix}.phase")).unwrap();
         let checkpoint: Cell<Vec<u8>> = store.open_data(&format!("{prefix}.checkpoint")).unwrap();
-        let spool: Queue<Vec<u8>> = store
-            .open_data(&format!("{prefix}.bootstrap_spool"))
-            .unwrap();
+        let input: Queue<Vec<u8>> = store.open_data(&format!("{prefix}.input")).unwrap();
         let (operation, _) = definition
             .construct(
                 &[],
@@ -173,7 +171,7 @@ impl Fixture {
                 .unwrap();
             for change in &expected {
                 assert!(
-                    spool
+                    input
                         .access(access)
                         .unwrap()
                         .try_push(
@@ -193,7 +191,7 @@ impl Fixture {
             reads,
             phase,
             checkpoint,
-            spool,
+            input,
             expected,
             expected_checkpoint: source.checkpoint(),
             _root: sample,
@@ -213,13 +211,13 @@ impl Fixture {
         };
         source.restore(self.reads.begin().access()).unwrap();
         for _ in 0..work_turns {
-            let mut delivery = source.poll().unwrap().expect("bootstrap work");
-            {
+            if reset {
+                let mut delivery = source.poll().unwrap().expect("reset work");
                 let txn = self.transactions.begin();
                 assert!(source.record(txn.access(), &mut delivery).unwrap());
                 txn.commit().unwrap();
+                source.ack(delivery).unwrap();
             }
-            source.ack(delivery).unwrap();
             let published = source.published(self.reads.begin().access()).unwrap();
             outputs.push(published.map(|encoded| self.codec.decode_owned(encoded).unwrap()));
             if outputs.last().unwrap().is_some() {
@@ -240,10 +238,10 @@ impl Fixture {
         }
         let transaction = self.transactions.begin();
         let access = transaction.access();
-        assert!(self.spool.access(access).unwrap().is_empty().unwrap());
+        assert!(self.input.access(access).unwrap().is_empty().unwrap());
         assert_eq!(
             self.phase.access(access).unwrap().get().unwrap(),
-            if reset { None } else { Some(3) }
+            if reset { None } else { Some(2) }
         );
         let checkpoint = self.checkpoint.access(access).unwrap().get().unwrap();
         assert_eq!(
@@ -274,19 +272,19 @@ fn main() {
     std::fs::write(root.path().join("context.json"), serde_json::to_vec_pretty(&json!({
         "benchmark": "cdc_bootstrap", "profile": profile,
         "host": HostEnvironment::collect(Some(root.filesystem_root())),
-        "spool_entry_format": "schema-bound Change entry without a repeated Arrow Schema",
+        "input_entry_format": "schema-bound Change entry without a repeated Arrow Schema",
         "reset_batch_entries": RESET_BATCH_ENTRIES,
         "publish_entries": publish_entries, "publish_rows_per_entry": publish_rows,
         "reset_entries": BATCHED_RESET_ENTRIES, "reset_rows_per_entry": RESET_ROWS_PER_ENTRY,
         "wide_entries": 1, "wide_rows_per_entry": wide_rows_per_entry,
-        "restore_calls_per_iteration": 1, "publish_sync_commits_per_iteration": 2 * publish_entries,
+        "restore_calls_per_iteration": 1, "publish_sync_commits_per_iteration": publish_entries,
         "reset_batches_per_iteration": reset_batches, "reset_sync_commits_per_iteration": reset_batches,
-        "wide_publish_sync_commits": 2,
+        "wide_publish_sync_commits": 1,
         "wide_reset_sync_commits": 1,
         "cases": ["postgres/publish", "postgres/reset", "postgres/publish_wide", "postgres/reset_wide", "mysql/publish", "mysql/reset", "mysql/publish_wide", "mysql/reset_wide"],
-        "timed_boundary": "one read-only restore; each publish entry records and synchronously commits, ACKs maintenance, reads/decodes published front, then consumes with a second synchronous commit; each reset batch records, synchronously commits and ACKs maintenance; output Changes retained for untimed validation",
+        "timed_boundary": "one read-only restore; each sealed entry reads/decodes input front and consumes with one synchronous commit; no payload transfer or publication transaction; each reset batch records, synchronously commits and ACKs maintenance; output Changes retained for untimed validation",
         "untimed": "Definition decoding, construction, Store creation/open, fixture encoding/seed, output and durable-state oracle, teardown",
-        "external_io": "none; stops at Streaming or Fresh before connector start",
+        "external_io": "none; stops with an empty Sealed input or Fresh before connector start",
         "limitations": "does not measure capture, connector polling, real Delivery ACK, source cleanup, or Flow computation/routing"
     })).unwrap()).unwrap();
     println!("cdc_bootstrap artifacts: {}", root.path().display());

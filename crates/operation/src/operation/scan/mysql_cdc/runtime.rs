@@ -22,8 +22,7 @@ impl MySqlCdcScanOperation {
         output_schema: SchemaRef,
         phase_cell: Cell<u32>,
         checkpoint: Cell<Vec<u8>>,
-        bootstrap_spool: Queue<Vec<u8>>,
-        published: Queue<Vec<u8>>,
+        input: Queue<Vec<u8>>,
         config: MySqlCdcScanConfig,
     ) -> Result<Self, dogpaddle_change::CodecError> {
         Self::new(
@@ -35,8 +34,7 @@ impl MySqlCdcScanOperation {
             output_schema,
             phase_cell,
             checkpoint,
-            bootstrap_spool,
-            published,
+            input,
             definition.bootstrap_spool_bytes(),
         )
     }
@@ -101,7 +99,7 @@ impl Source for MySqlSource {
         &self,
         phase: Phase,
         bytes: Option<Vec<u8>>,
-        spool_empty: bool,
+        input_empty: bool,
     ) -> Result<Option<Checkpoint>, OperationError> {
         let checkpoint = bytes
             .map(Checkpoint::from_bytes)
@@ -115,12 +113,12 @@ impl Source for MySqlSource {
             )
             .into());
         }
-        if matches!(phase, Phase::Publishing | Phase::Streaming) && checkpoint.is_none() {
+        if matches!(phase, Phase::Sealed | Phase::Streaming) && checkpoint.is_none() {
             return Err(
                 MySqlCdcScanError::InvalidState("sealed CDC scan has no checkpoint").into(),
             );
         }
-        if phase == Phase::Resetting && checkpoint.is_none() && !spool_empty {
+        if phase == Phase::Resetting && checkpoint.is_none() && !input_empty {
             return Err(MySqlCdcScanError::InvalidState(
                 "partial bootstrap spool has no checkpoint",
             )

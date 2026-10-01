@@ -1,4 +1,4 @@
-//! Source-owned sealed bootstrap and durable published input queue.
+//! Source-owned input queue, hidden until bootstrap is durably sealed.
 use crate::operation::{OperationError, SourceOperation};
 use arrow_schema::SchemaRef;
 use dogpaddle_change::{Change, CodecError, SchemaBoundChangeCodec};
@@ -6,9 +6,9 @@ use dogpaddle_debezium::{Checkpoint, Connector, Delivery, Record};
 use dogpaddle_store::{Cell, Queue, ReadTransactionAccess, TransactionAccess};
 use std::{num::NonZeroU64, time::Duration};
 const MAX_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
-const PUBLISHED_BYTES: u64 = 64 * 1024 * 1024;
+const STREAMING_BYTES: u64 = 64 * 1024 * 1024;
 const CAPTURING: u32 = 1;
-const PUBLISHING: u32 = 2;
+const SEALED: u32 = 2;
 const STREAMING: u32 = 3;
 const RESETTING: u32 = 4;
 const RESET_BATCH_ENTRIES: usize = 256;
@@ -19,7 +19,7 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 pub(super) enum Phase {
     Fresh,
     Capturing,
-    Publishing,
+    Sealed,
     Streaming,
     Resetting,
 }
@@ -29,7 +29,7 @@ impl Phase {
         match value {
             None => Ok(Self::Fresh),
             Some(CAPTURING) => Ok(Self::Capturing),
-            Some(PUBLISHING) => Ok(Self::Publishing),
+            Some(SEALED) => Ok(Self::Sealed),
             Some(STREAMING) => Ok(Self::Streaming),
             Some(RESETTING) => Ok(Self::Resetting),
             Some(_) => Err(B::invalid_state("CDC scan phase is invalid")),
@@ -44,7 +44,6 @@ pub(super) enum NextStep {
     Capture,
     PrepareReset,
     Reset,
-    Publish,
     Stream,
 }
 
@@ -81,7 +80,7 @@ pub(super) trait Source: Send + 'static {
         &self,
         phase: Phase,
         bytes: Option<Vec<u8>>,
-        spool_empty: bool,
+        input_empty: bool,
     ) -> Result<Option<Checkpoint>, OperationError>;
     fn invalid_state(message: &'static str) -> OperationError;
     fn runtime_error(message: String) -> OperationError;
@@ -97,7 +96,6 @@ pub struct SourceDelivery {
 pub(crate) enum DeliveryKind {
     BeginCapture,
     Reset,
-    Publish,
     Cdc {
         delivery: Delivery,
         encoded: Option<Vec<u8>>,
@@ -131,8 +129,7 @@ pub(super) struct CdcRuntime<B: Source> {
     pub(super) codec: SchemaBoundChangeCodec,
     phase_cell: Cell<u32>,
     checkpoint: Cell<Vec<u8>>,
-    spool: Queue<Vec<u8>>,
-    published: Queue<Vec<u8>>,
+    input: Queue<Vec<u8>>,
     capacity: NonZeroU64,
     pub(super) next_step: NextStep,
     resume: Option<Checkpoint>,
@@ -146,8 +143,7 @@ impl<B: Source> CdcRuntime<B> {
         output_schema: SchemaRef,
         phase_cell: Cell<u32>,
         checkpoint: Cell<Vec<u8>>,
-        spool: Queue<Vec<u8>>,
-        published: Queue<Vec<u8>>,
+        input: Queue<Vec<u8>>,
         capacity: NonZeroU64,
     ) -> Result<Self, CodecError> {
         Ok(Self {
@@ -155,8 +151,7 @@ impl<B: Source> CdcRuntime<B> {
             codec: SchemaBoundChangeCodec::try_new(output_schema)?,
             phase_cell,
             checkpoint,
-            spool,
-            published,
+            input,
             capacity,
             next_step: NextStep::Restore,
             resume: None,
@@ -173,6 +168,41 @@ impl<B: Source> CdcRuntime<B> {
         }
         self.connector = None;
         Ok(())
+    }
+    fn record_capture(
+        &self,
+        access: TransactionAccess<'_>,
+        encoded: Option<&Vec<u8>>,
+        checkpoint: &[u8],
+        sealed: bool,
+        streaming: bool,
+    ) -> Result<bool, OperationError> {
+        let mut input = self.input.access(access)?;
+        let capacity = if streaming {
+            // try_push checks data against this bound. A heartbeat also must
+            // wait before advancing its checkpoint or phase.
+            if encoded.is_none() && input.queued_bytes()? > STREAMING_BYTES {
+                return Ok(false);
+            }
+            NonZeroU64::new(STREAMING_BYTES).expect("nonzero capacity")
+        } else {
+            self.capacity
+        };
+        if let Some(encoded) = encoded
+            && !input.try_push(encoded, capacity)?
+        {
+            if streaming {
+                return Ok(false);
+            }
+            return Err(B::spool_full());
+        }
+        self.checkpoint.access(access)?.set(&checkpoint.to_vec())?;
+        if streaming {
+            self.phase_cell.access(access)?.set(&STREAMING)?;
+        } else if sealed {
+            self.phase_cell.access(access)?.set(&SEALED)?;
+        }
+        Ok(true)
     }
     fn poll_delivery(&mut self, streaming: bool) -> Result<Option<SourceDelivery>, OperationError> {
         if self.connector.is_none() {
@@ -260,15 +290,17 @@ impl<B: Source> SourceOperation for CdcRuntime<B> {
             .checkpoint
             .read(access)?
             .get_bounded(MAX_CAPTURE_BYTES)?;
-        let spool = self.spool.read(access)?;
-        if spool.queued_bytes()? > self.capacity.get()
-            || self.published.read(access)?.queued_bytes()? > PUBLISHED_BYTES
-        {
+        let input = self.input.read(access)?;
+        let capacity = if phase == Phase::Streaming {
+            STREAMING_BYTES
+        } else {
+            self.capacity.get()
+        };
+        if input.queued_bytes()? > capacity {
             return Err(B::invalid_state("source queue accounting exceeds capacity"));
         }
-        let empty = spool.is_empty()?;
+        let empty = input.is_empty()?;
         if (phase == Phase::Fresh && (checkpoint.is_some() || !empty))
-            || (phase == Phase::Streaming && !empty)
             || (phase == Phase::Capturing && !empty && checkpoint.is_none())
         {
             return Err(B::invalid_state("CDC phase and bootstrap data disagree"));
@@ -278,8 +310,7 @@ impl<B: Source> SourceOperation for CdcRuntime<B> {
             Phase::Fresh => NextStep::BeginCapture,
             Phase::Capturing => NextStep::PrepareReset,
             Phase::Resetting => NextStep::Reset,
-            Phase::Publishing => NextStep::Publish,
-            Phase::Streaming => NextStep::Stream,
+            Phase::Sealed | Phase::Streaming => NextStep::Stream,
         };
         Ok(())
     }
@@ -297,10 +328,6 @@ impl<B: Source> SourceOperation for CdcRuntime<B> {
                 DeliveryKind::Reset
             }
             NextStep::Reset => DeliveryKind::Reset,
-            NextStep::Publish => {
-                self.stop_connector("snapshot")?;
-                DeliveryKind::Publish
-            }
             NextStep::Capture => return self.poll_delivery(false),
             NextStep::Stream => return self.poll_delivery(true),
         };
@@ -319,33 +346,12 @@ impl<B: Source> SourceOperation for CdcRuntime<B> {
             DeliveryKind::Reset => {
                 self.phase_cell.access(access)?.set(&RESETTING)?;
                 capture.finished = self
-                    .spool
+                    .input
                     .access(access)?
                     .discard_front(RESET_BATCH_ENTRIES)?;
                 if capture.finished {
                     self.checkpoint.access(access)?.clear()?;
                     self.phase_cell.access(access)?.clear()?;
-                }
-            }
-            DeliveryKind::Publish => {
-                // Pop and publish are one transaction. Capacity rejection requires rollback.
-                if let Some((encoded, empty_after)) = self
-                    .spool
-                    .access(access)?
-                    .pop_front_bounded(8 * 1024 * 1024)?
-                {
-                    if !self.published.access(access)?.try_push(
-                        &encoded,
-                        NonZeroU64::new(PUBLISHED_BYTES).expect("nonzero capacity"),
-                    )? {
-                        return Ok(false);
-                    }
-                    capture.finished = empty_after;
-                } else {
-                    capture.finished = true;
-                }
-                if capture.finished {
-                    self.phase_cell.access(access)?.set(&STREAMING)?;
                 }
             }
             DeliveryKind::Cdc {
@@ -354,28 +360,13 @@ impl<B: Source> SourceOperation for CdcRuntime<B> {
                 sealed,
                 streaming,
             } => {
-                if let Some(encoded) = encoded {
-                    if *streaming {
-                        if !self.published.access(access)?.try_push(
-                            encoded,
-                            NonZeroU64::new(PUBLISHED_BYTES).expect("nonzero capacity"),
-                        )? {
-                            return Ok(false);
-                        }
-                    } else if !self
-                        .spool
-                        .access(access)?
-                        .try_push(encoded, self.capacity)?
-                    {
-                        return Err(B::spool_full());
-                    }
-                }
-                self.checkpoint
-                    .access(access)?
-                    .set(&delivery.checkpoint().as_bytes().to_vec())?;
-                if *sealed {
-                    self.phase_cell.access(access)?.set(&PUBLISHING)?;
-                }
+                return self.record_capture(
+                    access,
+                    encoded.as_ref(),
+                    delivery.checkpoint().as_bytes(),
+                    *sealed,
+                    *streaming,
+                );
             }
             DeliveryKind::Sequence { .. } => {
                 return Err(B::invalid_state("sequence delivery supplied to CDC source"));
@@ -398,11 +389,6 @@ impl<B: Source> SourceOperation for CdcRuntime<B> {
                 self.resume = None;
                 self.progress = B::Progress::default();
             }
-            DeliveryKind::Publish => {
-                if capture.finished {
-                    self.next_step = NextStep::Stream;
-                }
-            }
             DeliveryKind::Cdc {
                 delivery,
                 sealed,
@@ -419,7 +405,8 @@ impl<B: Source> SourceOperation for CdcRuntime<B> {
                     })?;
                 self.resume = Some(resumed);
                 if sealed {
-                    self.next_step = NextStep::Publish;
+                    self.stop_connector("snapshot")?;
+                    self.next_step = NextStep::Stream;
                 } else if !streaming {
                     self.progress = self
                         .pending_progress
@@ -437,13 +424,18 @@ impl<B: Source> SourceOperation for CdcRuntime<B> {
         &self,
         access: ReadTransactionAccess<'_>,
     ) -> Result<Option<Vec<u8>>, OperationError> {
-        Ok(self
-            .published
-            .read(access)?
-            .front_bounded(8 * 1024 * 1024)?)
+        let phase = Phase::decode::<B>(self.phase_cell.read(access)?.get_bounded(4)?)?;
+        if !matches!(phase, Phase::Sealed | Phase::Streaming) {
+            return Ok(None);
+        }
+        Ok(self.input.read(access)?.front_bounded(MAX_CAPTURE_BYTES)?)
     }
     fn consume_published(&self, access: TransactionAccess<'_>) -> Result<(), OperationError> {
-        self.published.access(access)?.discard_front(1)?;
+        let phase = Phase::decode::<B>(self.phase_cell.access(access)?.get_bounded(4)?)?;
+        if !matches!(phase, Phase::Sealed | Phase::Streaming) {
+            return Err(B::invalid_state("unsealed source input cannot be consumed"));
+        }
+        self.input.access(access)?.discard_front(1)?;
         Ok(())
     }
 }

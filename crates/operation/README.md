@@ -127,7 +127,7 @@ nearest、tolerance、多 order、residual、tie-break、NotDistinct、canonical
 
 ## Source 与 Sink 外部边界
 
-Source 拥有 published queue、bootstrap spool、checkpoint 和真实 Delivery 的 ACK。
+Source 拥有一条 input Queue、phase、checkpoint 和真实 Delivery 的 ACK。快照封口前隐藏，封口后在原地可消费，不把 payload 搬到第二条队列。
 `published` 只读返回 schema-bound front bytes；调用方用 exact Schema 解码，完成全部页和下游调用后以 `consume_published` 同事务删除前项。捕获只追加，不随 consumer 进度延迟 ACK。
 捕获、恢复、容量及 `PostgreSQL` / `MySQL` 差异由 [CDC 契约](docs/cdc.md) 规定。
 

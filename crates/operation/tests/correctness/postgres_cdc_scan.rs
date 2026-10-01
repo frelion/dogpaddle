@@ -95,7 +95,7 @@ fn postgres_cdc_definition_has_a_canonical_non_secret_tag_and_exact_schema() {
 }
 
 #[test]
-fn postgres_cdc_bootstrap_spool_is_a_queue() {
+fn postgres_cdc_uses_one_input_queue() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("state");
     let definition = definition();
@@ -110,10 +110,17 @@ fn postgres_cdc_bootstrap_spool_is_a_queue() {
         .into_parts();
     let transactions = setup.commit(&path, |_| Ok(())).unwrap();
     drop((operation, transactions));
-    Store::open(path)
-        .unwrap()
-        .open_data::<Queue<Vec<u8>>>("operation/postgres_cdc_scan.bootstrap_spool")
+    let store = Store::open(path).unwrap();
+    store
+        .open_data::<Queue<Vec<u8>>>("operation/postgres_cdc_scan.input")
         .unwrap();
+    for suffix in ["bootstrap_spool", "published"] {
+        let name = format!("operation/postgres_cdc_scan.{suffix}");
+        assert!(matches!(
+            store.open_data::<Queue<Vec<u8>>>(&name),
+            Err(dogpaddle_store::StoreError::DataNotFound(missing)) if missing == name
+        ));
+    }
 }
 
 #[test]
