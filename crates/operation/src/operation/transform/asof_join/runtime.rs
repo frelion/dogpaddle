@@ -1,16 +1,15 @@
 use std::{num::NonZeroU64, ops::Bound, sync::Arc};
 
-use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, RecordBatchOptions};
+use arrow_array::Array;
 use arrow_schema::Field;
 use datafusion_common::ScalarValue;
-use dogpaddle_change::Change;
 use dogpaddle_store::{OrderedMapAccess, ScanDirection, ScanLimit, StoreError, TransactionAccess};
 
 use super::{
     AsOfDirection, AsOfJoinError, AsOfJoinLayout,
     index::{
         matchable_partition_prefix, order_prefix, parse_row_key, prefix_successor, push_component,
-        row_key,
+        row_key, row_suffix,
     },
     state::{AsOfCursor, Rows},
 };
@@ -20,8 +19,8 @@ use crate::{
         BudgetExceeded, Cursor, OperationError, OperationInput, PagedOperation, Progress, Resume,
         Step, StepBudget,
         relation::{
-            RowError, canonical_row_bounded, canonical_row_size_bounded,
-            decode_canonical_row_bounded, encode_canonical_bounded, order_key,
+            ArrowOutput, RowError, canonical_row_bounded, canonical_row_size_bounded,
+            decode_canonical_rows_bounded, encode_canonical_bounded, order_key,
         },
     },
 };
@@ -75,10 +74,6 @@ impl Candidates {
             Ok(self.winner.as_ref())
         }
     }
-}
-struct Output {
-    columns: Vec<Vec<ScalarValue>>,
-    differences: Vec<i64>,
 }
 type Range = (Bound<Vec<u8>>, Bound<Vec<u8>>);
 
@@ -241,7 +236,7 @@ impl AsOfJoinOperation {
                 )
                 .into());
             }
-            decode_canonical_row_bounded(&self.layout.input_schemas[0], parsed.row, budget)?;
+            decode_canonical_rows_bounded(&self.layout.input_schemas[0], &[parsed.row], budget)?;
         }
         Ok(())
     }
@@ -309,7 +304,7 @@ impl AsOfJoinOperation {
             .into_iter()
             .next()
             .map(|key| {
-                let row_start = parse_row_key(&key).map(|parsed| key.len() - parsed.row.len());
+                let row_start = row_suffix(&key).map(|row| key.len() - row.len());
                 row_start.map(|row_start| Winner { key, row_start })
             })
             .transpose()?;
@@ -409,17 +404,6 @@ impl AsOfJoinOperation {
             ambiguous,
         })
     }
-    fn winner_values(
-        &self,
-        winner: Option<&Winner>,
-        budget: &mut StepBudget,
-    ) -> Result<Option<Vec<ScalarValue>>, OperationError> {
-        winner
-            .map(|winner| {
-                decode_canonical_row_bounded(&self.layout.input_schemas[1], winner.row(), budget)
-            })
-            .transpose()
-    }
     fn apply_weight(
         &self,
         port: usize,
@@ -481,7 +465,7 @@ impl AsOfJoinOperation {
         right: &PreparedRow,
         weights: (Option<NonZeroU64>, Option<NonZeroU64>),
         cursor: &mut AsOfCursor,
-        output: &mut Output,
+        output: &mut ArrowOutput,
         budget: &mut StepBudget,
         access: TransactionAccess<'_>,
     ) -> Result<bool, OperationError> {
@@ -542,39 +526,17 @@ impl AsOfJoinOperation {
             let old = old_bucket.checked()?.or(replacement);
             let new = new_bucket.checked()?.or(replacement);
             if old.map(|winner| &winner.key) != new.map(|winner| &winner.key) {
-                let before_decode = budget.remaining_bytes();
-                let old_values = self.winner_values(old, budget)?;
-                let new_values = self.winner_values(new, budget)?;
-                // Every output still reconstructs Arrow; only decoding is shared.
-                let winner_work = before_decode - budget.remaining_bytes();
-                budget.charge(winner_work.saturating_mul(page.entries.len() - 1))?;
-                for entry in &page.entries {
-                    let parsed = parse_row_key(&entry.0)?;
-                    let before_decode = budget.remaining_bytes();
-                    let left = decode_canonical_row_bounded(
-                        &self.layout.input_schemas[0],
-                        parsed.row,
-                        budget,
-                    )?;
-                    budget.charge(before_decode - budget.remaining_bytes())?;
-                    let positive = i64::try_from(entry.1.get())
-                        .map_err(|_| AsOfJoinError::OutputDifferenceOverflow)?;
-                    for (winner, values, difference) in [
-                        (old, old_values.as_deref(), -positive),
-                        (new, new_values.as_deref(), positive),
-                    ] {
-                        output.push(
-                            &left,
-                            values.unwrap_or(&self.layout.right_nulls),
-                            difference,
-                            parsed
-                                .row
-                                .len()
-                                .saturating_add(winner.map_or(0, |winner| winner.row().len())),
-                            budget,
-                        )?;
-                    }
-                }
+                let changes = page
+                    .entries
+                    .iter()
+                    .flat_map(|entry| [(entry, old, -1_i64), (entry, new, 1)])
+                    .map(|(entry, winner, sign)| {
+                        let row = row_suffix(&entry.0)?;
+                        let positive = i64::try_from(entry.1.get())
+                            .map_err(|_| AsOfJoinError::OutputDifferenceOverflow)?;
+                        Ok(([Some(row), winner.map(Winner::row)], sign * positive))
+                    });
+                output.extend(&self.layout.input_schemas, changes, budget)?;
             }
         }
         if let Some(key) = page.continuation {
@@ -642,7 +604,7 @@ impl PagedOperation for AsOfJoinOperation {
         self.validate_cursor_binding(cursor, &rows[0], budget)?;
         let mut cursor = cursor.clone();
         let mut next = start;
-        let mut output = Output::new(self.layout.output_schema.fields().len());
+        let mut output = ArrowOutput::default();
         for row in &rows {
             if budget.head_remaining() == 0 {
                 break;
@@ -664,21 +626,11 @@ impl PagedOperation for AsOfJoinOperation {
             if input.port == 0 {
                 let winner = self.select(row, budget, access)?;
                 let winner = winner.checked()?;
-                let values = self.winner_values(winner, budget)?;
-                let parsed = parse_row_key(&row.key)?;
-                let left = decode_canonical_row_bounded(
-                    &self.layout.input_schemas[0],
-                    parsed.row,
-                    budget,
-                )?;
+                let left = row_suffix(&row.key)?;
                 output.push(
-                    &left,
-                    values.as_deref().unwrap_or(&self.layout.right_nulls),
+                    &self.layout.input_schemas,
+                    [Some(left), winner.map(Winner::row)],
                     row.difference,
-                    parsed
-                        .row
-                        .len()
-                        .saturating_add(winner.map_or(0, |winner| winner.row().len())),
                     budget,
                 )?;
                 self.apply_weight(0, row, after, budget, access)?;
@@ -712,60 +664,13 @@ impl PagedOperation for AsOfJoinOperation {
         })
     }
 }
-impl Output {
-    fn new(fields: usize) -> Self {
-        Self {
-            columns: (0..fields).map(|_| Vec::new()).collect(),
-            differences: Vec::new(),
-        }
-    }
-    fn push(
-        &mut self,
-        left: &[ScalarValue],
-        right: &[ScalarValue],
-        diff: i64,
-        encoded_bytes: usize,
-        budget: &mut StepBudget,
-    ) -> Result<(), OperationError> {
-        let row_bytes = self
-            .columns
-            .len()
-            .saturating_mul(std::mem::size_of::<ScalarValue>())
-            .saturating_add(8);
-        budget.charge(encoded_bytes.saturating_add(row_bytes))?;
-        for (column, value) in self.columns.iter_mut().zip(left.iter().chain(right)) {
-            column.push(value.clone());
-        }
-        self.differences.push(diff);
-        Ok(())
-    }
-    fn finish(self, schema: &arrow_schema::SchemaRef) -> Result<Option<Change>, OperationError> {
-        if self.differences.is_empty() {
-            return Ok(None);
-        }
-        let count = self.differences.len();
-        let arrays = self
-            .columns
-            .into_iter()
-            .map(ScalarValue::iter_to_array)
-            .collect::<Result<Vec<ArrayRef>, _>>()?;
-        let records = RecordBatch::try_new_with_options(
-            Arc::clone(schema),
-            arrays,
-            &RecordBatchOptions::new().with_row_count(Some(count)),
-        )?;
-        Ok(Some(Change::try_new(
-            records,
-            Int64Array::from(self.differences),
-        )?))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{col, expression::StoredExpression};
+    use arrow_array::{Int64Array, RecordBatch};
     use arrow_schema::{DataType, Schema};
+    use dogpaddle_change::Change;
     use dogpaddle_store::StoreSetup;
 
     #[test]
@@ -795,7 +700,6 @@ mod tests {
                     left: scalar("at", DataType::Int64),
                     right: scalar("at", DataType::Int64),
                 },
-                right_nulls: vec![],
             },
             left_rows: setup.data_scope().data("left").unwrap(),
             right_rows: setup.data_scope().data("right").unwrap(),
@@ -877,7 +781,6 @@ mod tests {
                     left: scalar(),
                     right: scalar(),
                 },
-                right_nulls: vec![],
             },
             left_rows: setup.data_scope().data("left").unwrap(),
             right_rows: setup.data_scope().data("right").unwrap(),

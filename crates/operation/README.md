@@ -97,7 +97,7 @@ head item 额度限制输入事件、扫描候选或修正原子；Atomic tail �
 预算不足返回 `BudgetExceeded`，Flow 整页回滚并确定性减半 head item 额度，最小原子仍超限则失败。
 预算描述逻辑事务工作量，Arrow/DataFusion 表达式的临时分配不构成严格 RSS 或执行时间保证。
 可变大小索引读取使用 byte-bounded scan；已知编码写入在写前扣账。
-canonical row 在 owned scalar 与 Arrow 重建前完成全行 framing 与逻辑费用预验；Boolean 值等仍由实际 decoder 检查，不承诺所有语义错误都早于重建。NULL 和空 List 子类型的 Arrow shape 也计费；空子类型补计形状费用可能使合法页缩小或使最小行报预算不足，canonical bytes、row hash 与布局不变。
+Join 不以 owned `ScalarValue` 保存候选或输出行：每批 borrowed canonical fragments 先按原输入 Schema 完成全行 framing、nullability、Boolean、UTF-8 和 Arrow 逻辑费用预验，随后直接追加到 Arrow builders，不拼接或保留第二份 canonical 输出行。外联的输出 nullability 不放宽 stored fragment 的验证。每个候选或输出批次只计一次嵌套 child shape 与初始 offsets，逐行另计实际 Arrow buffers 和 diff 槽位；NULL Struct 的 child positions 仍计费。空 List 不重复计费不存在的单值 child arrays，`List<Null>` 不再分配或计费逐 child `ScalarValue` 向量，因此此前拒绝的合法页可能容纳于同一预算。canonical bytes、row hash 与布局不变。
 
 ## 内建计算算子
 

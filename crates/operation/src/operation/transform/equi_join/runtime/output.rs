@@ -1,90 +1,82 @@
 //! Output rows and presence corrections for the current transactional page.
 
-use std::{num::NonZeroU64, sync::Arc};
-
-use arrow_array::{ArrayRef, Int64Array, RecordBatch, RecordBatchOptions};
-use arrow_schema::SchemaRef;
-use datafusion_common::ScalarValue;
-use dogpaddle_change::Change;
-
-use crate::operation::relation::decode_canonical_row_bounded;
+use std::num::NonZeroU64;
 
 use super::{
-    ActiveRow, EquiJoinError, EquiJoinKind, EquiJoinOperation, KeyTransition, MatchTransition,
-    PreparedMatch, RowEffect, StepBudget, canonical_error,
+    ArrowOutput, EquiJoinError, EquiJoinKind, EquiJoinOperation, KeyTransition, MatchTransition,
+    OperationError, PreparedRow, ResidualPage, RowEffect, StepBudget, canonical_error,
 };
-
-pub(super) struct OutputRows {
-    columns: Vec<Vec<ScalarValue>>,
-    differences: Vec<i64>,
-}
 
 impl EquiJoinOperation {
     pub(super) fn append_output_page(
         &self,
         port: usize,
-        input: &ActiveRow<'_>,
+        input: &PreparedRow,
         effect: RowEffect,
         matches: &[(Vec<u8>, NonZeroU64)],
-        output: &mut OutputRows,
+        output: &mut ArrowOutput,
         budget: &mut StepBudget,
     ) -> Result<(), EquiJoinError> {
         if self.kind.left_only() {
             return self.append_existence_output(port, input, effect, matches, output, budget);
         }
         if matches.is_empty() && !effect.matched && self.kind.preserves(port) {
-            self.append_padded(port, input.values()?, input.difference, output);
+            self.append_padded(port, &input.row, input.difference, output, budget)?;
         }
         if matches.is_empty() {
             return Ok(());
         }
-        let input_values = input.values()?;
-        let opposite_schema = &self.input_schemas[1 - port];
-        for matched in matches {
-            let opposite = decode_canonical_row_bounded(opposite_schema, &matched.0, budget)
-                .map_err(canonical_error)?;
-            let difference =
-                output_difference(i128::from(input.difference) * i128::from(matched.1.get()))?;
-            // A match and its NULL-row correction share one cursor position
-            // and transaction, including when both have identical values.
-            if self.kind.preserves(1 - port) && matches!(effect.transition, KeyTransition::First) {
-                self.append_padded(
-                    1 - port,
-                    &opposite,
-                    output_difference(-i128::from(matched.1.get()))?,
-                    output,
-                );
-            }
-            if port == 0 {
-                output.push(input_values, &opposite, difference);
-            } else {
-                output.push(&opposite, input_values, difference);
-            }
-            if self.kind.preserves(1 - port) && matches!(effect.transition, KeyTransition::Last) {
-                self.append_padded(
-                    1 - port,
-                    &opposite,
-                    output_difference(i128::from(matched.1.get()))?,
-                    output,
-                );
-            }
-        }
-        Ok(())
+        let changes = matches
+            .iter()
+            .flat_map(|matched| {
+                let opposite = matched.0.as_slice();
+                let weight = i128::from(matched.1.get());
+                let pair = if port == 0 {
+                    [Some(input.row.as_slice()), Some(opposite)]
+                } else {
+                    [Some(opposite), Some(input.row.as_slice())]
+                };
+                let padding = if port == 0 {
+                    [None, Some(opposite)]
+                } else {
+                    [Some(opposite), None]
+                };
+                // A match and its NULL-row correction share one cursor position
+                // and transaction, including when both have identical values.
+                [
+                    (self.kind.preserves(1 - port)
+                        && matches!(effect.transition, KeyTransition::First))
+                    .then_some((padding, -weight)),
+                    Some((pair, i128::from(input.difference) * weight)),
+                    (self.kind.preserves(1 - port)
+                        && matches!(effect.transition, KeyTransition::Last))
+                    .then_some((padding, weight)),
+                ]
+            })
+            .flatten()
+            .map(|(fragments, difference)| {
+                output_difference(difference)
+                    .map(|difference| (fragments, difference))
+                    .map_err(OperationError::from)
+            });
+        output
+            .extend(&self.input_schemas, changes, budget)
+            .map_err(canonical_error)
     }
 
     fn append_existence_output(
         &self,
         port: usize,
-        input: &ActiveRow<'_>,
+        input: &PreparedRow,
         effect: RowEffect,
         matches: &[(Vec<u8>, NonZeroU64)],
-        output: &mut OutputRows,
+        output: &mut ArrowOutput,
         budget: &mut StepBudget,
     ) -> Result<(), EquiJoinError> {
         let semi = self.kind == EquiJoinKind::LeftSemi;
         if port == 0 {
             if effect.matched == semi {
-                output.push(input.values()?, &[], input.difference);
+                self.append(Some(&input.row), None, input.difference, output, budget)?;
             }
             return Ok(());
         }
@@ -93,104 +85,125 @@ impl EquiJoinOperation {
             KeyTransition::Last => -1,
             KeyTransition::None => return Ok(()),
         } * if semi { 1 } else { -1 };
-        for matched in matches {
-            let left = decode_canonical_row_bounded(&self.input_schemas[0], &matched.0, budget)
-                .map_err(canonical_error)?;
-            output.push(
-                &left,
-                &[],
-                output_difference(sign * i128::from(matched.1.get()))?,
-            );
-        }
-        Ok(())
+        let changes = matches.iter().map(|matched| {
+            output_difference(sign * i128::from(matched.1.get()))
+                .map(|difference| ([Some(matched.0.as_slice()), None], difference))
+                .map_err(OperationError::from)
+        });
+        output
+            .extend(&self.input_schemas[..1], changes, budget)
+            .map_err(canonical_error)
+    }
+
+    fn append(
+        &self,
+        left: Option<&[u8]>,
+        right: Option<&[u8]>,
+        difference: i64,
+        output: &mut ArrowOutput,
+        budget: &mut StepBudget,
+    ) -> Result<(), EquiJoinError> {
+        let ports = if self.kind.left_only() { 1 } else { 2 };
+        output
+            .push(
+                &self.input_schemas[..ports],
+                [left, right],
+                difference,
+                budget,
+            )
+            .map_err(canonical_error)
     }
 
     fn append_padded(
         &self,
         port: usize,
-        values: &[ScalarValue],
+        row: &[u8],
         difference: i64,
-        output: &mut OutputRows,
-    ) {
+        output: &mut ArrowOutput,
+        budget: &mut StepBudget,
+    ) -> Result<(), EquiJoinError> {
         if port == 0 {
-            output.push(values, &self.nulls[1], difference);
+            self.append(Some(row), None, difference, output, budget)
         } else {
-            output.push(&self.nulls[0], values, difference);
+            self.append(None, Some(row), difference, output, budget)
         }
     }
 
-    pub(super) fn append_residual_match_output(
+    pub(super) fn append_residual_page(
         &self,
         port: usize,
-        input: &ActiveRow<'_>,
-        effect: RowEffect,
-        matched: &PreparedMatch,
-        transition: MatchTransition,
-        output: &mut OutputRows,
-    ) -> Result<(), EquiJoinError> {
-        if transition == MatchTransition::BecameMatched {
-            self.append_match_correction(1 - port, matched, true, output)?;
-        }
-        if !self.kind.left_only() {
-            let difference =
-                output_difference(i128::from(input.difference) * i128::from(matched.multiplicity))?;
-            let input_values = input.values()?;
-            if port == 0 {
-                output.push(input_values, &matched.values, difference);
-            } else {
-                output.push(&matched.values, input_values, difference);
-            }
-        }
-        if transition == MatchTransition::BecameUnmatched {
-            self.append_match_correction(1 - port, matched, false, output)?;
-        }
-        debug_assert!(
-            transition == MatchTransition::None
-                || !matches!(effect.transition, KeyTransition::None)
-        );
-        Ok(())
-    }
-
-    fn append_match_correction(
-        &self,
-        port: usize,
-        matched: &PreparedMatch,
-        now_matched: bool,
-        output: &mut OutputRows,
-    ) -> Result<(), EquiJoinError> {
-        let magnitude = i128::from(matched.multiplicity);
-        if self.kind.preserves(port) {
-            let difference = output_difference(if now_matched { -magnitude } else { magnitude })?;
-            self.append_padded(port, &matched.values, difference, output);
-        } else if self.kind.left_only() && port == 0 {
-            let semi = self.kind == EquiJoinKind::LeftSemi;
-            let positive = now_matched == semi;
-            let difference = output_difference(if positive { magnitude } else { -magnitude })?;
-            output.push(&matched.values, &[], difference);
-        } else {
-            return Err(EquiJoinError::InvalidMatchCount(
-                "match transition targeted an untracked side",
-            ));
-        }
-        Ok(())
-    }
-
-    pub(super) fn append_residual_current(
-        &self,
-        port: usize,
-        input: &ActiveRow<'_>,
+        input: &PreparedRow,
+        page: &ResidualPage,
         found_match: bool,
-        output: &mut OutputRows,
+        output: &mut ArrowOutput,
+        budget: &mut StepBudget,
     ) -> Result<(), EquiJoinError> {
-        if self.kind.left_only() && port == 0 {
-            let semi = self.kind == EquiJoinKind::LeftSemi;
-            if found_match == semi {
-                output.push(input.values()?, &[], input.difference);
-            }
-        } else if self.kind.preserves(port) && !found_match {
-            self.append_padded(port, input.values()?, input.difference, output);
-        }
-        Ok(())
+        let current = if page.continuation.is_some() {
+            None
+        } else if self.kind.left_only() && port == 0 {
+            (found_match == (self.kind == EquiJoinKind::LeftSemi)).then_some((
+                [Some(input.row.as_slice()), None],
+                i128::from(input.difference),
+            ))
+        } else {
+            (self.kind.preserves(port) && !found_match).then_some((
+                if port == 0 {
+                    [Some(input.row.as_slice()), None]
+                } else {
+                    [None, Some(input.row.as_slice())]
+                },
+                i128::from(input.difference),
+            ))
+        };
+        let changes = page
+            .matches
+            .iter()
+            .flat_map(|matched| {
+                let opposite = matched.row.as_slice();
+                let weight = i128::from(matched.multiplicity);
+                let pair = if port == 0 {
+                    [Some(input.row.as_slice()), Some(opposite)]
+                } else {
+                    [Some(opposite), Some(input.row.as_slice())]
+                };
+                let correction = if self.kind.preserves(1 - port) {
+                    (
+                        if port == 0 {
+                            [None, Some(opposite)]
+                        } else {
+                            [Some(opposite), None]
+                        },
+                        -weight,
+                    )
+                } else {
+                    (
+                        [Some(opposite), None],
+                        if self.kind == EquiJoinKind::LeftSemi {
+                            weight
+                        } else {
+                            -weight
+                        },
+                    )
+                };
+                [
+                    (matched.transition == MatchTransition::BecameMatched).then_some(correction),
+                    (!self.kind.left_only())
+                        .then_some((pair, i128::from(input.difference) * weight)),
+                    (matched.transition == MatchTransition::BecameUnmatched)
+                        .then_some((correction.0, -correction.1)),
+                ]
+            })
+            .flatten()
+            .chain(current)
+            .map(|(fragments, difference)| {
+                output_difference(difference)
+                    .map(|difference| (fragments, difference))
+                    .map_err(OperationError::from)
+            });
+        let ports = if self.kind.left_only() { 1 } else { 2 };
+        output
+            .extend(&self.input_schemas[..ports], changes, budget)
+            .map_err(canonical_error)
     }
 }
 
@@ -198,37 +211,105 @@ fn output_difference(difference: i128) -> Result<i64, EquiJoinError> {
     i64::try_from(difference).map_err(|_| EquiJoinError::OutputDifferenceOverflow)
 }
 
-impl OutputRows {
-    pub(super) fn new(column_count: usize) -> Self {
-        Self {
-            columns: (0..column_count).map(|_| Vec::new()).collect(),
-            differences: Vec::new(),
-        }
-    }
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
 
-    fn push(&mut self, left: &[ScalarValue], right: &[ScalarValue], difference: i64) {
-        debug_assert_eq!(self.columns.len(), left.len() + right.len());
-        for (column, value) in self.columns.iter_mut().zip(left.iter().chain(right)) {
-            column.push(value.clone());
-        }
-        self.differences.push(difference);
-    }
+    use arrow_array::{RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use dogpaddle_store::StoreSetup;
 
-    pub(super) fn finish(self, schema: &SchemaRef) -> Result<Option<Change>, EquiJoinError> {
-        if self.differences.is_empty() {
-            return Ok(None);
-        }
-        let row_count = self.differences.len();
-        let columns = self
-            .columns
-            .into_iter()
-            .map(ScalarValue::iter_to_array)
-            .collect::<Result<Vec<ArrayRef>, _>>()?;
-        let options = RecordBatchOptions::new().with_row_count(Some(row_count));
-        let records = RecordBatch::try_new_with_options(Arc::clone(schema), columns, &options)?;
-        Ok(Some(Change::try_new(
-            records,
-            Int64Array::from(self.differences),
-        )?))
+    use super::*;
+    use crate::operation::relation::canonical_row_bounded;
+    use crate::operation::transform::equi_join::runtime::PreparedMatch;
+
+    #[test]
+    fn a_refused_wide_residual_page_appends_no_output_prefix() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Utf8,
+            false,
+        )]));
+        let source = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(vec![
+                String::new(),
+                "a".repeat(128 * 1024),
+                "b".repeat(128 * 1024),
+            ]))],
+        )
+        .unwrap();
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("left", DataType::Utf8, true),
+            Field::new("right", DataType::Utf8, true),
+        ]));
+        let mut setup = StoreSetup::new();
+        let mut scope = setup.data_scope();
+        let operation = EquiJoinOperation {
+            kind: EquiJoinKind::FullOuter,
+            input_schemas: [Arc::clone(&schema), schema],
+            candidate_schema: Arc::clone(&output_schema),
+            output_schema: Arc::clone(&output_schema),
+            keys: Box::new([]),
+            residual: None,
+            left_rows: scope.data("left").unwrap(),
+            right_rows: scope.data("right").unwrap(),
+            match_counts: None,
+        };
+        let input = PreparedRow {
+            row: canonical_row_bounded(&source, 0, usize::MAX).unwrap(),
+            key: Vec::new(),
+            matchable: true,
+            difference: 1,
+        };
+        let page = ResidualPage {
+            matches: (1..3)
+                .map(|row| PreparedMatch {
+                    row: canonical_row_bounded(&source, row, usize::MAX).unwrap(),
+                    multiplicity: 1,
+                    transition: MatchTransition::BecameMatched,
+                })
+                .collect(),
+            qualifying: 2,
+            continuation: None,
+            items: 2,
+        };
+        let mut refused = ArrowOutput::default();
+        let error = operation
+            .append_residual_page(
+                0,
+                &input,
+                &page,
+                true,
+                &mut refused,
+                &mut StepBudget::new(2, 384 * 1024),
+            )
+            .unwrap_err();
+        assert!(matches!(error, EquiJoinError::Budget(_)));
+        assert!(refused.finish(&output_schema).unwrap().is_none());
+        let mut complete = ArrowOutput::default();
+        operation
+            .append_residual_page(
+                0,
+                &input,
+                &page,
+                true,
+                &mut complete,
+                &mut StepBudget::new(2, 1024 * 1024),
+            )
+            .unwrap();
+        let output = complete.finish(&output_schema).unwrap().unwrap();
+        assert_eq!(output.diffs().values().as_ref(), &[-1, 1, -1, 1]);
+        let left = output.records().column(0);
+        assert!(left.is_null(0) && left.is_valid(1) && left.is_null(2) && left.is_valid(3));
+        let right = output
+            .records()
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(right.value(0), right.value(1));
+        assert_eq!(right.value(2), right.value(3));
+        assert!(right.value(0).starts_with('a') && right.value(2).starts_with('b'));
     }
 }

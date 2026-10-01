@@ -83,7 +83,7 @@ equality 与 order 使用零字节转义及终止符，canonical row 直接作�
 影响区间按严格相邻 RHS 时刻定义。Backward inclusive 为 `[t,next)`，strict 为 `(t,next]`；
 Forward inclusive 为 `(prev,t]`，strict 为 `[prev,t)`，不存在邻居时该端延伸到 partition 边界。
 一页按此区间扫描多个 left；所有 left 共享该事件固定的 before/after winner，不逐 left 重扫整个 RHS history。
-before/after winner 的 canonical 值每页各解码一次，每个 left 解码一次供负正输出使用；每条输出仍保留原有的嵌套值与 Arrow 重建准入，不因复用解码而免去复制预算。
+before/after winner 直接借用索引 key 的 canonical 后缀；每个 left 按事件顺序将 `-old,+new` 片段直接追加到整页 Arrow builders，不建立 owned scalar 行、canonical 输出副本或单行 Arrow 临时数组。仅需要 row suffix 时沿同一严格 framing loop 跳过两个 header，不分配解码后的 partition/order。每个输出片段在追加前完成原输入 Schema 的完整预验和 Arrow 费用准入，winner 复用不免去每条输出的 payload 费用。
 每个 left 的 `-old,+new` 是同一修正原子，至少一次预算扣账；空区间和无输出也前进。
 
 状态与 output/Resume 同事务；晚页歧义、权重或 diff overflow 保留早页和失败帧。
@@ -100,15 +100,24 @@ Resume 是唯一 ordinal 加强类型 cursor，严格 StoreValue codec 限制 co
 Store scans 在读前传 byte bound；已知 key/value/output writes 在写前计费。
 候选扫描成功即计入已读字节，即使后续输出准入拒绝该页；canonical 编码失败前已复制的前缀仍计费。
 需要构造完整行及索引副本时，先无复制检查 canonical 大小，再准入并编码，不能把失败分配留在重试预算之外。
-canonical row 解码先在 owned scalar 与 Arrow 重建前检查全行 framing，并将顶层及全部嵌套 scalar 槽位、已知 Arrow payload 计入同一预算；
-List 声明的整个临时 scalar Vec，以及嵌套数组转换的 owned/borrowed array Vec 槽位，在遍历和分配前准入；
-NULL Struct/List 和非 NULL 空 List 的子类型 Arrow shape 也在重建前递归计费；此前漏计的空 Struct/List/变长子类型费用可能使合法页缩小，或使最小行报预算不足。Boolean 值等语义仍由实际 decoder 检查，不承诺所有错误都早于重建。
-这是已知逻辑 scratch 与 payload 的准入，Arrow 的 ArrayData/Arc、concat 内部暂存不构成 RSS 硬界；canonical bytes、row hash 与布局不变。
+Join 借用已有 canonical rows，候选和输出只有 Arrow builders，不以 `ScalarValue` 或另一份 owned canonical 行作为中间输出格式。
+每个 present fragment 在复制前按其原输入 Schema 预验完整 framing、nullability、Boolean、UTF-8、长度及 Arrow 逻辑费用；
+外联输出字段放宽 nullability 不允许 stored non-nullable 字段出现 NULL。padding 直接追加每个顶层字段的 NULL，不生成 canonical markers。
+候选批次直接重建 Arrow 求 residual，保留 qualifying canonical keys 与 multiplicity，不从 Arrow 再抽取 owned scalar。
+每个候选/输出批次只准入一次 builder/array Vec 槽位、嵌套 child 槽位与初始 offsets；逐行另准入固定值、变长 payload、offset 和 validity。
+NULL Struct 的全部 child positions 递归准入和追加，NULL List 不追加 children；空 List 仍建立并准入完整 child shape，但该 shape 在同一批次只存在一次。
+`List<Null>` 的 children 只维护长度，不再分配或计费逐 child 的 owned ScalarValue/ArrayRef Vec，因此此前因这类临时表示拒绝的合法页可通过同一预算。
+每批输出 Arrow buffers 与最终零拷贝 diff buffer 在追加前计费；不收取不存在的 canonical 输出副本或 owned row slots，finish 不重复扣账。
+ASOF rematch、EquiJoin 输出页和 residual 候选批次先完整检查 diff、原 Schema 片段及全批费用，成功后才追加该批 Arrow 值；预算拒绝不追加该批的输出前缀。residual support 更新仍只在原事务内执行一次，先将临时 transition 写入既有 PreparedMatch，再整批输出；写入可以早于输出准入，失败仍须回滚整页。
+候选批次的实际重建与输出批次的实际重建分别计费，不能将扫描费替代输出费，也不为已经退休的 scalar 槽位预缴。
+Arrow builders 在首个非空批次完整准入后才建立，按该批行数预留固定值、offset 和 Struct child positions；后续批次继续追加，List children 长度未知仍从零容量开始，字符串和二进制 payload 同样从零开始。直接 decoder 保持 nested 字段 metadata、Timestamp timezone、Decimal128 类型与 Float raw bits，零列 Schema 保留行数。累计 String/List offsets 的 i32 上限仍在追加阶段检查，失败回滚，不承诺所有 overflow 都在首遍拒绝。
+这是已知逻辑 scratch 与 payload 的准入；builder capacity 增长、Arrow ArrayData/Arc 和表达式内部暂存不构成 RSS 硬界。canonical bytes、row hash 与布局不变。
 预算不足回滚整页，Flow 以同一 input 和 Resume 确定性减半 head 额度；最小工作项仍超限时返回 `BudgetExceeded`。
 表达式输出仍可能额外分配；这些逻辑工作界不承诺进程 RSS 或执行时间硬界。
 
 correctness 覆盖五种 EquiJoin 与四种 residual 配置的 independent bag oracle、weighted 插删、NULL、
 逐页 rollback 和完整 runtime 重构、晚页负事件、fanout、4096 空 bucket 的批量推进。
+Join payload owner tests 另覆盖 nullable Struct 的 non-nullable children、NULL/empty List 和 Struct、字段 metadata、浮点原始位模式及时间/Decimal 类型。
 ASOF 覆盖 Forward/Backward strict/inclusive independent bag、相邻时刻插删、重复同 row multiplicity、
 NULL、空区间、零列 canonical 行的四种邻接边界、行尾截断/多余字节与坏 Resume 的只读拒绝、旧索引布局拒绝、歧义暴露和最後页 RHS 落账。Flow 负责 root/child/send/queue 的持久故障窗口和融合 tail 回滚。
 

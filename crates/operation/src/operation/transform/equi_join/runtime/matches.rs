@@ -1,24 +1,21 @@
 //! Bounded candidate scans and residual evaluation; no durable writes.
 
-use std::{mem::size_of, num::NonZeroU64, sync::Arc};
+use std::{mem::size_of, num::NonZeroU64};
 
-use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch, RecordBatchOptions};
-use datafusion_common::ScalarValue;
+use arrow_array::{Array, BooleanArray};
 use dogpaddle_store::{OrderedMapPage, ScanDirection, ScanLimit, StoreError, TransactionAccess};
 
-use crate::operation::relation::decode_canonical_row_bounded;
-
 use super::{
-    ActiveRow, EquiJoinError, EquiJoinKind, EquiJoinOperation, KeyTransition, PreparedMatch,
-    PreparedRow, ResidualPage, RowEffect, StepBudget, canonical_error,
+    ArrowOutput, EquiJoinError, EquiJoinKind, EquiJoinOperation, KeyTransition, MatchTransition,
+    PreparedMatch, PreparedRow, ResidualPage, RowEffect, StepBudget, canonical_error,
 };
 
 const RESIDUAL_BATCH_ITEMS: usize = 256;
 const RESIDUAL_BATCH_BYTES: usize = 1024 * 1024;
-const RESIDUAL_BATCH_SCALAR_VALUES: usize = 16 * 1024;
+const RESIDUAL_BATCH_FIELDS: usize = 16 * 1024;
 
 fn residual_batch_item_limit(candidate_fields: usize) -> usize {
-    (RESIDUAL_BATCH_SCALAR_VALUES / candidate_fields.max(1)).clamp(1, RESIDUAL_BATCH_ITEMS)
+    (RESIDUAL_BATCH_FIELDS / candidate_fields.max(1)).clamp(1, RESIDUAL_BATCH_ITEMS)
 }
 
 impl EquiJoinOperation {
@@ -54,10 +51,8 @@ impl EquiJoinOperation {
                 continuation: None,
             }));
         }
-        let expanded =
-            self.kind.preserves(1 - port) && !matches!(effect.transition, KeyTransition::None);
         let repeats_input = !(self.kind.left_only() && port == 1);
-        let max_items = budget.max_scan_items(row, expanded, repeats_input);
+        let max_items = budget.max_scan_items(row, repeats_input);
         let max_bytes = budget.scan_bytes();
         let limit =
             ScanLimit::new(max_items, max_bytes).expect("positive Join page limits are valid");
@@ -76,7 +71,7 @@ impl EquiJoinOperation {
     pub(super) fn scan_residual_matches(
         &self,
         port: usize,
-        row: &ActiveRow<'_>,
+        row: &PreparedRow,
         effect: RowEffect,
         resume_after: Option<&Vec<u8>>,
         budget: &mut StepBudget,
@@ -85,25 +80,17 @@ impl EquiJoinOperation {
         if !row.matchable
             || (self.kind.left_only() && matches!(effect.transition, KeyTransition::None))
         {
-            let work = StepBudget::work(row, &[], true);
-            if !budget.can_accept(work) {
-                return Ok(None);
-            }
-            budget.charge(work.1)?;
             return Ok(Some(ResidualPage {
                 matches: Vec::new(),
                 qualifying: 0,
                 continuation: None,
-                items: work.0,
+                items: 1,
             }));
         }
         let mut opposite = self.rows(1 - port).access(access)?;
         let partition = opposite.partition(&row.key)?;
-        let expanded = !self.kind.left_only()
-            && self.tracks_match_count(1 - port)
-            && !matches!(effect.transition, KeyTransition::None);
         let max_items = budget
-            .max_scan_items(row, expanded, true)
+            .max_scan_items(row, true)
             .min(residual_batch_item_limit(
                 self.candidate_schema.fields().len(),
             ));
@@ -118,7 +105,7 @@ impl EquiJoinOperation {
             Err(source) => return Err(source.into()),
         };
         budget.charge(StepBudget::scanned_bytes(row, &page.entries))?;
-        let work = self.residual_work(port, row, effect, &page.entries);
+        let work = self.residual_work(port, effect, &page.entries);
         if !budget.can_accept(work) {
             return Ok(None);
         }
@@ -136,50 +123,28 @@ impl EquiJoinOperation {
     fn evaluate_residual_matches(
         &self,
         port: usize,
-        input: &ActiveRow<'_>,
+        input: &PreparedRow,
         entries: Vec<(Vec<u8>, NonZeroU64)>,
         budget: &mut StepBudget,
     ) -> Result<(Vec<PreparedMatch>, usize), EquiJoinError> {
         if entries.is_empty() {
             return Ok((Vec::new(), 0));
         }
-        let opposite_schema = &self.input_schemas[1 - port];
-        let left_fields = self.input_schemas[0].fields().len();
-        let input_values = input.values()?;
-        let mut columns = (0..self.candidate_schema.fields().len())
-            .map(|_| Vec::with_capacity(entries.len()))
-            .collect::<Vec<Vec<ScalarValue>>>();
-        let mut candidates = Vec::with_capacity(entries.len());
-        for entry in entries {
-            let opposite = decode_canonical_row_bounded(opposite_schema, &entry.0, budget)
-                .map_err(canonical_error)?;
-            if port == 0 {
-                for (column, value) in columns[..left_fields].iter_mut().zip(input_values) {
-                    column.push(value.clone());
-                }
-                for (column, value) in columns[left_fields..].iter_mut().zip(opposite) {
-                    column.push(value);
-                }
+        let mut candidates = ArrowOutput::default();
+        let rows = entries.iter().map(|entry| {
+            let fragments = if port == 0 {
+                [Some(input.row.as_slice()), Some(entry.0.as_slice())]
             } else {
-                for (column, value) in columns[..left_fields].iter_mut().zip(opposite) {
-                    column.push(value);
-                }
-                for (column, value) in columns[left_fields..].iter_mut().zip(input_values) {
-                    column.push(value.clone());
-                }
-            }
-            candidates.push((entry.0, entry.1.get()));
-        }
-        let arrays = columns
-            .into_iter()
-            .map(ScalarValue::iter_to_array)
-            .collect::<Result<Vec<ArrayRef>, _>>()?;
-        let options = RecordBatchOptions::new().with_row_count(Some(candidates.len()));
-        let records = RecordBatch::try_new_with_options(
-            Arc::clone(&self.candidate_schema),
-            arrays,
-            &options,
-        )?;
+                [Some(entry.0.as_slice()), Some(input.row.as_slice())]
+            };
+            Ok((fragments, 1))
+        });
+        candidates
+            .extend(&self.input_schemas, rows, budget)
+            .map_err(canonical_error)?;
+        let records = candidates
+            .records(&self.candidate_schema)
+            .map_err(canonical_error)?;
         let predicate = self
             .residual
             .as_ref()
@@ -190,17 +155,12 @@ impl EquiJoinOperation {
             .as_any()
             .downcast_ref::<BooleanArray>()
             .ok_or(EquiJoinError::ResidualArray)?;
-        if predicate.len() != candidates.len() {
+        if predicate.len() != entries.len() {
             return Err(EquiJoinError::ResidualArray);
         }
-        let opposite_columns = if port == 0 {
-            left_fields..records.num_columns()
-        } else {
-            0..left_fields
-        };
         let mut matches = Vec::new();
         let mut qualifying = 0_usize;
-        for (index, (row, multiplicity)) in candidates.into_iter().enumerate() {
+        for (index, (row, multiplicity)) in entries.into_iter().enumerate() {
             if predicate.is_valid(index) && predicate.value(index) {
                 qualifying = qualifying
                     .checked_add(1)
@@ -208,16 +168,10 @@ impl EquiJoinOperation {
                 if self.kind.left_only() && port == 0 {
                     continue;
                 }
-                let values = opposite_columns
-                    .clone()
-                    .map(|column| {
-                        ScalarValue::try_from_array(records.column(column).as_ref(), index)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
                 matches.push(PreparedMatch {
                     row,
-                    values,
-                    multiplicity,
+                    multiplicity: multiplicity.get(),
+                    transition: MatchTransition::None,
                 });
             }
         }
@@ -227,36 +181,22 @@ impl EquiJoinOperation {
     fn residual_work(
         &self,
         port: usize,
-        row: &PreparedRow,
         effect: RowEffect,
         candidates: &[(Vec<u8>, NonZeroU64)],
     ) -> (usize, usize) {
         // Every raw candidate is materialized to evaluate the predicate, even
         // when it is filtered out and produces no relational output.
-        let (items, mut bytes) = StepBudget::work(row, candidates, true);
-        let scalar_slots_per_candidate = self
-            .candidate_schema
-            .fields()
-            .len()
-            .saturating_add(self.output_schema.fields().len().saturating_mul(2));
-        bytes = bytes.saturating_add(
-            candidates
-                .len()
-                .saturating_mul(scalar_slots_per_candidate)
-                .saturating_mul(size_of::<ScalarValue>()),
-        );
+        let items = candidates.len().max(1);
+        let mut bytes = 0_usize;
+        // Only retained match slots and support reads/writes belong here.
+        // Candidate Arrow and every output row are admitted at construction.
+        bytes = bytes.saturating_add(candidates.len().saturating_mul(size_of::<PreparedMatch>()));
         if !self.kind.left_only()
             && self.tracks_match_count(1 - port)
             && !matches!(effect.transition, KeyTransition::None)
         {
             for candidate in candidates {
-                bytes = bytes
-                    .saturating_add(candidate.0.len().saturating_add(9).saturating_mul(3))
-                    .saturating_add(
-                        self.nulls[port]
-                            .len()
-                            .saturating_mul(size_of::<ScalarValue>()),
-                    );
+                bytes = bytes.saturating_add(candidate.0.len().saturating_add(9).saturating_mul(3));
             }
         }
         (items, bytes)
@@ -265,21 +205,21 @@ impl EquiJoinOperation {
 
 #[cfg(test)]
 mod tests {
-    use super::{RESIDUAL_BATCH_ITEMS, RESIDUAL_BATCH_SCALAR_VALUES, residual_batch_item_limit};
+    use super::{RESIDUAL_BATCH_FIELDS, RESIDUAL_BATCH_ITEMS, residual_batch_item_limit};
 
     #[test]
     fn residual_batch_limit_accounts_for_candidate_schema_width() {
         assert_eq!(residual_batch_item_limit(0), RESIDUAL_BATCH_ITEMS);
         assert_eq!(residual_batch_item_limit(1), RESIDUAL_BATCH_ITEMS);
         assert_eq!(
-            residual_batch_item_limit(RESIDUAL_BATCH_SCALAR_VALUES / RESIDUAL_BATCH_ITEMS),
+            residual_batch_item_limit(RESIDUAL_BATCH_FIELDS / RESIDUAL_BATCH_ITEMS),
             RESIDUAL_BATCH_ITEMS
         );
         assert!(
-            residual_batch_item_limit(RESIDUAL_BATCH_SCALAR_VALUES / RESIDUAL_BATCH_ITEMS + 1)
+            residual_batch_item_limit(RESIDUAL_BATCH_FIELDS / RESIDUAL_BATCH_ITEMS + 1)
                 < RESIDUAL_BATCH_ITEMS
         );
-        assert_eq!(residual_batch_item_limit(RESIDUAL_BATCH_SCALAR_VALUES), 1);
+        assert_eq!(residual_batch_item_limit(RESIDUAL_BATCH_FIELDS), 1);
         assert_eq!(residual_batch_item_limit(usize::MAX), 1);
     }
 }

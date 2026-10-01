@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use datafusion_common::ScalarValue;
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -24,7 +23,6 @@ pub(crate) struct AsOfJoinLayout {
     pub(super) output_schema: SchemaRef,
     pub(super) equalities: Box<[BoundPair]>,
     pub(super) order: BoundPair,
-    pub(super) right_nulls: Vec<ScalarValue>,
 }
 
 /// One SQL equality expression pair. NULL keys never match.
@@ -212,12 +210,7 @@ impl AsOfJoinDefinition {
                     .with_name(&self.output_names[fields.len()]),
             ));
         }
-        let mut right_nulls = Vec::with_capacity(right.fields().len());
         for field in right.fields() {
-            right_nulls.push(
-                ScalarValue::try_from(field.data_type())
-                    .map_err(AsOfJoinSchemaError::NullPadding)?,
-            );
             fields.push(Arc::new(
                 field
                     .as_ref()
@@ -234,7 +227,6 @@ impl AsOfJoinDefinition {
             output_schema,
             equalities: equalities.into_boxed_slice(),
             order,
-            right_nulls,
         })
     }
 }

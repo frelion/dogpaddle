@@ -298,7 +298,14 @@ fn a_budget_rejected_stable_semi_or_anti_row_never_publishes_an_invalid_resume()
                 &mut StepBudget::new(1, bytes),
             ) {
                 Err(error) => {
-                    assert!(error.is::<BudgetExceeded>(), "{error}");
+                    assert!(
+                        std::iter::successors(
+                            Some(error.as_ref() as &(dyn std::error::Error + 'static)),
+                            |cause| cause.source(),
+                        )
+                        .any(<dyn std::error::Error>::is::<BudgetExceeded>),
+                        "{error}"
+                    );
                     refused += 1;
                 }
                 Ok(step) => {

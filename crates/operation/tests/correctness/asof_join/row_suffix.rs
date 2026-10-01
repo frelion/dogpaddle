@@ -269,3 +269,257 @@ fn retired_three_frame_layout_is_rejected_read_only_even_when_empty() {
         }
     }
 }
+
+#[test]
+fn output_nullability_cannot_mask_a_null_in_a_nonnullable_source_field() {
+    let mut fixture = Fixture::new(AsOfDirection::Backward { allow_exact: true });
+    fixture.run(1, &change(&[((Some(1), Some(10), 4), 1)]), 1);
+    let (key, value) = fixture.right_rows().pop().unwrap();
+    // The final source field is nonnullable Int64: marker 1 and eight bytes.
+    // Its outer output field is nullable, but that cannot validate stored input.
+    assert_eq!(&key[key.len() - 9..], &[1, 0, 0, 0, 0, 0, 0, 0, 4]);
+    let mut malformed = key[..key.len() - 9].to_vec();
+    malformed.push(0);
+    {
+        let transaction = fixture.transactions.begin();
+        let mut rows = fixture.raw_right.access(transaction.access()).unwrap();
+        assert!(rows.remove(&key).unwrap());
+        rows.put(&malformed, &value).unwrap();
+        transaction.commit().unwrap();
+    }
+    let input = change(&[((Some(1), Some(20), 8), 1)]);
+    for _ in 0..2 {
+        let error = fixture.page(0, &input, 256, true).unwrap_err();
+        let mut cause: &(dyn std::error::Error + 'static) = error.as_ref();
+        while let Some(source) = cause.source() {
+            cause = source;
+        }
+        assert!(cause.to_string().contains("non-nullable field \"id\""));
+        assert_eq!(fixture.right_rows(), [(malformed.clone(), value.clone())]);
+        {
+            let transaction = fixture.transactions.begin();
+            assert!(
+                fixture
+                    .frame
+                    .access(transaction.access())
+                    .unwrap()
+                    .get()
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                fixture
+                    .raw_left
+                    .access(transaction.access())
+                    .unwrap()
+                    .scan(
+                        ..,
+                        ScanDirection::Ascending,
+                        None,
+                        ScanLimit::new(1, 4096).unwrap(),
+                    )
+                    .unwrap()
+                    .entries
+                    .is_empty()
+            );
+        }
+        fixture = fixture.reopen();
+    }
+}
+
+#[test]
+fn a_multi_event_right_input_keeps_each_left_old_new_correction_in_order() {
+    let old = (Some(1), Some(10), 10);
+    let first = (Some(1), Some(15), 15);
+    let last = (Some(1), Some(18), 18);
+    let left_a = (Some(1), Some(20), 101);
+    let left_b = (Some(1), Some(30), 102);
+    let expected = vec![
+        ((left_a, Some(old)), -2),
+        ((left_a, Some(first)), 2),
+        ((left_b, Some(old)), -3),
+        ((left_b, Some(first)), 3),
+        ((left_a, Some(first)), -2),
+        ((left_a, Some(old)), 2),
+        ((left_b, Some(first)), -3),
+        ((left_b, Some(old)), 3),
+        ((left_a, Some(old)), -2),
+        ((left_a, Some(last)), 2),
+        ((left_b, Some(old)), -3),
+        ((left_b, Some(last)), 3),
+    ];
+    for items in [1, 256] {
+        let mut fixture = Fixture::new(AsOfDirection::Backward { allow_exact: true });
+        fixture.run(1, &change(&[(old, 1)]), items);
+        fixture.run(0, &change(&[(left_a, 2), (left_b, 3)]), items);
+        fixture = fixture.reopen();
+        let input = change(&[(first, 1), (first, -1), (last, 1)]);
+        let mut trace = Vec::new();
+        loop {
+            let step = fixture.page(1, &input, items, true).unwrap();
+            if let Some(change) = step.output {
+                trace.extend(output(&change));
+            }
+            let done = step.progress == Progress::Done;
+            fixture = fixture.reopen();
+            if done {
+                break;
+            }
+        }
+        assert_eq!(trace, expected, "items={items}");
+        assert_eq!(fixture.right_rows().len(), 2);
+    }
+}
+
+fn nested_list_event(
+    schema: &Arc<Schema>,
+    item: &Arc<Field>,
+    data_type: &DataType,
+    at: i64,
+    length: i32,
+) -> Change {
+    use arrow_array::{ArrayRef, ListArray, NullArray};
+    use arrow_buffer::OffsetBuffer;
+    let length_usize = usize::try_from(length).unwrap();
+    let values: ArrayRef = if *data_type == DataType::Null {
+        Arc::new(NullArray::new(length_usize))
+    } else {
+        Arc::new(UInt64Array::from(vec![7; length_usize]))
+    };
+    Change::try_new(
+        RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![
+                Arc::new(Int64Array::from(vec![at])),
+                Arc::new(ListArray::new(
+                    Arc::clone(item),
+                    OffsetBuffer::new(vec![0, length].into()),
+                    values,
+                    None,
+                )),
+            ],
+        )
+        .unwrap(),
+        Int64Array::from(vec![1]),
+    )
+    .unwrap()
+}
+
+fn assert_nested_winner(output: &Change, data_type: &DataType) {
+    use arrow_array::ListArray;
+    assert_eq!(output.num_rows(), 1);
+    assert_eq!(output.diffs().value(0), 1);
+    let list = output
+        .records()
+        .column(3)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    assert_eq!(list.value_length(0), 128 * 1024);
+    assert_eq!(list.values().data_type(), data_type);
+    if *data_type == DataType::UInt64 {
+        assert!(
+            list.values()
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .values()
+                .iter()
+                .all(|value| *value == 7)
+        );
+    }
+}
+
+#[test]
+fn nested_winners_admit_null_children_and_charge_actual_nonnull_payload() {
+    for data_type in [DataType::Null, DataType::UInt64] {
+        let item = Arc::new(Field::new(
+            "item",
+            data_type.clone(),
+            data_type == DataType::Null,
+        ));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("at", DataType::Int64, false),
+            Field::new("items", DataType::List(Arc::clone(&item)), false),
+        ]));
+        let (_root, operation, left_rows, mut transactions) =
+            asof_runtime_fixture(&schema, AsOfDirection::Backward { allow_exact: true });
+        let event = |at, length| nested_list_event(&schema, &item, &data_type, at, length);
+        let right = event(10, 128 * 1024);
+        {
+            let transaction = transactions.begin();
+            let step = operation
+                .step(
+                    OperationInput {
+                        port: 1,
+                        change: &right,
+                    },
+                    &operation.initial_resume(),
+                    transaction.access(),
+                    &mut StepBudget::new(1, 64 * 1024 * 1024),
+                )
+                .unwrap();
+            assert_eq!(step.progress, Progress::Done);
+            assert!(step.output.is_none());
+            transaction.commit().unwrap();
+        }
+        let left = event(20, 0);
+        {
+            let transaction = transactions.begin();
+            let result = operation.step(
+                OperationInput {
+                    port: 0,
+                    change: &left,
+                },
+                &operation.initial_resume(),
+                transaction.access(),
+                &mut StepBudget::new(1, 2 * 1024 * 1024),
+            );
+            if data_type == DataType::Null {
+                let step = result.unwrap();
+                assert_eq!(step.progress, Progress::Done);
+                assert_eq!(step.output.unwrap().num_rows(), 1);
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .is::<dogpaddle_operation::operation::BudgetExceeded>()
+                );
+            }
+            // Both the successful probe and the budget refusal roll back.
+        }
+        {
+            let transaction = transactions.begin();
+            assert!(
+                left_rows
+                    .access(transaction.access())
+                    .unwrap()
+                    .scan(
+                        ..,
+                        ScanDirection::Ascending,
+                        None,
+                        ScanLimit::new(1, 1024).unwrap(),
+                    )
+                    .unwrap()
+                    .entries
+                    .is_empty()
+            );
+        }
+        let transaction = transactions.begin();
+        let step = operation
+            .step(
+                OperationInput {
+                    port: 0,
+                    change: &left,
+                },
+                &operation.initial_resume(),
+                transaction.access(),
+                &mut StepBudget::new(1, 64 * 1024 * 1024),
+            )
+            .unwrap();
+        assert_eq!(step.progress, Progress::Done);
+        let output = step.output.unwrap();
+        assert_nested_winner(&output, &data_type);
+        transaction.commit().unwrap();
+    }
+}

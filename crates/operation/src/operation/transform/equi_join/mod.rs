@@ -38,7 +38,6 @@ fn construct(
         output_schema: layout.output_schema,
         keys: layout.keys,
         residual: layout.residual,
-        nulls: layout.nulls,
         left_rows,
         right_rows,
         match_counts,
@@ -163,9 +162,6 @@ pub enum EquiJoinSchemaError {
         /// Supplied name count.
         actual: usize,
     },
-    /// An input field cannot be represented as a typed NULL for outer output.
-    #[error("equi-join cannot construct NULL padding")]
-    NullPadding(#[source] DataFusionError),
 }
 
 /// Failure during one `EquiJoinOperation` step.

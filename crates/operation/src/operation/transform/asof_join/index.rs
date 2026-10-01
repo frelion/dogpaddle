@@ -68,6 +68,14 @@ pub(super) fn parse_row_key(encoded: &[u8]) -> Result<ParsedIndexKey<'_>, IndexC
     })
 }
 
+/// Validates both headers without materializing them and borrows the row suffix.
+pub(super) fn row_suffix(encoded: &[u8]) -> Result<&[u8], IndexCodecError> {
+    let mut remaining = encoded;
+    consume_component(&mut remaining, |_| {})?;
+    consume_component(&mut remaining, |_| {})?;
+    Ok(remaining)
+}
+
 /// Returns the smallest byte key strictly above every key beginning with `prefix`.
 pub(super) fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
     let mut successor = prefix.to_vec();
@@ -92,15 +100,23 @@ pub(super) fn push_component(output: &mut Vec<u8>, component: &[u8]) {
     output.extend_from_slice(&[ESCAPE, TERMINATOR]);
 }
 
-pub(super) fn take_component(remaining: &mut &[u8]) -> Result<Vec<u8>, IndexCodecError> {
+fn take_component(remaining: &mut &[u8]) -> Result<Vec<u8>, IndexCodecError> {
     let mut decoded = Vec::new();
+    consume_component(remaining, |byte| decoded.push(byte))?;
+    Ok(decoded)
+}
+
+fn consume_component(
+    remaining: &mut &[u8],
+    mut decoded: impl FnMut(u8),
+) -> Result<(), IndexCodecError> {
     loop {
         let (&byte, rest) = remaining
             .split_first()
             .ok_or(IndexCodecError::TruncatedComponent)?;
         *remaining = rest;
         if byte != ESCAPE {
-            decoded.push(byte);
+            decoded(byte);
             continue;
         }
         let (&marker, rest) = remaining
@@ -108,8 +124,8 @@ pub(super) fn take_component(remaining: &mut &[u8]) -> Result<Vec<u8>, IndexCode
             .ok_or(IndexCodecError::TruncatedComponent)?;
         *remaining = rest;
         match marker {
-            TERMINATOR => return Ok(decoded),
-            ESCAPED_ZERO => decoded.push(0),
+            TERMINATOR => return Ok(()),
+            ESCAPED_ZERO => decoded(0),
             _ => return Err(IndexCodecError::InvalidEscape),
         }
     }
@@ -126,14 +142,21 @@ mod tests {
         assert_eq!(decoded.partition, b"p\0");
         assert_eq!(decoded.order, b"o");
         assert_eq!(decoded.row, b"r\0");
+        assert_eq!(row_suffix(&key).unwrap(), decoded.row);
         let header = order_prefix(b"p\0", b"o");
         for length in 0..header.len() {
             assert!(parse_row_key(&key[..length]).is_err());
+            assert!(row_suffix(&key[..length]).is_err());
         }
         assert!(parse_row_key(&header).unwrap().row.is_empty());
         assert_eq!(parse_row_key(&[0, 1]), Err(IndexCodecError::InvalidEscape));
+        assert_eq!(row_suffix(&[0, 1]), Err(IndexCodecError::InvalidEscape));
         assert_eq!(
             parse_row_key(&[0, 0, 0, 1]),
+            Err(IndexCodecError::InvalidEscape)
+        );
+        assert_eq!(
+            row_suffix(&[0, 0, 0, 1]),
             Err(IndexCodecError::InvalidEscape)
         );
     }

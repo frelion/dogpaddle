@@ -3,7 +3,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use arrow_schema::{DataType, Schema, SchemaRef};
-use datafusion_common::{DFSchema, ScalarValue, TableReference};
+use datafusion_common::{DFSchema, TableReference};
 
 use crate::{
     ConstructedOperation, Expr, OperationSchemaError,
@@ -27,7 +27,6 @@ pub(crate) struct EquiJoinLayout {
     pub(super) output_schema: SchemaRef,
     pub(super) keys: Box<[BoundKeyPair]>,
     pub(super) residual: Option<BoundExpression>,
-    pub(super) nulls: [Vec<ScalarValue>; 2],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -220,7 +219,6 @@ impl EquiJoinDefinition {
 
         let input_schemas = [Arc::clone(left_schema), Arc::clone(right_schema)];
         let mut output_fields = Vec::with_capacity(expected_names);
-        let mut nulls = [Vec::new(), Vec::new()];
         for (port, schema) in input_schemas.iter().enumerate() {
             if port == 1 && self.kind.left_only() {
                 break;
@@ -233,10 +231,6 @@ impl EquiJoinDefinition {
                     .with_name(&self.output_names[output_fields.len()]);
                 if pad {
                     output = output.with_nullable(true);
-                    nulls[port].push(
-                        ScalarValue::try_from(field.data_type())
-                            .map_err(EquiJoinSchemaError::NullPadding)?,
-                    );
                 }
                 output_fields.push(Arc::new(output));
             }
@@ -250,7 +244,6 @@ impl EquiJoinDefinition {
             output_schema,
             keys: keys.into_boxed_slice(),
             residual,
-            nulls,
         })
     }
 }

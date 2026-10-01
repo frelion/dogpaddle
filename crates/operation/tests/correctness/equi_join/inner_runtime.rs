@@ -150,10 +150,10 @@ fn nested_candidate_decode_is_charged_before_pure_or_residual_output_allocation(
     use arrow_array::ListArray;
     use dogpaddle_operation::{
         lit,
-        operation::{OperationInput, Progress, StepBudget, transform::EquiJoinError},
+        operation::{BudgetExceeded, OperationInput, Progress, StepBudget},
     };
     for residual in [None, Some(lit(true))] {
-        let item = Arc::new(Field::new("item", DataType::Null, true));
+        let item = Arc::new(Field::new("item", DataType::UInt64, false));
         let schema = Arc::new(Schema::new(vec![
             Field::new("key", DataType::UInt64, false),
             Field::new("items", DataType::List(Arc::clone(&item)), false),
@@ -167,7 +167,7 @@ fn nested_candidate_decode_is_charged_before_pure_or_residual_output_allocation(
         .unwrap();
         let (_root, operation, left_rows, mut transactions) = runtime_fixture(&schema, definition);
         let event = |length| list_event(&schema, &item, length);
-        let right = event(128 * 1024);
+        let right = event(96 * 1024);
         {
             let transaction = transactions.begin();
             let step = operation
@@ -185,7 +185,9 @@ fn nested_candidate_decode_is_charged_before_pure_or_residual_output_allocation(
             assert!(step.output.is_none());
             transaction.commit().unwrap();
         }
-        let left = event(0);
+        // Both sides contribute real Arrow payload. The budget still admits
+        // the 864 KiB canonical candidate scan, then refuses its joined arrays.
+        let left = event(16 * 1024);
         {
             let transaction = transactions.begin();
             let error = operation
@@ -196,13 +198,14 @@ fn nested_candidate_decode_is_charged_before_pure_or_residual_output_allocation(
                     },
                     &operation.initial_resume(),
                     transaction.access(),
-                    &mut StepBudget::new(1, 4 * 1024 * 1024),
+                    &mut StepBudget::new(1, 2 * 1024 * 1024 + 128 * 1024),
                 )
                 .unwrap_err();
-            assert!(matches!(
-                error.downcast_ref::<EquiJoinError>(),
-                Some(EquiJoinError::Budget(_))
-            ));
+            let cause: &(dyn std::error::Error + 'static) = error.as_ref();
+            assert!(
+                std::iter::successors(Some(cause), |cause| cause.source())
+                    .any(<dyn std::error::Error>::is::<BudgetExceeded>)
+            );
             assert!(
                 left_rows
                     .access(transaction.access())
@@ -240,7 +243,7 @@ fn nested_candidate_decode_is_charged_before_pure_or_residual_output_allocation(
                 .as_any()
                 .downcast_ref::<ListArray>()
                 .unwrap();
-            assert_eq!(list.value_length(0), 128 * 1024);
+            assert_eq!(list.value_length(0), 96 * 1024);
             transaction.commit().unwrap();
         }
     }
@@ -262,7 +265,7 @@ fn nested_candidate_budget_rejection_can_retry_smaller_pages_without_losing_rows
     use dogpaddle_store::StoreValue;
 
     for residual in [None, Some(lit(true))] {
-        let item = Arc::new(Field::new("item", DataType::Null, true));
+        let item = Arc::new(Field::new("item", DataType::UInt64, false));
         let schema = Arc::new(Schema::new(vec![
             Field::new("key", DataType::UInt64, false),
             Field::new("items", DataType::List(Arc::clone(&item)), false),
@@ -275,7 +278,7 @@ fn nested_candidate_budget_rejection_can_retry_smaller_pages_without_losing_rows
         )
         .unwrap();
         let (_root, operation, _left_rows, mut transactions) = runtime_fixture(&schema, definition);
-        for length in 8192..8208 {
+        for length in 4096..4112 {
             let right = list_event(&schema, &item, length);
             let transaction = transactions.begin();
             let step = operation
@@ -292,7 +295,9 @@ fn nested_candidate_budget_rejection_can_retry_smaller_pages_without_losing_rows
             assert_eq!(step.progress, Progress::Done);
             transaction.commit().unwrap();
         }
-        let left = list_event(&schema, &item, 0);
+        // Repeating the driving payload makes a multi-candidate Arrow page
+        // exceed the budget while each individual candidate still fits.
+        let left = list_event(&schema, &item, 4096);
         let mut resume = operation.initial_resume();
         let mut lengths = Vec::new();
         let mut refused = false;
@@ -307,7 +312,7 @@ fn nested_candidate_budget_rejection_can_retry_smaller_pages_without_losing_rows
                     },
                     &resume,
                     transaction.access(),
-                    &mut StepBudget::new(items, 4 * 1024 * 1024),
+                    &mut StepBudget::new(items, 512 * 1024),
                 ) {
                     Ok(step) => {
                         transaction.commit().unwrap();
@@ -353,7 +358,7 @@ fn nested_candidate_budget_rejection_can_retry_smaller_pages_without_losing_rows
             "nested reconstruction must exercise the retry path"
         );
         lengths.sort_unstable();
-        assert_eq!(lengths, (8192..8208).collect::<Vec<_>>());
+        assert_eq!(lengths, (4096..4112).collect::<Vec<_>>());
     }
 }
 
@@ -398,7 +403,7 @@ fn list_event(
     item: &Arc<Field>,
     length: i32,
 ) -> dogpaddle_change::Change {
-    use arrow_array::{Int64Array, ListArray, NullArray, RecordBatch, UInt64Array};
+    use arrow_array::{Int64Array, ListArray, RecordBatch, UInt64Array};
     use arrow_buffer::OffsetBuffer;
     dogpaddle_change::Change::try_new(
         RecordBatch::try_new(
@@ -408,7 +413,9 @@ fn list_event(
                 Arc::new(ListArray::new(
                     Arc::clone(item),
                     OffsetBuffer::new(vec![0, length].into()),
-                    Arc::new(NullArray::new(usize::try_from(length).unwrap())),
+                    Arc::new(UInt64Array::from_iter_values(
+                        0..u64::try_from(length).unwrap(),
+                    )),
                     None,
                 )),
             ],
@@ -513,7 +520,13 @@ fn rejected_wide_output_still_charges_pure_and_residual_candidate_reads() {
                     &mut budget,
                 )
                 .unwrap_err();
-            assert!(error.is::<BudgetExceeded>());
+            assert!(
+                std::iter::successors(
+                    Some(error.as_ref() as &(dyn std::error::Error + 'static)),
+                    |cause| cause.source(),
+                )
+                .any(<dyn std::error::Error>::is::<BudgetExceeded>)
+            );
             // At least sixteen 1800-byte payloads fit the encoded scan page,
             // even though their 206-column output cannot fit the remaining budget.
             assert!(80 * 1024 - budget.remaining_bytes() >= 16 * 1800);
@@ -642,7 +655,7 @@ fn empty_nested_child_shape_budget_failure_rolls_back_and_reopens_for_complete_o
                 },
                 &resume,
                 transaction.access(),
-                &mut StepBudget::new(1, 512 * 1024),
+                &mut StepBudget::new(1, 16 * 1024),
             )
             .unwrap_err();
         assert!(
@@ -690,7 +703,7 @@ fn empty_nested_child_shape_budget_failure_rolls_back_and_reopens_for_complete_o
                 },
                 &resume,
                 transaction.access(),
-                &mut StepBudget::new(1, 16 * 1024 * 1024),
+                &mut StepBudget::new(1, 128 * 1024),
             )
             .unwrap();
         assert_eq!(step.progress, Progress::Done);

@@ -135,9 +135,6 @@ pub enum AsOfJoinSchemaError {
         /// Supplied name count.
         actual: usize,
     },
-    /// A right input field cannot be represented as typed NULL padding.
-    #[error("ASOF join cannot construct NULL padding")]
-    NullPadding(#[source] DataFusionError),
 }
 
 /// Failure during one `AsOfJoinOperation` step.

@@ -137,6 +137,7 @@ struct Fixture {
     definition: AsOfJoinDefinition,
     operation: Operation,
     frame: Cell<Resume>,
+    raw_left: OrderedMap<Vec<u8>, Vec<u8>>,
     raw_right: OrderedMap<Vec<u8>, Vec<u8>>,
     transactions: Transactions,
 }
@@ -171,12 +172,14 @@ impl Fixture {
             .into_parts()
             .0;
         let frame = store.open_data("test.frame").unwrap();
+        let raw_left = store.open_data("operation/asof_join.left_index").unwrap();
         let raw_right = store.open_data("operation/asof_join.right_index").unwrap();
         Self {
             root,
             definition,
             operation,
             frame,
+            raw_left,
             raw_right,
             transactions: store.into_transactions(),
         }
@@ -187,6 +190,7 @@ impl Fixture {
             definition,
             operation,
             frame: _,
+            raw_left: _,
             raw_right: _,
             transactions,
         } = self;
@@ -202,12 +206,14 @@ impl Fixture {
             .into_parts()
             .0;
         let frame = store.open_data("test.frame").unwrap();
+        let raw_left = store.open_data("operation/asof_join.left_index").unwrap();
         let raw_right = store.open_data("operation/asof_join.right_index").unwrap();
         Self {
             root,
             definition,
             operation,
             frame,
+            raw_left,
             raw_right,
             transactions: store.into_transactions(),
         }
@@ -687,7 +693,7 @@ fn shared_winners_still_admit_every_output_reconstruction() {
     let replacement = payload_event(&schema, 15, 1, &new_payload);
     {
         let transaction = transactions.begin();
-        let error = operation
+        let step = operation
             .step(
                 OperationInput {
                     port: 1,
@@ -696,6 +702,42 @@ fn shared_winners_still_admit_every_output_reconstruction() {
                 &operation.initial_resume(),
                 transaction.access(),
                 &mut StepBudget::new(16, 4 * 1024 * 1024),
+            )
+            .unwrap();
+        assert_eq!(step.progress, Progress::Done);
+        let output = step.output.unwrap();
+        assert_eq!(output.num_rows(), 32);
+        let payloads = output
+            .records()
+            .column(5)
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        for row in 0..32 {
+            assert_eq!(output.diffs().value(row), if row % 2 == 0 { -1 } else { 1 });
+            assert_eq!(
+                payloads.value(row),
+                if row % 2 == 0 {
+                    &old_payload
+                } else {
+                    &new_payload
+                }
+            );
+        }
+        // A full page now fits without the retired canonical output copy.
+        // Drop the transaction so the tighter probe sees the original winners.
+    }
+    {
+        let transaction = transactions.begin();
+        let error = operation
+            .step(
+                OperationInput {
+                    port: 1,
+                    change: &replacement,
+                },
+                &operation.initial_resume(),
+                transaction.access(),
+                &mut StepBudget::new(16, 2 * 1024 * 1024),
             )
             .unwrap_err();
         assert!(error.is::<dogpaddle_operation::operation::BudgetExceeded>());
@@ -872,109 +914,6 @@ fn asof_runtime_fixture(
     let left_rows = store.open_data("operation/asof_join.left_index").unwrap();
     (root, operation, left_rows, store.into_transactions())
 }
-#[test]
-fn nested_winner_decode_fails_before_allocating_more_than_the_shared_budget() {
-    use arrow_array::{ListArray, NullArray};
-    use arrow_buffer::OffsetBuffer;
-    let item = Arc::new(Field::new("item", DataType::Null, true));
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("at", DataType::Int64, false),
-        Field::new("items", DataType::List(Arc::clone(&item)), false),
-    ]));
-    let (_root, operation, left_rows, mut transactions) =
-        asof_runtime_fixture(&schema, AsOfDirection::Backward { allow_exact: true });
-    let event = |at, length: i32| {
-        Change::try_new(
-            RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![
-                    Arc::new(Int64Array::from(vec![at])),
-                    Arc::new(ListArray::new(
-                        Arc::clone(&item),
-                        OffsetBuffer::new(vec![0, length].into()),
-                        Arc::new(NullArray::new(usize::try_from(length).unwrap())),
-                        None,
-                    )),
-                ],
-            )
-            .unwrap(),
-            Int64Array::from(vec![1]),
-        )
-        .unwrap()
-    };
-    let right = event(10, 128 * 1024);
-    {
-        let transaction = transactions.begin();
-        let step = operation
-            .step(
-                OperationInput {
-                    port: 1,
-                    change: &right,
-                },
-                &operation.initial_resume(),
-                transaction.access(),
-                &mut StepBudget::new(1, 4 * 1024 * 1024),
-            )
-            .unwrap();
-        assert_eq!(step.progress, Progress::Done);
-        assert!(step.output.is_none());
-        transaction.commit().unwrap();
-    }
-    let left = event(20, 0);
-    {
-        let transaction = transactions.begin();
-        let error = operation
-            .step(
-                OperationInput {
-                    port: 0,
-                    change: &left,
-                },
-                &operation.initial_resume(),
-                transaction.access(),
-                &mut StepBudget::new(1, 4 * 1024 * 1024),
-            )
-            .unwrap_err();
-        assert!(error.is::<dogpaddle_operation::operation::BudgetExceeded>());
-        assert!(
-            left_rows
-                .access(transaction.access())
-                .unwrap()
-                .scan(
-                    ..,
-                    ScanDirection::Ascending,
-                    None,
-                    ScanLimit::new(1, 1024).unwrap()
-                )
-                .unwrap()
-                .entries
-                .is_empty()
-        );
-    }
-    let transaction = transactions.begin();
-    let step = operation
-        .step(
-            OperationInput {
-                port: 0,
-                change: &left,
-            },
-            &operation.initial_resume(),
-            transaction.access(),
-            &mut StepBudget::new(1, 64 * 1024 * 1024),
-        )
-        .unwrap();
-    assert_eq!(step.progress, Progress::Done);
-    let output = step.output.unwrap();
-    assert_eq!(output.num_rows(), 1);
-    let list = output
-        .records()
-        .column(3)
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .unwrap();
-    assert_eq!(list.value_length(0), 128 * 1024);
-    transaction.commit().unwrap();
-}
-
 #[test]
 fn raw_plan_business_validation_precedes_store_handle_access() {
     let mut payload =

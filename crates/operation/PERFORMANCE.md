@@ -449,3 +449,131 @@ RocksDB native heap、WAL、磁盘或跨数据库吞吐。
 `rejected-single-pass-product5.patch`、`single-pass-witness-runs.json`；临时程序
 错误文本 oracle 与 trait-object 编译修复记录也保留，最终对照只使用修复后的
 同一程序和成功构建的二进制。
+
+## 直接 Arrow Join 输出：2026-10-02 配对对照
+
+Join 候选与输出现在直接追加到 Arrow builders，退休 owned ScalarValue 行、
+canonical 输出副本、两种 Join 的 Scalar 输出容器和 NULL Scalar 缓存。
+原 canonical bytes、hash、Store layout 与 Resume 不变；实际 Arrow payload、
+nested shape 和 diff buffers 仍逐批准入。ASOF 仅需 row suffix 时共用原 framing
+解析器跳过两个索引 header，不重复分配 partition/order。
+
+Apple M5、aarch64 macOS/Darwin 25.6、APFS、Rust 1.96.0；release build。
+CPU targets 每场景 10 samples、100 ms warmup、5 秒目标 measurement；
+EquiJoin 和 ASOF 都计完整 insert/retract 输入、所有分页和同步提交，ASOF 还计失败
+尝试及确定性缩页。fixture、seed、关系 oracle 和 teardown 不计时。资源 targets
+使用 smoke profile，不能与 reference CPU 的绝对规模混算。
+
+基线是 `4f9e394b1cfe98c2b4ffe7aab87c4abf6e8dacef`；candidate 是其冻结的
+未提交产品 diff。四个 benchmark 源文件、workload 和 oracle 未改。每个二进制由
+fresh=false 的 release compiler artifact 复制到独立目录并验证 SHA；运行顺序为
+baseline、candidate、candidate、baseline，期间没有 Cargo、native gate 或容器工作。
+原始 build/source context、全部 samples/estimates、80 条 resource 记录和 32 次
+同源 rollback witness 位于 `/tmp/dogpaddle-arrow-relation-pages-performance-v3`；
+`comparison.json` 保留完整数据和 CI，`runs.json` 记录实际退出码。基线复制前的
+原 build context 在 `/tmp/dogpaddle-arrow-relation-pages-performance`，复制上下文
+保存其来源并再次核验二进制。
+
+| target | baseline binary SHA-256 | candidate binary SHA-256 |
+| --- | --- | --- |
+| equi_join | `9aad6e7afd073a1bdff021f1da2a44833b4c6811e0b02ffd584ad493d7fd123c` | `9301bef7d528df9e4df65dcb30ffab8885f5e73618edc51bcc55fdb693d5c962` |
+| asof_join | `0f715cf8dca9ee189aa79061b495d969155996be7e48518a49aea7849a5b6abb` | `6ec24029076bdef30ccd1016ebd510f8317a4adb3aa7cb9b78bd738b7263f0de` |
+| equi_join_resources | `f7fe1fce44114fe78dae6b24e080e5675c102da59087d1beee941fc62c5fe1e5` | `e5ce41ba5da3fdac7eb5308742b287aa6d0f9f979e67e23c2dca1096c2898f8f` |
+| asof_join_resources | `ad99c5314e1e444c5a5a95d85f0aca5fbeeec82fba3465c171b027b08351cd8e` | `6299eb540502a61f0f741ea4a519e004c65a562f2cba14c20084b78f02f45ec9` |
+
+下表中位数单位 µs；首轮是 baseline → candidate，反向轮是 candidate → baseline。
+变化为 candidate / baseline - 1，负值表示耗时下降；CI 为中位数 95% bootstrap CI。
+两轮 CI 的完整端点保存在原始 estimates，表中逐轮标出是否重叠。
+
+| 场景 | 首轮 A / C | 首轮变化 | 反向 A / C | 反向变化 | CI 重叠：首 / 反 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| equi_join/full_outer_first_last_match | 557.041 / 572.725 | +2.82% | 568.418 / 571.669 | +0.57% | 否 / 是 |
+| equi_join/full_outer_residual_partial_transition | 3026.139 / 2984.860 | -1.36% | 3010.894 / 2935.973 | -2.49% | 是 / 是 |
+| equi_join/inner_first_last_match | 454.834 / 422.576 | -7.09% | 473.336 / 416.873 | -11.93% | 否 / 否 |
+| equi_join/inner_residual_full_selectivity | 643.775 / 551.086 | -14.40% | 659.338 / 555.726 | -15.71% | 否 / 否 |
+| equi_join/inner_residual_half_selective | 543.518 / 476.330 | -12.36% | 563.099 / 485.676 | -13.75% | 否 / 否 |
+| equi_join/inner_residual_zero_selectivity | 442.179 / 399.592 | -9.63% | 459.894 / 407.704 | -11.35% | 否 / 否 |
+| equi_join/left_semi_first_last_match | 443.703 / 362.227 | -18.36% | 446.372 / 364.141 | -18.42% | 否 / 否 |
+| equi_join/left_semi_presence_stable | 45.339 / 44.923 | -0.92% | 45.335 / 44.971 | -0.80% | 是 / 是 |
+| equi_join/left_semi_residual_left_presence_stable | 45.238 / 47.395 | +4.77% | 47.309 / 45.008 | -4.86% | 是 / 是 |
+| equi_join/left_semi_residual_partial_transition | 2922.241 / 2856.582 | -2.25% | 2857.849 / 2877.013 | +0.67% | 是 / 是 |
+| equi_join/left_semi_residual_presence_stable | 43.170 / 43.333 | +0.38% | 43.430 / 43.352 | -0.18% | 是 / 是 |
+| asof_join/global_partition_lookup | 50.996 / 46.508 | -8.80% | 50.745 / 50.374 | -0.73% | 否 / 是 |
+| asof_join/partitioned_lookup | 3111.243 / 2946.148 | -5.31% | 3111.060 / 2922.737 | -6.05% | 是 / 否 |
+| asof_join/right_historical_full_rematch | 166.449 / 145.018 | -12.88% | 164.998 / 145.793 | -11.64% | 否 / 否 |
+| asof_join/right_tail_small_rematch | 68.927 / 64.998 | -5.70% | 68.925 / 68.237 | -1.00% | 否 / 是 |
+| asof_join/right_wide_winner_rematch | 23904.519 / 13393.261 | -43.97% | 28532.351 / 14513.309 | -49.13% | 否 / 否 |
+
+纯 FullOuter 首轮 +2.82% 且 CI 不重叠，反向 +0.57% 且重叠；不能宣称全面无
+CPU 回归。其余小幅、异号或 CI 重叠的变化不作普遍提速结论。Inner residual 和
+ASOF 历史/宽 winner 的两轮改善均有同向且不重叠的 CI，但仍仅描述本机样本。
+
+资源表单位 bytes，A / C 分别为基线与 candidate；累计包含完整 driving input 的
+所有成功与失败尝试。每版本两轮 resource JSON 完全一致；两版本关系输出数和
+记录到的逻辑 Store 条目数与字节统计一致。allocator 只覆盖 Rust global allocator，排除 fixture、
+seed、input Arrow、RocksDB/native heap；没有 RSS 采样。
+
+| 场景 | 累计 A / C | 峰值 A / C | 页 A / C |
+| --- | ---: | ---: | ---: |
+| equi_join_resources/selectivity_zero | 59951 / 13119 | 31784 / 8856 | 1 / 1 |
+| equi_join_resources/selectivity_half | 101711 / 20207 | 31784 / 9672 | 1 / 1 |
+| equi_join_resources/selectivity_full | 141647 / 24559 | 47736 / 10952 | 1 / 1 |
+| equi_join_resources/wide_zero | 2113231 / 1564895 | 1322904 / 1054008 | 1 / 1 |
+| equi_join_resources/wide_full | 4235759 / 2604175 | 1597208 / 1055080 | 1 / 1 |
+| equi_join_resources/wide_candidate | 798666 / 400474 | 397403 / 264555 | 1 / 1 |
+| equi_join_resources/page_boundary | 517399 / 79839 | 152174 / 37691 | 2 / 2 |
+| equi_join_resources/large_fanout | 1546862 / 246278 | 188169 / 37745 | 4 / 4 |
+| equi_join_resources/batch | 1502507 / 1502219 | 292265 / 292121 | 2 / 2 |
+| equi_join_resources/computed_keys | 3000400 / 3000112 | 159808 / 159664 | 2 / 2 |
+| equi_join_resources/full_outer_state | 276573 / 54405 | 72885 / 21467 | 1 / 1 |
+| equi_join_resources/full_outer_wide_state | 64377747 / 53033459 | 2183334 / 1628849 | 8 / 8 |
+| equi_join_resources/nested_list_values | 420587 / 129679 | 95276 / 57024 | 1 / 1 |
+| equi_join_resources/nested_empty_child_shape | 981883 / 46127 | 118804 / 13540 | 1 / 1 |
+| asof_join_resources/left_lookup_history | 5790 / 4766 | 3017 / 2078 | 1 / 1 |
+| asof_join_resources/right_historical_interval | 1139900 / 149156 | 228904 / 56664 | 2 / 2 |
+| asof_join_resources/right_empty_interval | 2415 / 2271 | 1110 / 966 | 1 / 1 |
+| asof_join_resources/right_null_left_history | 2350 / 2206 | 999 / 855 | 1 / 1 |
+| asof_join_resources/left_lookup_zero_payload | 270214 / 135902 | 199653 / 132677 | 1 / 1 |
+| asof_join_resources/right_zero_payload_rematch | 402859512 / 196376802 | 1643094 / 2298688 | 64 / 32 |
+
+EquiJoin 全部完整输入的 current Rust heap 都回到零；输出 Arrow capacity 字节可能
+不同，原始 resource 记录保留了该差异。nested empty child 累计 -95.30%、峰值
+-88.60%；宽 FullOuter 累计 -17.62%、峰值 -25.40%，均保持原页数、输出行数及所记录状态统计。
+ASOF 宽 rematch 同一 4 MiB 逻辑预算下页数 64 → 32、失败尝试 315 → 124，累计
+-51.25%，但峰值 1,643,094 → 2,298,688（+39.90%）：每页容纳更多真实输出。
+仍逐输出计 winner payload，未删除真实 Arrow 费用；不能据此承诺全面降低峰值或
+进程 RSS。其他五个 ASOF 资源场景的失败尝试都为零，两版本相同。
+
+另一个配对 witness 使用同一份临时 Rust 源码与独立完整输出/rollback oracle，
+源码 SHA-256 为 `950ae40ed574fa5e9cf3d74c14a464c88b0c12c0d6884066ea3a3ae7076ff5c5`。
+它不是通用实验框架或产品 API；成功和拒绝的每次尝试都回滚，再比较完整 raw left
+Rows、空 right Rows、原 Resume 字节并 readonly reopen。成功输出逐字段匹配源 Arrow。
+每版本每场景两次，32 次全部成功；下表各版本两次测量相同。
+
+| witness | 结果 A / C | 尝试 A / C | 累计 A / C | 峰值 A / C | current A / C |
+| --- | --- | ---: | ---: | ---: | ---: |
+| nonempty | 成功并回滚 / 成功并回滚 | 1 / 1 | 58810 / 35353 | 44735 / 13511 | 6819 / 7131 |
+| small_empty | 成功并回滚 / 成功并回滚 | 1 / 1 | 134758 / 47801 | 90495 / 13275 | 5931 / 9327 |
+| shape_gap | 预算拒绝 / 成功并回滚 | 9 / 1 | 116403 / 566249 | 11967 / 147531 | 6 / 105711 |
+| late_budget | 预算拒绝 / 成功并回滚 | 9 / 1 | 6072819 / 3044729 | 673823 / 1331239 | 6 / 658395 |
+| utf8 | 同类语义拒绝 / 同类语义拒绝 | 1 / 1 | 69505 / 67809 | 68503 / 66975 | 36 / 36 |
+| trailing | 同类语义拒绝 / 同类语义拒绝 | 1 / 1 | 69507 / 67811 | 68504 / 66976 | 37 / 37 |
+| null | 同类语义拒绝 / 同类语义拒绝 | 1 / 1 | 69606 / 67910 | 68507 / 66979 | 76 / 76 |
+| truncated | 同类语义拒绝 / 同类语义拒绝 | 1 / 1 | 69494 / 67798 | 68502 / 66974 | 26 / 26 |
+
+shape_gap（256 child fields、1024 outer elements）和 late_budget（60,000 UInt64
+elements、128 KiB prefix）现在在 4 MiB 内合法成功。两版本做了不同的工作，不能
+把该表的 peak/current 或耗时变化当相同拒绝路径的回归/提速。nonempty/small_empty
+的 retained 输出 heap 略增，current 不是泄漏断言；四种 malformed 的 current 是仍
+持有的错误文本 outcome String。所有源码、lock、binary SHA 和实际退出码由 paired-witness context
+与日志保存；基线 witness 的全部产品源逐字节核对为 4f9e394。
+
+两个先前实现没有交付：S0 canonical 输出缓冲使宽 FullOuter 累计分配 +60.33%，
+宽 ASOF +131.34%；S1 虽整批准入后再复制，仍有宽 FullOuter +60.19%，ASOF
+历史/宽 winner CPU +29%～49%（两轮 CI 不重叠）。原始负结果保留在
+`/tmp/dogpaddle-arrow-relation-pages-performance` 和 `-performance-v2`。
+最终直接 Arrow 路径删除这些额外复制和只取后缀时的 allocating index decode；
+没有通过改 workload、放宽 framing 或恢复 phantom 费用来抹掉负结果。
+correctness 另证明更紧预算仍拒绝并回滚真实 payload，以及单候选可重试和完整结果；
+whole-workspace gate 和 native SQL 组合验证分别记录实际执行，不能把 smoke/test
+mode 当 release 性能证据。
