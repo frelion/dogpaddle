@@ -376,3 +376,76 @@ payload 的结果，不代表任意编码或数据库文件大小减半。benchm
 源码和 binary SHA 位于 `/tmp/dogpaddle-asof-row-suffix-performance/`，
 对照为 `comparison.json` 与 `resource-comparison.json`。初次格式化的 module 路径错误
 与首次编译的借用生命周期错误均已修复，负证据保留；上述对照仅使用修复后的 release binary。
+
+## 空 List 子类型 shape 准入：2026-10-01 对照
+
+保留 canonical row 的全行 framing/逻辑费用预验与原实际 decoder，只在 present
+空 List 分支调用已有 shape 计费函数；该函数从 `admit_null_array` 改名为
+`admit_array_shape`，算法不变。生产 Rust 净增加 3 行，不增加类型、缓存、codec、
+状态或重试机制。canonical bytes、row hash 与资源布局不变；空子类型的形状费用
+补计可能缩小合法页，或使最小行报 `BudgetExceeded`。逻辑费不是 Arrow 所有对象的
+精确物理成本，不构成严格 RSS 上限；Boolean 等语义仍由实际 decoder 检查。
+
+同一 Apple M5/macOS arm64/Rust 1.96 与锁文件，baseline 为 `fcca35f`，
+candidate 为同一基线加本轮修复。原 11 个 `equi_join` Criterion fixture、计时与
+输出行数/方向 oracle 未改，reference 为 1024 fanout，每 case 10 samples、100 ms
+warmup、5 s measurement。保存的 release binaries 按 baseline/candidate/
+candidate/baseline 运行。下表为 mean 变化，负数表示耗时减少；CI 栏为两侧
+mean 的 95% CI 是否重叠。
+
+| case | 正序变化 | CI 重叠 | 反序变化 | CI 重叠 |
+| --- | ---: | :---: | ---: | :---: |
+| full_outer_first_last_match | +2.59% | 否 | +0.12% | 是 |
+| full_outer_residual_partial_transition | +0.68% | 是 | -2.03% | 是 |
+| inner_first_last_match | +0.32% | 是 | -1.54% | 是 |
+| inner_residual_full_selectivity | +3.56% | 否 | -0.37% | 是 |
+| inner_residual_half_selective | +0.92% | 是 | +1.23% | 是 |
+| inner_residual_zero_selectivity | +2.71% | 否 | +1.02% | 是 |
+| left_semi_first_last_match | +0.59% | 是 | +0.62% | 是 |
+| left_semi_presence_stable | -1.76% | 是 | -0.66% | 是 |
+| left_semi_residual_left_presence_stable | -4.15% | 是 | +2.87% | 否 |
+| left_semi_residual_partial_transition | +1.98% | 是 | +0.26% | 是 |
+| left_semi_residual_presence_stable | +2.41% | 否 | +0.15% | 是 |
+
+正反序结果混合；五个比较出现耗时增加且 CI 分离，反序最大为 +2.87%。
+这一对照不能证明普遍提速或无性能回归。14 个 `equi_join_resources` smoke
+fixture 各按 ABBA 在独立子进程运行，共 56 份记录；每 case 的四份完整对象
+完全相同，包括 Rust 分配、页数、方向、输出和逻辑状态。原 12 个 fixture
+不变；新增两个 fixture 逐字应用到 baseline：8 个候选、4 个 qualifying，
+分别为含 NULL 的 512-element List，以及 16 个空 `List<Struct<16 fields>>`。
+二者均一页输出 4 个正行；累计/峰值 Rust bytes 分别为 420587/95276、
+981883/118804。fixture、seed、input 在 profiler 前建立；benchmark 检查
+行数与方向，逐值关系由 correctness 和下述公开 Operation 程序验证。
+
+另用仓库外相同公开 Operation API 程序运行 8 个场景的 ABBA，共 32 个独立
+进程；所有进程成功退出，每版本各场景的两份完整记录相同。profiler 包含
+begin、step、全部失败重试和事务 drop，成功 output 保留至统计；fixture、
+逐值 oracle、完整 Rows/Resume 校验和只读 reopen 在 profiler 外。所有尝试
+都回滚，因此这一对照不代表 commit 吞吐或端到端 SQL 性能。
+
+| 场景 | 累计 Rust bytes 旧 → 新 | Rust peak bytes 旧 → 新 | 结果与尝试次数 |
+| --- | ---: | ---: | --- |
+| 512-element 非空 List | 58810 → 58810 | 44735 → 44735 | 两版本成功后回滚，各 1 次 |
+| 16 个空 inner List、16 个 Struct fields | 134758 → 134758 | 90495 → 90495 | 两版本成功后回滚，各 1 次 |
+| 1024 个空 inner List、256 个 Struct fields | 105580054 → 116403 | 80152767 → 11967 | 旧版漏费准入 1 次；新版 Budget 失败 9 次，最终 head=1 |
+| 128 KiB 前缀后的 late Budget | 6072819 → 6072819 | 673823 → 673823 | 两版本 Budget 失败，各 9 次 |
+| 坏 UTF-8 / trailing / nonnull NULL / truncated | 每 case 69494–69606，旧新相同 | 每 case 68502–68507，旧新相同 | 两版本对应错误，各 1 次 |
+
+宽空子类型把小 canonical row 放大为大量 Arrow shape；补计后在 owned
+重建前拒绝。80 MB → 12 KB 是不同准入结果的失败路径改善，不是等工作量
+吞吐提升。其余七个场景的完整分配和结果记录与旧版完全相同。未测量 RSS、
+RocksDB native heap、WAL、磁盘或跨数据库吞吐。
+
+原先尝试过单次递归边解码边计费，生产 Rust 减少 37 行，但实际失败成本更高，
+已全部撤回。相同 32 进程的旧/单次解码 ABBA 中，宽空 shape 新版九次 Budget
+失败累计分配 877213635 bytes，旧版漏费成功一次为 105580054 bytes；两者
+准入结果不同。等失败结果的 late Budget 各九次仍从 6072819/673823 增至
+7256499/805343 累计/峰值 bytes，四种晚期坏编码也重复物化了前缀。普通成功
+仅节省 64 bytes。最终保留费用预验，拒绝用少 37 行换取明显失败放大。
+
+原始 samples、estimates、56 份 owner resource 记录、32 份最终公开 API 记录、
+源码上下文与 binary SHA 保存在 `/tmp/dogpaddle-canonical-row-decoder-performance/`，
+完整对照为 `final-comparison.json`。撤回的源码、二进制与 32 份负证据独立保存为
+`rejected-single-pass-product5.patch`、`single-pass-witness-runs.json`；临时程序
+错误文本 oracle 与 trait-object 编译修复记录也保留，最终对照只使用修复后的
+同一程序和成功构建的二进制。

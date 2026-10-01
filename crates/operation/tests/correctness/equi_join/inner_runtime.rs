@@ -554,3 +554,157 @@ fn rejected_wide_output_still_charges_pure_and_residual_candidate_reads() {
         assert_eq!(ids, (0..64).collect::<Vec<_>>());
     }
 }
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "One real nested candidate proves budget rollback, reopen and complete output."
+)]
+fn empty_nested_child_shape_budget_failure_rolls_back_and_reopens_for_complete_output() {
+    use arrow_array::{Array, Int64Array, ListArray, RecordBatch, UInt64Array, new_empty_array};
+    use arrow_buffer::OffsetBuffer;
+    use dogpaddle_operation::{
+        lit,
+        operation::{BudgetExceeded, OperationInput, Progress, StepBudget},
+    };
+    let fields = (0..64)
+        .map(|index| Field::new(format!("f{index}"), DataType::Int64, false))
+        .collect::<Vec<_>>();
+    let structure = Arc::new(Field::new("item", DataType::Struct(fields.into()), false));
+    let inner = Arc::new(Field::new(
+        "item",
+        DataType::List(Arc::clone(&structure)),
+        false,
+    ));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("key", DataType::UInt64, false),
+        Field::new("items", DataType::List(Arc::clone(&inner)), false),
+    ]));
+    let event = |length: usize| {
+        let nested = ListArray::new(
+            Arc::clone(&structure),
+            OffsetBuffer::new(vec![0_i32; length + 1].into()),
+            new_empty_array(structure.data_type()),
+            None,
+        );
+        let payload = ListArray::new(
+            Arc::clone(&inner),
+            OffsetBuffer::new(vec![0, i32::try_from(length).unwrap()].into()),
+            Arc::new(nested),
+            None,
+        );
+        dogpaddle_change::Change::try_new(
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(UInt64Array::from(vec![1])), Arc::new(payload)],
+            )
+            .unwrap(),
+            Int64Array::from(vec![1]),
+        )
+        .unwrap()
+    };
+    let definition = EquiJoinDefinition::try_new(
+        EquiJoinKind::Inner,
+        [(col("key"), col("key"))],
+        ["left_key", "left_items", "right_key", "right_items"],
+        Some(lit(true)),
+    )
+    .unwrap();
+    let (root, operation, left_rows, mut transactions) =
+        runtime_fixture(&schema, definition.clone());
+    let right = event(512);
+    {
+        let transaction = transactions.begin();
+        let step = operation
+            .step(
+                OperationInput {
+                    port: 1,
+                    change: &right,
+                },
+                &operation.initial_resume(),
+                transaction.access(),
+                &mut StepBudget::new(1, 16 * 1024 * 1024),
+            )
+            .unwrap();
+        assert_eq!(step.progress, Progress::Done);
+        assert!(step.output.is_none());
+        transaction.commit().unwrap();
+    }
+    let left = event(0);
+    let resume = operation.initial_resume();
+    {
+        let transaction = transactions.begin();
+        let error = operation
+            .step(
+                OperationInput {
+                    port: 0,
+                    change: &left,
+                },
+                &resume,
+                transaction.access(),
+                &mut StepBudget::new(1, 512 * 1024),
+            )
+            .unwrap_err();
+        assert!(
+            std::iter::successors(
+                Some(error.as_ref() as &(dyn std::error::Error + 'static)),
+                |cause| cause.source()
+            )
+            .any(<dyn std::error::Error>::is::<BudgetExceeded>)
+        );
+        assert!(
+            left_rows
+                .access(transaction.access())
+                .unwrap()
+                .scan(
+                    ..,
+                    dogpaddle_store::ScanDirection::Ascending,
+                    None,
+                    dogpaddle_store::ScanLimit::new(1, 1024).unwrap(),
+                )
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+    }
+    drop((operation, transactions));
+    let store = dogpaddle_store::Store::open(root.path().join("store")).unwrap();
+    let operation = OperationDefinition::from(definition)
+        .construct(
+            &[Arc::clone(&schema), Arc::clone(&schema)],
+            &mut store.data_scope().scoped("operation"),
+            RuntimeResource::none(),
+        )
+        .unwrap()
+        .into_parts()
+        .0;
+    assert_eq!(operation.initial_resume(), resume);
+    let mut transactions = store.into_transactions();
+    {
+        let transaction = transactions.begin();
+        let step = operation
+            .step(
+                OperationInput {
+                    port: 0,
+                    change: &left,
+                },
+                &resume,
+                transaction.access(),
+                &mut StepBudget::new(1, 16 * 1024 * 1024),
+            )
+            .unwrap();
+        assert_eq!(step.progress, Progress::Done);
+        let output = step.output.unwrap();
+        assert_eq!(output.num_rows(), 1);
+        assert_eq!(output.diffs().value(0), 1);
+        assert_eq!(
+            output.records().column(1).to_data(),
+            left.records().column(1).to_data()
+        );
+        assert_eq!(
+            output.records().column(3).to_data(),
+            right.records().column(1).to_data()
+        );
+        transaction.commit().unwrap();
+    }
+}

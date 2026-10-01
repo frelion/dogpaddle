@@ -100,9 +100,10 @@ Resume 是唯一 ordinal 加强类型 cursor，严格 StoreValue codec 限制 co
 Store scans 在读前传 byte bound；已知 key/value/output writes 在写前计费。
 候选扫描成功即计入已读字节，即使后续输出准入拒绝该页；canonical 编码失败前已复制的前缀仍计费。
 需要构造完整行及索引副本时，先无复制检查 canonical 大小，再准入并编码，不能把失败分配留在重试预算之外。
-canonical row 解码先无分配检查 framing，并将顶层及全部嵌套 scalar 槽位、已知 Arrow payload 计入同一预算；
+canonical row 解码先在 owned scalar 与 Arrow 重建前检查全行 framing，并将顶层及全部嵌套 scalar 槽位、已知 Arrow payload 计入同一预算；
 List 声明的整个临时 scalar Vec，以及嵌套数组转换的 owned/borrowed array Vec 槽位，在遍历和分配前准入；
-NULL Struct/List 的 Arrow shape 也计费。这是已知逻辑 scratch 与 payload 的准入，Arrow concat 的全部内部暂存不构成 RSS 硬界。
+NULL Struct/List 和非 NULL 空 List 的子类型 Arrow shape 也在重建前递归计费；此前漏计的空 Struct/List/变长子类型费用可能使合法页缩小，或使最小行报预算不足。Boolean 值等语义仍由实际 decoder 检查，不承诺所有错误都早于重建。
+这是已知逻辑 scratch 与 payload 的准入，Arrow 的 ArrayData/Arc、concat 内部暂存不构成 RSS 硬界；canonical bytes、row hash 与布局不变。
 预算不足回滚整页，Flow 以同一 input 和 Resume 确定性减半 head 额度；最小工作项仍超限时返回 `BudgetExceeded`。
 表达式输出仍可能额外分配；这些逻辑工作界不承诺进程 RSS 或执行时间硬界。
 

@@ -10,7 +10,10 @@ use std::{
     sync::Arc,
 };
 
-use arrow_array::{Array, Int64Array, RecordBatch, StringArray, UInt64Array};
+use arrow_array::{
+    Array, Int64Array, ListArray, RecordBatch, StringArray, UInt64Array, new_empty_array,
+};
+use arrow_buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion_expr::{col, lit};
 use dogpaddle_change::Change;
@@ -45,6 +48,9 @@ enum Invocation {
 
 #[derive(Clone, Copy)]
 enum Scenario {
+    Nested {
+        empty_child: bool,
+    },
     Fanout {
         kind: EquiJoinKind,
         candidates: usize,
@@ -157,6 +163,13 @@ impl Invocation {
 }
 
 impl CaseSpec {
+    const fn nested(name: &'static str, empty_child: bool) -> Self {
+        Self {
+            name,
+            scenario: Scenario::Nested { empty_child },
+        }
+    }
+
     const fn fanout(
         name: &'static str,
         kind: EquiJoinKind,
@@ -195,6 +208,17 @@ impl CaseSpec {
 
     fn context(self) -> Value {
         match self.scenario {
+            Scenario::Nested { empty_child } => json!({
+                "name": self.name,
+                "scenario": "nested",
+                "join_kind": "Inner",
+                "distinct_candidates": 8,
+                "qualifying_candidates": 4,
+                "logical_predicate_evaluations": 8,
+                "list_elements_per_candidate": if empty_child { 16 } else { 512 },
+                "empty_inner_list_struct_fields": if empty_child { 16 } else { 0 },
+                "observe_match_counts": false,
+            }),
             Scenario::Fanout {
                 kind,
                 candidates,
@@ -457,6 +481,71 @@ fn change(
         .expect("build EquiJoin resource Change")
 }
 
+fn nested_schema(empty_child: bool) -> SchemaRef {
+    let child = if empty_child {
+        let fields = (0..16)
+            .map(|index| Field::new(format!("f{index}"), DataType::Int64, false))
+            .collect::<Vec<_>>();
+        DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Struct(fields.into()),
+            false,
+        )))
+    } else {
+        DataType::Int64
+    };
+    Arc::new(Schema::new(vec![
+        Field::new("key", DataType::UInt64, false),
+        Field::new("value", DataType::Int64, false),
+        Field::new(
+            "payload",
+            DataType::List(Arc::new(Field::new("item", child, !empty_child))),
+            false,
+        ),
+    ]))
+}
+
+fn nested_change(schema: &SchemaRef, values: Vec<i64>, elements: usize) -> Change {
+    let rows = values.len();
+    let DataType::List(child) = schema.field(2).data_type() else {
+        unreachable!()
+    };
+    let length = rows * elements;
+    let child_values = if let DataType::List(inner) = child.data_type() {
+        Arc::new(ListArray::new(
+            Arc::clone(inner),
+            OffsetBuffer::new(ScalarBuffer::from(vec![0_i32; length + 1])),
+            new_empty_array(inner.data_type()),
+            None,
+        )) as Arc<dyn Array>
+    } else {
+        Arc::new(Int64Array::from(
+            (0..length)
+                .map(|index| if index % 2 == 0 { Some(7) } else { None })
+                .collect::<Vec<_>>(),
+        )) as Arc<dyn Array>
+    };
+    let offsets = (0..=rows)
+        .map(|index| i32::try_from(index * elements).expect("nested resource offset fits i32"))
+        .collect::<Vec<_>>();
+    let payload = ListArray::new(
+        Arc::clone(child),
+        OffsetBuffer::new(ScalarBuffer::from(offsets)),
+        child_values,
+        None,
+    );
+    let records = RecordBatch::try_new(
+        Arc::clone(schema),
+        vec![
+            Arc::new(UInt64Array::from(repeated_key(rows))),
+            Arc::new(Int64Array::from(values)),
+            Arc::new(payload),
+        ],
+    )
+    .expect("build nested resource records");
+    Change::try_new(records, Int64Array::from(vec![1; rows])).expect("build nested resource Change")
+}
+
 fn ordinal_values(rows: usize) -> Vec<i64> {
     (0..rows)
         .map(|value| i64::try_from(value).expect("resource workload ordinal fits i64"))
@@ -476,6 +565,22 @@ fn unique_keys(rows: usize) -> Vec<u64> {
 fn prepare_workload(spec: CaseSpec, path: &Path) -> Workload {
     let schema = schema();
     match spec.scenario {
+        Scenario::Nested { empty_child } => {
+            let schema = nested_schema(empty_child);
+            let mut fixture = Fixture::new(path, EquiJoinKind::Inner, &schema, 1);
+            let seed = nested_change(
+                &schema,
+                ordinal_values(8),
+                if empty_child { 16 } else { 512 },
+            );
+            assert!(fixture.apply(0, &seed).pages > 0);
+            Workload {
+                fixture,
+                port: 1,
+                input: nested_change(&schema, vec![4], 0),
+                expected_output_rows: 4,
+            }
+        }
         Scenario::Fanout {
             kind,
             candidates,
@@ -553,6 +658,9 @@ fn measure_heap(spec: CaseSpec, path: &Path) -> (usize, InputMeasurement, RustHe
     let stats = dhat::HeapStats::get();
     drop(profiler);
     assert_eq!(input.output_rows, expected_output_rows);
+    if matches!(spec.scenario, Scenario::Nested { .. }) {
+        assert_eq!((input.positive_rows, input.negative_rows), (4, 0));
+    }
     assert!(input.pages > 0);
     let heap = RustHeapMeasurement {
         coverage: "allocations made through Rust's global allocator during one complete driving Input; fixture, seed, and input Arrow allocation excluded; RocksDB native heap excluded",
@@ -648,7 +756,8 @@ fn measure_case(
             observe_state: false,
             ..
         }
-        | Scenario::Batch { .. } => None,
+        | Scenario::Batch { .. }
+        | Scenario::Nested { .. } => None,
     };
     ResourceRecord {
         benchmark: BENCHMARK,
@@ -666,11 +775,16 @@ fn measure_case(
 }
 
 fn cases(profile: PerformanceProfile, invocation: Invocation) -> Vec<CaseSpec> {
-    if invocation == Invocation::Test {
+    let mut cases = if invocation == Invocation::Test {
         test_cases()
     } else {
         benchmark_cases(profile)
-    }
+    };
+    cases.extend([
+        CaseSpec::nested("nested_list_values", false),
+        CaseSpec::nested("nested_empty_child_shape", true),
+    ]);
+    cases
 }
 
 fn test_cases() -> Vec<CaseSpec> {

@@ -308,7 +308,7 @@ fn admit_decoded_value(
                 }
                 .into());
             }
-            admit_null_array(field.data_type(), 1, budget)?;
+            admit_array_shape(field.data_type(), 1, budget)?;
         }
         1 => match field.data_type() {
             DataType::Null => return Err(RowError::InvalidNullMarker.into()),
@@ -337,6 +337,9 @@ fn admit_decoded_value(
                         )
                         .saturating_add(8 + 2 * size_of::<ArrayRef>()),
                 )?;
+                if length == 0 {
+                    admit_array_shape(child.data_type(), 0, budget)?;
+                }
                 for _ in 0..length {
                     admit_decoded_value(child, cursor, budget)?;
                 }
@@ -367,7 +370,7 @@ fn admit_decoded_value(
     Ok(())
 }
 
-fn admit_null_array(
+fn admit_array_shape(
     data_type: &DataType,
     rows: usize,
     budget: &mut StepBudget,
@@ -380,12 +383,12 @@ fn admit_null_array(
                     .saturating_mul(4)
                     .saturating_add(2 * size_of::<ArrayRef>()),
             )?;
-            admit_null_array(child.data_type(), 0, budget)?;
+            admit_array_shape(child.data_type(), 0, budget)?;
         }
         DataType::Struct(fields) => {
             budget.charge(fields.len().saturating_mul(size_of::<ArrayRef>()))?;
             for child in fields {
-                admit_null_array(child.data_type(), rows, budget)?;
+                admit_array_shape(child.data_type(), rows, budget)?;
             }
         }
         DataType::Utf8 | DataType::Binary => {
@@ -881,6 +884,49 @@ mod tests {
                 canonical_row_bounded(&rebuilt, 0, usize::MAX).unwrap(),
                 encoded
             );
+        }
+    }
+
+    #[test]
+    fn empty_list_child_shapes_are_admitted_before_arrow_reconstruction() {
+        let fields = Fields::from(
+            (0..64)
+                .map(|index| Field::new(format!("f{index}"), DataType::Int64, false))
+                .collect::<Vec<_>>(),
+        );
+        for (child, shape_fee) in [
+            (DataType::Null, 0),
+            (DataType::Int64, 0),
+            (DataType::Utf8, 4),
+            (
+                DataType::List(Arc::new(Field::new("leaf", DataType::Null, true))),
+                4 + 2 * size_of::<ArrayRef>(),
+            ),
+            (DataType::Struct(fields), 64 * size_of::<ArrayRef>()),
+        ] {
+            let schema = Schema::new(vec![Field::new(
+                "items",
+                DataType::List(Arc::new(Field::new("item", child, true))),
+                false,
+            )]);
+            let encoded = [1, 0, 0, 0, 0, 0, 0, 0, 0];
+            let fee = size_of::<ScalarValue>() + 8 + 2 * size_of::<ArrayRef>() + shape_fee;
+            let mut budget = StepBudget::new(1, fee);
+            let decoded = decode_canonical_row_bounded(&schema, &encoded, &mut budget).unwrap();
+            assert_eq!(budget.remaining_bytes(), 0);
+            let batch = RecordBatch::try_new(
+                Arc::new(schema.clone()),
+                vec![decoded[0].to_array_of_size(1).unwrap()],
+            )
+            .unwrap();
+            assert_eq!(
+                canonical_row_bounded(&batch, 0, usize::MAX).unwrap(),
+                encoded
+            );
+            let error =
+                decode_canonical_row_bounded(&schema, &encoded, &mut StepBudget::new(1, fee - 1))
+                    .unwrap_err();
+            assert!(error.is::<crate::operation::BudgetExceeded>());
         }
     }
 

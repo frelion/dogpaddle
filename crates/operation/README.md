@@ -97,6 +97,7 @@ head item 额度限制输入事件、扫描候选或修正原子；Atomic tail �
 预算不足返回 `BudgetExceeded`，Flow 整页回滚并确定性减半 head item 额度，最小原子仍超限则失败。
 预算描述逻辑事务工作量，Arrow/DataFusion 表达式的临时分配不构成严格 RSS 或执行时间保证。
 可变大小索引读取使用 byte-bounded scan；已知编码写入在写前扣账。
+canonical row 在 owned scalar 与 Arrow 重建前完成全行 framing 与逻辑费用预验；Boolean 值等仍由实际 decoder 检查，不承诺所有语义错误都早于重建。NULL 和空 List 子类型的 Arrow shape 也计费；空子类型补计形状费用可能使合法页缩小或使最小行报预算不足，canonical bytes、row hash 与布局不变。
 
 ## 内建计算算子
 
