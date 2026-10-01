@@ -56,28 +56,23 @@ fn config() -> PostgresCdcScanConfig {
 }
 
 fn literal_definition_bytes() -> Vec<u8> {
-    let mut expected = b"dogpaddle.operation\0\0\x01\0\x0b".to_vec();
-    expected.extend_from_slice(br#"{"spec":{"engine_name":"orders","database":"shop","schema":"public","table":"orders","slot":"orders_slot","publication":"orders_pub","system_identifier":"123","database_oid":42,"table_oid":43,"columns":[{"name":"id","data_type":"int64","nullable":false}]},"output_projection":[0],"bootstrap_spool_bytes":1048576}"#);
+    let mut expected = b"dogpaddle.operation\0\0\x01".to_vec();
+    expected.extend_from_slice(br#"{"postgres_cdc_scan":{"spec":{"engine_name":"orders","database":"shop","schema":"public","table":"orders","slot":"orders_slot","publication":"orders_pub","system_identifier":"123","database_oid":42,"table_oid":43,"columns":[{"name":"id","data_type":"int64","nullable":false}]},"output_projection":[0],"bootstrap_spool_bytes":1048576}}"#);
     expected
 }
 
 #[test]
-fn postgres_cdc_definition_has_a_canonical_non_secret_tag_and_exact_schema() {
+fn postgres_cdc_definition_has_a_canonical_non_secret_variant_and_exact_schema() {
     let definition = definition();
     assert_eq!(
         OperationDefinition::from(definition.clone()).kind(),
         OperationKind::Scan
-    );
-    assert_eq!(
-        OperationDefinition::from(definition.clone()).persistence_tag(),
-        11
     );
     let bytes = encode_definition(&definition.clone().into());
     let expected = literal_definition_bytes();
     assert_eq!(bytes, expected);
     let decoded = decode_definition(&bytes).unwrap();
     assert_eq!(decoded.kind(), OperationKind::Scan);
-    assert_eq!(decoded.persistence_tag(), 11);
     assert_eq!(encode_definition(&decoded), bytes);
     let binding = construct_checked(&decoded, &[]).unwrap();
     let output = binding.as_ref().unwrap();
@@ -381,4 +376,13 @@ fn postgres_cdc_runtime_options_validate_java_bounds_before_external_io() {
             .snapshot_fetch_size(NonZeroU32::new(maximum + 1).unwrap())
             .is_err()
     );
+}
+
+#[test]
+fn raw_plan_business_validation_precedes_store_handle_access() {
+    let mut payload = serde_json::to_value(definition()).unwrap();
+    payload["output_projection"] = serde_json::json!([1, 0]);
+    let plan: OperationDefinition =
+        serde_json::from_value(serde_json::json!({"postgres_cdc_scan": payload})).unwrap();
+    crate::support::assert_rejected_plan_before_data(&plan, &[], RuntimeResource::new(config()));
 }

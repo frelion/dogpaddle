@@ -473,7 +473,6 @@ fn the_current_v1_payload_and_layout_reject_retired_asof_capabilities() {
     ));
     let decoded = decode_definition(&literal).unwrap();
     assert_eq!(encode_definition(&decoded), literal);
-    assert_eq!(decoded.persistence_tag(), 17);
     assert_eq!(
         decoded.kind(),
         OperationKind::PagedTransform(NonZeroU32::new(2).unwrap())
@@ -900,4 +899,32 @@ fn nested_winner_decode_fails_before_allocating_more_than_the_shared_budget() {
         .unwrap();
     assert_eq!(list.value_length(0), 128 * 1024);
     transaction.commit().unwrap();
+}
+
+#[test]
+fn raw_plan_business_validation_precedes_store_handle_access() {
+    let mut payload =
+        serde_json::to_value(definition(AsOfDirection::Backward { allow_exact: true })).unwrap();
+    payload["output_names"] = serde_json::json!(["x".repeat(65_537)]);
+    let plan: OperationDefinition =
+        serde_json::from_str(&serde_json::json!({"asof_join": payload}).to_string()).unwrap();
+    crate::support::assert_rejected_plan_before_data(
+        &plan,
+        &[schema(), schema()],
+        RuntimeResource::none(),
+    );
+}
+
+#[test]
+fn raw_duplicate_output_names_are_rejected_before_store_handle_access() {
+    let mut payload =
+        serde_json::to_value(definition(AsOfDirection::Backward { allow_exact: true })).unwrap();
+    payload["output_names"][1] = payload["output_names"][0].clone();
+    let plan: OperationDefinition =
+        serde_json::from_str(&serde_json::json!({"asof_join": payload}).to_string()).unwrap();
+    crate::support::assert_rejected_plan_before_data(
+        &plan,
+        &[schema(), schema()],
+        RuntimeResource::none(),
+    );
 }

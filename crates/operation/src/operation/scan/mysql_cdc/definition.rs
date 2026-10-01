@@ -3,16 +3,11 @@ use std::{any::TypeId, num::NonZeroU64, sync::Arc};
 use arrow_schema::SchemaRef;
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    ConstructedOperation, DefinitionCodecError, RuntimeResource,
-    codec::{parse_json_payload, require_canonical_json_payload},
-    definition::schema_error,
-};
+use crate::{ConstructedOperation, RuntimeResource, definition::schema_error};
 
 use super::{MySqlCdcScanConfig, MySqlCdcScanError, MySqlCdcScanOperation, MySqlColumn, schema};
 use dogpaddle_store::{Cell, Queue};
 
-pub(crate) const TAG: u16 = 15;
 pub(super) const CONNECTOR_CLASS: &str = "io.debezium.connector.mysql.MySqlConnector";
 const MAX_DEFINITION_BYTES: usize = 1024 * 1024;
 pub(super) const PHASE: &str = "mysql_cdc_scan.phase";
@@ -51,7 +46,8 @@ pub struct MySqlCdcScanSpec {
 /// resumes from the sealed checkpoint while Flow consumes that input, with
 /// streaming capture bounded by its queue capacity. No source-write gate is required. Online
 /// Schema evolution is not supported.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct MySqlCdcScanDefinition {
     spec: MySqlCdcScanSpec,
     output_projection: Vec<u32>,
@@ -105,20 +101,25 @@ impl MySqlCdcScanDefinition {
         output_projection: Vec<u32>,
         bootstrap_spool_bytes: NonZeroU64,
     ) -> Result<Self, MySqlCdcScanError> {
-        validate_spec(&spec)?;
-        super::super::ordered_projection(&output_projection, spec.columns.len())
-            .ok_or_else(invalid_projection)?;
         let definition = Self {
             spec,
             output_projection,
             bootstrap_spool_bytes,
         };
-        if encode(&definition)?.len() > MAX_DEFINITION_BYTES {
+        definition.validate()?;
+        Ok(definition)
+    }
+
+    fn validate(&self) -> Result<(), MySqlCdcScanError> {
+        validate_spec(&self.spec)?;
+        super::super::ordered_projection(&self.output_projection, self.spec.columns.len())
+            .ok_or_else(invalid_projection)?;
+        if encode(self)?.len() > MAX_DEFINITION_BYTES {
             return Err(MySqlCdcScanError::InvalidDefinition(
                 "scan definition exceeds 1 MiB".to_owned(),
             ));
         }
-        Ok(definition)
+        Ok(())
     }
 
     /// Returns the frozen, non-sensitive Scan specification.
@@ -144,6 +145,7 @@ impl MySqlCdcScanDefinition {
     pub(crate) fn output_schema_unchecked(
         &self,
     ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
+        self.validate()?;
         output_schema(&self.spec, &self.output_projection)
             .map(Some)
             .map_err(Into::into)
@@ -154,6 +156,7 @@ impl MySqlCdcScanDefinition {
         scope: &mut dogpaddle_store::DataScope<'_>,
         resource: RuntimeResource,
     ) -> Result<ConstructedOperation, crate::OperationSetupError> {
+        self.validate().map_err(schema_error)?;
         let output = output_schema(&self.spec, &self.output_projection).map_err(schema_error)?;
         let phase = scope.data::<Cell<u32>>(PHASE)?;
         let checkpoint = scope.data::<Cell<Vec<u8>>>(CHECKPOINT)?;
@@ -174,36 +177,6 @@ impl MySqlCdcScanDefinition {
     pub(crate) fn resource_type() -> TypeId {
         TypeId::of::<MySqlCdcScanConfig>()
     }
-}
-
-pub(crate) fn decode_definition(
-    payload_bytes: &[u8],
-) -> Result<Box<MySqlCdcScanDefinition>, DefinitionCodecError> {
-    let invalid = || DefinitionCodecError::InvalidPayload("invalid MySQL CDC scan specification");
-    if payload_bytes.len() > MAX_DEFINITION_BYTES {
-        return Err(invalid());
-    }
-    let payload: PersistentDefinition = parse_json_payload(payload_bytes)?;
-    let definition = MySqlCdcScanDefinition::try_new_projected(
-        payload.spec,
-        payload.output_projection,
-        payload.bootstrap_spool_bytes,
-    )
-    .map_err(|_| invalid())?;
-    require_canonical_json_payload(
-        &definition,
-        payload_bytes,
-        "invalid MySQL CDC scan specification",
-    )?;
-    Ok(Box::new(definition))
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PersistentDefinition {
-    spec: MySqlCdcScanSpec,
-    output_projection: Vec<u32>,
-    bootstrap_spool_bytes: NonZeroU64,
 }
 
 fn encode(definition: &MySqlCdcScanDefinition) -> Result<Vec<u8>, MySqlCdcScanError> {
@@ -290,9 +263,9 @@ mod tests {
     fn spool_capacity_is_canonical_definition_payload_and_survives_binding() {
         let definition = MySqlCdcScanDefinition::try_new(spec("orders"), capacity()).unwrap();
         let payload = encode(&definition).unwrap();
-        let decoded = decode_definition(&payload).unwrap();
+        let decoded: MySqlCdcScanDefinition = serde_json::from_slice(&payload).unwrap();
         assert_eq!(
-            crate::encode_definition(&crate::OperationDefinition::from(*decoded)),
+            crate::encode_definition(&crate::OperationDefinition::from(decoded)),
             crate::encode_definition(&crate::OperationDefinition::from(definition.clone()))
         );
         assert_eq!(definition.bootstrap_spool_bytes(), capacity());

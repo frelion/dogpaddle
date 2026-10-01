@@ -5,21 +5,13 @@ use crate::expression::BoundExpression;
 
 use super::{AggregateError, AggregateSchemaError, state::Statistic};
 
-mod extrema;
+use super::definition::AggregateCall;
+use crate::operation::relation::indexable;
 
-pub(super) use extrema::ExtremaDirection;
-
-pub(super) const COUNT_ALL: u16 = 1;
-pub(super) const COUNT: u16 = 2;
-pub(super) const SUM: u16 = 3;
-pub(super) const AVG: u16 = 4;
-pub(super) const MIN: u16 = 5;
-pub(super) const MAX: u16 = 6;
-
-pub(super) struct Descriptor {
-    pub(super) tag: u16,
-    pub(super) arguments: usize,
-    pub(super) bind: fn(&[BoundExpression]) -> Result<BoundReduction, AggregateSchemaError>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ExtremaDirection {
+    Min,
+    Max,
 }
 
 pub(super) struct BoundReduction {
@@ -53,62 +45,49 @@ impl StatisticKind {
     }
 }
 
-const DESCRIPTORS: &[Descriptor] = &[
-    Descriptor {
-        tag: COUNT_ALL,
-        arguments: 0,
-        bind: |_| {
-            Ok(BoundReduction {
-                reduction: Reduction::RowsCount,
-                output_type: DataType::Int64,
-                nullable: false,
-            })
+pub(super) fn bind(
+    call: AggregateCall<BoundExpression>,
+) -> Result<(Option<BoundExpression>, BoundReduction), AggregateSchemaError> {
+    let (argument, reduction, output_type, nullable) = match call {
+        AggregateCall::CountAll => (None, Reduction::RowsCount, DataType::Int64, false),
+        AggregateCall::Count(value) => (Some(value), Reduction::Count, DataType::Int64, false),
+        AggregateCall::Sum(value) => {
+            let kind = numeric_kind("SUM", value.output_type())?;
+            let output = value.output_type().clone();
+            (Some(value), Reduction::Sum(kind), output, true)
+        }
+        AggregateCall::Avg(value) => {
+            let kind = numeric_kind("AVG", value.output_type())?;
+            (
+                Some(value),
+                Reduction::Average(kind),
+                DataType::Float64,
+                true,
+            )
+        }
+        AggregateCall::Min(value) => bind_extrema(value, ExtremaDirection::Min, "MIN")?,
+        AggregateCall::Max(value) => bind_extrema(value, ExtremaDirection::Max, "MAX")?,
+    };
+    Ok((
+        argument,
+        BoundReduction {
+            reduction,
+            output_type,
+            nullable,
         },
-    },
-    Descriptor {
-        tag: COUNT,
-        arguments: 1,
-        bind: |_| {
-            Ok(BoundReduction {
-                reduction: Reduction::Count,
-                output_type: DataType::Int64,
-                nullable: false,
-            })
-        },
-    },
-    Descriptor {
-        tag: SUM,
-        arguments: 1,
-        bind: bind_sum,
-    },
-    Descriptor {
-        tag: AVG,
-        arguments: 1,
-        bind: bind_average,
-    },
-    extrema::MIN_DESCRIPTOR,
-    extrema::MAX_DESCRIPTOR,
-];
-
-pub(super) fn descriptor(tag: u16) -> Option<&'static Descriptor> {
-    DESCRIPTORS.iter().find(|descriptor| descriptor.tag == tag)
+    ))
 }
 
-fn bind_sum(arguments: &[BoundExpression]) -> Result<BoundReduction, AggregateSchemaError> {
-    let input = arguments[0].output_type();
-    Ok(BoundReduction {
-        reduction: Reduction::Sum(numeric_kind("SUM", input)?),
-        output_type: input.clone(),
-        nullable: true,
-    })
-}
-
-fn bind_average(arguments: &[BoundExpression]) -> Result<BoundReduction, AggregateSchemaError> {
-    Ok(BoundReduction {
-        reduction: Reduction::Average(numeric_kind("AVG", arguments[0].output_type())?),
-        output_type: DataType::Float64,
-        nullable: true,
-    })
+fn bind_extrema(
+    value: BoundExpression,
+    direction: ExtremaDirection,
+    name: &'static str,
+) -> Result<(Option<BoundExpression>, Reduction, DataType, bool), AggregateSchemaError> {
+    if !indexable(value.output_type()) {
+        return Err(unsupported(name, value.output_type()));
+    }
+    let output = value.output_type().clone();
+    Ok((Some(value), Reduction::Extrema(direction), output, true))
 }
 
 fn numeric_kind(

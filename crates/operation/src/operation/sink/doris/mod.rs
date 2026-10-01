@@ -11,8 +11,6 @@ pub use config::{DorisSinkConfig, DorisTargetSpec};
 pub use definition::DorisSinkDefinition;
 pub use error::{DorisSinkError, DorisSinkSchemaError};
 
-pub(crate) use definition::{TAG, decode_definition};
-
 use super::buffered;
 
 #[cfg(test)]

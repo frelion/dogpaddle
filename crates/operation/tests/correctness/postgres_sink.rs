@@ -63,18 +63,14 @@ fn input_change() -> Change {
 }
 
 fn literal_definition_bytes() -> Vec<u8> {
-    let mut expected = b"dogpaddle.operation\0\0\x01\0\x0c".to_vec();
-    expected.extend_from_slice(br#"{"sink_id":"orders_sink","database":"shop","schema":"public","table":"orders_materialized","system_identifier":"123456789","database_oid":42}"#);
+    let mut expected = b"dogpaddle.operation\0\0\x01".to_vec();
+    expected.extend_from_slice(br#"{"postgres_sink":{"sink_id":"orders_sink","database":"shop","schema":"public","table":"orders_materialized","system_identifier":"123456789","database_oid":42}}"#);
     expected
 }
 
 #[test]
-fn postgres_sink_definition_has_canonical_non_secret_tag_12_bytes() {
+fn postgres_sink_definition_has_canonical_non_secret_variant_bytes() {
     let definition = definition();
-    assert_eq!(
-        OperationDefinition::from(definition.clone()).persistence_tag(),
-        12
-    );
     assert_eq!(
         OperationDefinition::from(definition.clone()).kind(),
         OperationKind::Sink(NonZeroU32::MIN)
@@ -85,7 +81,6 @@ fn postgres_sink_definition_has_canonical_non_secret_tag_12_bytes() {
 
     let decoded = decode_definition(&encoded).unwrap();
     assert_eq!(decoded.kind(), OperationKind::Sink(NonZeroU32::MIN));
-    assert_eq!(decoded.persistence_tag(), 12);
     assert_eq!(encode_definition(&decoded), encoded);
     let printable = String::from_utf8(encoded.clone()).unwrap();
     for secret in [PASSWORD, "127.0.0.1", "sink_user"] {
@@ -303,4 +298,17 @@ fn postgres_sink_load_is_offline_and_target_check_precedes_initialization_intent
     ));
     let txn = writes.begin();
     assert!(!sink.try_enqueue(txn.access(), &input_change()).unwrap());
+}
+
+#[test]
+fn raw_plan_business_validation_precedes_store_handle_access() {
+    let mut payload = serde_json::to_value(definition()).unwrap();
+    payload["sink_id"] = serde_json::json!("");
+    let plan: OperationDefinition =
+        serde_json::from_value(serde_json::json!({"postgres_sink": payload})).unwrap();
+    crate::support::assert_rejected_plan_before_data(
+        &plan,
+        &[input_schema()],
+        RuntimeResource::new(config()),
+    );
 }

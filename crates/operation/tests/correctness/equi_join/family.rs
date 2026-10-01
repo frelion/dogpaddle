@@ -508,7 +508,6 @@ fn definitions_keep_the_five_literal_golden_payloads_and_no_operator_cursor_reso
             decoded.kind(),
             OperationKind::PagedTransform(NonZeroU32::new(2).unwrap())
         );
-        assert_eq!(decoded.persistence_tag(), 16);
         assert_eq!(
             encode_definition(&decoded),
             crate::support::decode_hex(literal)
@@ -562,5 +561,33 @@ fn wrong_resume_variant_and_input_port_are_rejected_before_state_changes() {
                 &mut StepBudget::new(1, 4096)
             )
             .is_err()
+    );
+}
+
+#[test]
+fn raw_plan_business_validation_precedes_store_handle_access() {
+    let mut payload =
+        serde_json::to_value(definition(EquiJoinKind::Inner, Residual::None)).unwrap();
+    payload["keys"] = serde_json::json!([]);
+    let plan: OperationDefinition =
+        serde_json::from_str(&serde_json::json!({"equi_join": payload}).to_string()).unwrap();
+    crate::support::assert_rejected_plan_before_data(
+        &plan,
+        &[schema(), schema()],
+        RuntimeResource::none(),
+    );
+}
+
+#[test]
+fn raw_duplicate_output_names_are_rejected_before_store_handle_access() {
+    let mut payload =
+        serde_json::to_value(definition(EquiJoinKind::Inner, Residual::None)).unwrap();
+    payload["output_names"][1] = payload["output_names"][0].clone();
+    let plan: OperationDefinition =
+        serde_json::from_str(&serde_json::json!({"equi_join": payload}).to_string()).unwrap();
+    crate::support::assert_rejected_plan_before_data(
+        &plan,
+        &[schema(), schema()],
+        RuntimeResource::none(),
     );
 }

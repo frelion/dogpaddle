@@ -9,15 +9,11 @@ use dogpaddle_store::TransactionAccess;
 use thiserror::Error;
 
 use crate::{
-    ConstructedOperation, DefinitionCodecError, Expr, ExpressionBindError,
-    ExpressionDefinitionError, ExpressionError,
-    codec::decode_json_payload,
+    ConstructedOperation, Expr, ExpressionBindError, ExpressionDefinitionError, ExpressionError,
     definition::schema_error,
     expression::{BoundExpression, StoredExpression},
     operation::{AtomicOperation, OperationError, OperationInput},
 };
-
-pub(crate) const TAG: u16 = 5;
 
 /// Pure definition of an order-preserving row filter.
 ///
@@ -193,11 +189,4 @@ fn canonical_record_batch(records: &RecordBatch) -> Result<RecordBatch, ArrowErr
         .collect();
     let options = RecordBatchOptions::new().with_row_count(Some(records.num_rows()));
     RecordBatch::try_new_with_options(records.schema(), columns, &options)
-}
-
-pub(crate) fn decode_definition(
-    payload: &[u8],
-) -> Result<Box<FilterDefinition>, DefinitionCodecError> {
-    let definition: FilterDefinition = decode_json_payload(payload, "invalid Filter payload")?;
-    Ok(Box::new(definition))
 }

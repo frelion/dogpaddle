@@ -2,13 +2,9 @@ use dogpaddle_store::{ReadTransactionAccess, TransactionAccess};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    DefinitionCodecError,
-    codec::decode_json_payload,
     definition::ConstructedOperation,
     operation::{OperationError, SinkOperation, SinkPending, SinkPrepared},
 };
-
-pub(crate) const TAG: u16 = 3;
 
 /// Pure definition of a sink that intentionally discards every input Change.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -74,11 +70,4 @@ impl SinkOperation for DiscardOperation {
     ) -> Result<(), OperationError> {
         unreachable!("discard has no prepared delivery")
     }
-}
-
-pub(crate) fn decode_definition(
-    payload: &[u8],
-) -> Result<Box<DiscardDefinition>, DefinitionCodecError> {
-    let definition: DiscardDefinition = decode_json_payload(payload, "invalid Discard payload")?;
-    Ok(Box::new(definition))
 }

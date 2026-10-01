@@ -15,8 +15,8 @@ mod value;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use definition::AggregateLayout;
 pub use definition::{AggregateCall, AggregateDefinition};
-pub(crate) use definition::{AggregateLayout, TAG, decode_definition};
 pub(crate) use runtime::AggregateOperation;
 
 use crate::{OperationSetupError, operation::Operation};

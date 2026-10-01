@@ -5,14 +5,14 @@
 
 ## SQLite
 
-SqliteSink 的 tag 是 10，只接受绝对 UTF-8 文件路径和新的非保留目标表名。
+SqliteSink 只接受绝对 UTF-8 文件路径和新的非保留目标表名。
 构造只编译精确 Schema 对应的 `STRICT` 表布局、SQL 和行编码，连接与建表延迟到事务外 prepare/deliver；不得在 SQLite 中增加元数据表或保存整行 canonical bytes。
 所有当前 DogPaddle v1 类型都必须无损映射。
 运行实例把 SQLite target 与 crate 私有 relation planner 装入下述唯一 buffered Sink 内核，不保留独立 runtime/state 或兼容出口。
 
 ## PostgreSQL
 
-PostgresSink 的 tag 是 12，是具体的单输入 exact-relation Sink。
+PostgresSink 是具体的单输入 exact-relation Sink。
 Definition 只保存 discovery 得到的非敏感 `PostgresTargetSpec` canonical JSON；numeric IP、port、user 与 password 只存在于每次 Flow build/open 构造边界显式注入的拥有型 `PostgresSinkConfig`，不接受 DNS endpoint。
 私有 Tokio session 必须给完整连接握手、discovery、身份校验和每个数据库工作单元施加 5 秒 client deadline，失败或超时丢弃整个 session。
 同一 target spec 只能属于一个持久化 Flow/Sink，不能用于接管或共享已有目标；远端 marker 使用开发期 `dogpaddle.postgres-relation.event-address.v1:` ownership/layout 前缀，精确 logical Schema 由 Flow 构造与运行时 guard 保证。已有目标需随当前 v1 布局重建。
@@ -21,11 +21,11 @@ Definition 只保存 discovery 得到的非敏感 `PostgresTargetSpec` canonical
 
 ## Doris 与 ClickHouse
 
-DorisSink 的 tag 是 18，Definition 只持久化 sink ID、database/table 和 discovery 得到的唯一 cluster ID；numeric IP、MySQL port、user/password 只属于每次构造注入的 `DorisSinkConfig`。
+DorisSink Definition 只持久化 sink ID、database/table 和 discovery 得到的唯一 cluster ID；numeric IP、MySQL port、user/password 只属于每次构造注入的 `DorisSinkConfig`。
 目标 lookup 的数据库请求或布局复核失败后丢弃缓存连接；重试同一 Loaded batch 时重新连接并复核目标身份与布局。
 目标由一个开启 merge-on-write 的 Unique Key 状态表和公开 view 组成，私有 delete marker 同时是 sequence column，公开 technical ID/hash 固定别名为 `$dogpaddle.id`/`$dogpaddle.hash`。
 写入按 SQL bytes 与 value 数拆分，多个 statement 必须处于同一显式事务。
-ClickHouseSink 的 tag 是 19，Definition 只持久化 sink ID、database/table 和 Atomic database UUID；numeric IP、HTTP port、user/password 只属于 `ClickHouseSinkConfig`。
+ClickHouseSink Definition 只持久化 sink ID、database/table 和 Atomic database UUID；numeric IP、HTTP port、user/password 只属于 `ClickHouseSinkConfig`。
 目标由 `ReplacingMergeTree(version)` 状态表和带 `FINAL` 的公开 view 组成，live version 为 0、tombstone version 为 1，旧 live 重放不得复活删除。
 两者的状态表都必须包含精确 row-hash 索引，并严格校验 key、version/sequence、distribution、view projection/filter 和 ownership marker；删除终态为阻止不确定旧写复活而保留，compaction 只能合并同一 ID，历史 technical-ID 基数不会自动 GC。
 两者均无 TLS、禁止外部写入或在线 Schema evolution，真实容器验收由 `system-tests/warehouse-sinks/check.sh` 拥有。

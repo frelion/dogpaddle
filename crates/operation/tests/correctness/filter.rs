@@ -62,7 +62,6 @@ fn literal_definition_reconstructs_predicate_binding_and_runtime() {
     let decoded = assert_literal_definition(
         &definition,
         FILTER_V1,
-        5,
         OperationKind::AtomicTransform(NonZeroU32::MIN),
     );
     assert_eq!(definition.predicate(), &predicate);

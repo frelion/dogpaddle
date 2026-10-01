@@ -1,4 +1,4 @@
-use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -9,13 +9,8 @@ use arrow_schema::{DataType, SchemaRef};
 use thiserror::Error;
 
 use super::{TECHNICAL_HASH, TECHNICAL_ID, buffered, target::SqliteTarget};
-use crate::{
-    ConstructedOperation, DefinitionCodecError,
-    codec::{parse_json_payload, require_canonical_json_payload},
-    definition::schema_error,
-};
+use crate::{ConstructedOperation, definition::schema_error};
 
-pub(crate) const TAG: u16 = 10;
 const MAX_LOGICAL_COLUMNS: usize = 1_998;
 
 /// Pure definition of a sink that materializes its input relation in `SQLite`.
@@ -23,32 +18,11 @@ const MAX_LOGICAL_COLUMNS: usize = 1_998;
 /// The definition only stores the absolute database path and target table
 /// name. Binding is pure, and neither opens the database nor creates the table;
 /// those effects are deferred to lazy runtime initialization.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SqliteSinkDefinition {
     database_path: PathBuf,
     table_name: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Payload {
-    database_path: PathBuf,
-    table_name: String,
-}
-
-impl Payload {
-    fn into_definition(self) -> Result<SqliteSinkDefinition, &'static str> {
-        SqliteSinkDefinition::try_new(self.database_path, self.table_name)
-            .map_err(|_| "SQLite sink definition is invalid")
-    }
-}
-
-impl<'de> Deserialize<'de> for SqliteSinkDefinition {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Payload::deserialize(deserializer)?
-            .into_definition()
-            .map_err(D::Error::custom)
-    }
 }
 
 /// Failure while constructing a [`SqliteSinkDefinition`].
@@ -171,8 +145,10 @@ impl SqliteSinkDefinition {
 
 impl SqliteSinkDefinition {
     pub(crate) fn output_schema_unchecked(
+        &self,
         inputs: &[SchemaRef],
     ) -> Result<(), crate::OperationSchemaError> {
+        validate_definition(&self.database_path, &self.table_name)?;
         validate_input_schema(&inputs[0])?;
         Ok(())
     }
@@ -182,6 +158,7 @@ impl SqliteSinkDefinition {
         input_schemas: &[SchemaRef],
         data: &mut dogpaddle_store::DataScope<'_>,
     ) -> Result<ConstructedOperation, crate::OperationSetupError> {
+        validate_definition(&self.database_path, &self.table_name).map_err(schema_error)?;
         let input_schema = input_schemas
             .first()
             .expect("the final binding entrypoint enforces SQLiteSink input arity");
@@ -264,14 +241,4 @@ fn validate_definition(
         return Err(SqliteSinkDefinitionError::TableNameTooLong);
     }
     Ok(())
-}
-
-pub(crate) fn decode_definition(
-    payload: &[u8],
-) -> Result<Box<SqliteSinkDefinition>, DefinitionCodecError> {
-    let definition = parse_json_payload::<Payload>(payload)?
-        .into_definition()
-        .map_err(DefinitionCodecError::InvalidPayload)?;
-    require_canonical_json_payload(&definition, payload, "invalid SQLite sink payload")?;
-    Ok(Box::new(definition))
 }

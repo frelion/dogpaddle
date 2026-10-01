@@ -17,14 +17,17 @@ Filter、Select、SchemaAlign、Aggregate 固定声明 Atomic；Aggregate 同时
 入口统一校验 input arity、全部 input/output DogPaddle Schema、runtime resource 类型、kind/output 与执行能力一致性；各具体 Definition 的私有 `construct_unchecked` 只实现自身规则、表达式编译、类型化状态句柄取得和最终 runtime 构造，外部调用方不能绕过公共校验。
 资源前缀由调用方通过 `DataScope::scoped` 限定；具体 Definition 只向 `DataScope::data` 传固定逻辑名，不拼接全局资源名。Store 声明/查找错误透明传递，保留完整资源名。
 Scan 接收空 inputs，Scan/Transform 必须给出完整 output Schema，Sink 必须没有 output。
-构造不得读取业务状态、开始事务、访问外部系统、时间或随机性；相同持久化 tag、payload 与有序 input Schemas 必须维持相同 Schema、状态资源集合和执行语义。
+构造不得读取业务状态、开始事务、访问外部系统、时间或随机性；相同持久化算子名、计划数据 与有序 input Schemas 必须维持相同 Schema、状态资源集合和执行语义。
 
-## 分类与注册
+## 计划表示与持久化
 
-`scan`、`transform`、`sink` 分类模块必须能容纳任意多个算子，不得拥有或重导出分类级的单一 tag。每个具体模块拥有唯一稳定 tag 及自身 payload 的校验；公共 enum 的 tag dispatch 只选定具体类型，不承载第二套注册表或动态扩展点。
-新增内建 Operation 必须加入 `OperationDefinition` 和 tag dispatch，并在算子自己的 correctness 文件覆盖 tag 唯一性、literal golden、资源布局、construct、step 与适用的 reopen。
-所有 variant 的 v1 payload 使用 canonical JSON。解码必须完整消费输入且重新编码后的字节逐字相同；具体 Definition 继续校验业务不变量，不能因为 JSON 字段能反序列化就接受无效计划。表达式在 JSON 中保存 canonical protobuf 字节的 base64 表示，decode 仍检查 protobuf 与逐行可重放准入。修改 payload 时直接更新当前 v1 golden 和 reopen 证据，已有状态重建。
-公开 Definition 的 JSON 反序列化也必须保持构造不变量；有非空键、函数 arity 或目标路径等限制的类型先解到私有 payload，再由同一个验证步骤产生可信 Definition。持久解码在该步骤失败时保留具体算子的静态错误原因，不能通过公开反序列化绕开检查。
+`OperationDefinition` 是唯一的封闭类型分发，也是公开 JSON 和持久格式共同使用的计划表示。v1 外层只有 marker 和版本，随后是以稳定 snake_case 算子名标记的 canonical JSON，例如 `{"filter":{"predicate":"..."}}`；没有数字 tag 目录、逐算子解码分发或第二份 Payload 类型。新增算子在 enum 声明其计划类型并实现已有的能力分发，不增加注册表。
+
+解码完整消费输入并逐字比较重新编码的 JSON，拒绝未知字段、非 canonical 字节和非法结构。`UnionAll` 的非零 arity、CDC 非零容量和 Aggregate 六变体调用由类型表达。`StoredExpression` 保留完整 protobuf roundtrip、canonical 与 immutable/row-local 证明；表达式不是未经验证的计划字节。
+
+具体 Definition 是待绑定的计划数据。公开 JSON 反序列化与持久解码不证明非空 join keys、group list、目标身份/路径或 Schema 业务规则；这些约束在同一个纯验证/编译路径执行，`output_schema` 与 `construct` 都必须经过，且早于取得 Store 数据句柄或任何外部 I/O。便利构造器也复用该定义验证；不存在受信任 Definition 包装层。各 owner 的大小上限（CDC/远端 Sink 1 MiB、ASOF 字段上限）保留于该路径。单独调用 decode 可以暂时持有超 owner 上限的待绑定计划；它不再提供每种 owner 的提前字节准入。Flow 在解析前仍限制整个持久 Definition 不超过 8 MiB。
+
+修改计划格式直接更新当前 v1 golden 和 reopen 证据并重建旧状态，不提供旧数字 tag 识别、alias、fallback 或迁移。算子 correctness 覆盖稳定名称、literal golden、资源布局、construct、step 和适用的 reopen。
 Flow 只按机制保留代表性 witness；只有新增 arity 或 Schema propagation、runtime-resource 方向、外部副作用边界、持久 data/Resume 或 recovery 阶段时才增加 Flow case，不逐算子复制同一 build/open/reopen 矩阵，也不得用 test-only Operation 代替真实产品语义。
 
 ## 表达式
@@ -37,10 +40,10 @@ DogPaddle 只负责 Definition/Flow 边界、完整 Schema guard 及 Change 语�
 DataFusion Expr protobuf 是 Expression payload 的版本绑定格式，不承诺跨 DataFusion 版本兼容。
 工作区全部 DataFusion direct/transitive crate 必须精确 pin 到 `b631f2c7d92d0a38637a8d8ae980e2474b891f34`，并保持唯一 Arrow 60.0.0 与 sqlparser 0.63.0 类型族；升级时必须审查 ASOF logical lowering、proto roundtrip、physical planning 和执行语义。
 开发期持久格式始终按 v1 处理；DataFusion 升级若改变 payload 或执行语义，应更新 v1 golden 与 reopen 证据，并重建受影响的 Flow，不增加旧表达式识别、迁移或兼容分支。
-Filter 的 tag 是 5，output Schema 精确等于 input，只保留 non-null true；全删返回 `None`，部分筛选必须用同一 predicate 保持 records/diffs 对齐。
+Filter output Schema 精确等于 input，只保留 non-null true；全删返回 `None`，部分筛选必须用同一 predicate 保持 records/diffs 对齐。
 Filter 与投影不声明 Operation data；公共证据覆盖 proto golden/roundtrip、静态拒绝无目录副作用、decoded Definition 的 construct/apply、open 重新构造、Filter 空/全量/部分选择与混合 diff 重批，以及投影 Schema metadata/nullability 和 Array/diff 共享。
 
-Project/Extend 的独立 Definition、tag 4/6 和运行实例已删除，tag dispatch 不接受这些 tag。
+Project/Extend 的独立 Definition 和运行实例已删除。
 选列与改名直接使用 `SelectDefinition::try_new([(name, Expr), ...])`；追加列使用
 `SelectDefinition::try_extend(&input_schema, fields)`，它立即展开为普通 Select 字段列表，不保存 mode、输入 Schema 或单独的持久格式。
 
@@ -48,19 +51,19 @@ Select 与 SchemaAlign 直接构造同一个私有 `BoundProjection`，由它实
 
 ## 简单 Transform
 
-RunningEventCount 的 tag 是 2，只声明 `running_event_count.count: Cell<u64>`，固定输出 non-null `UInt64` 字段 `count`。
+RunningEventCount 只声明 `running_event_count.count: Cell<u64>`，固定输出 non-null `UInt64` 字段 `count`。
 它按输入行序观察每一行并将 durable count 加一，忽略 diff 数值，输出每个更新后的 count 且 diff 固定为 `+1`；它是事件观测算子，不是关系 cardinality Aggregate。
 公共 API 与资源路径的破坏性重命名不提供 alias、fallback 或迁移；旧数据库直接删除并重建，不为旧版本增加识别或兼容协议。
 
-Select 的 tag 是 7，以有序 `name + Expr` 列表一次性计算完整 output，所有表达式都绑定到同一个原始 input Schema，不能引用同一 Select 新建的别名；空 Select 合法并保留输入行数与 diff。
+Select 以有序 `name + Expr` 列表一次性计算完整 output，所有表达式都绑定到同一个原始 input Schema，不能引用同一 Select 新建的别名；空 Select 合法并保留输入行数与 diff。
 Select 保留输入 Schema metadata；直接列引用（包括改名）保留源字段 metadata，计算列 metadata 为空。
 纯列引用共享输入 Arrow arrays，全部投影共享 diff buffer；保留完整子树，字段重排无需复制数据。
 绑定后的严格递增纯列引用若输出 Schema 精确等于对应输入投影，自动复用 ChangeProjection 快路径，避免重扫已验证的 diff 和 Decimal 值；不增加公开或持久 mode。改名、重排和计算走共享表达式执行。
 这改变了原 Select 直接列引用的字段 metadata 规则；受影响的精确 Schema、Flow 与目标布局应重建。
-UnionAll 的 tag 是 8，Definition 只保存非零 input arity，要求所有输入具有完全相同的 logical Schema，按端口原样转发 Change。
+UnionAll Definition 只保存非零 input arity，要求所有输入具有完全相同的 logical Schema，按端口原样转发 Change。
 二者都不声明 Operation data，也不引入 planner、额外表达式层或专用 Flow 抽象。
 
-SchemaAlign 的 tag 是 9，以有序 `name + Expr + target nullability + Field metadata` 和独立 Schema metadata 显式产生完整 output Schema；字段类型只从绑定表达式推导，cast/try_cast 必须写在 Expr 中。
+SchemaAlign 以有序 `name + Expr + target nullability + Field metadata` 和独立 Schema metadata 显式产生完整 output Schema；字段类型只从绑定表达式推导，cast/try_cast 必须写在 Expr 中。
 它允许 non-null 到 nullable 的放宽，拒绝 nullable 到 non-null 的收窄；所有表达式绑定同一个原始 input Schema，空字段定义合法并保留输入行数与 diff。
 metadata 按 key canonical 排序，重复 key 必须在构造期拒绝，不能静默覆盖。
 SchemaAlign 不声明 Operation data，不提供隐式 coercion，也不为 SQL 或其他上层接口引入专用 Flow 抽象。

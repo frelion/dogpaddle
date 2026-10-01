@@ -23,7 +23,7 @@ use super::support::{
 };
 
 const SQLITE_SINK_V1: &str = include_str!("../fixtures/v1/sqlite_sink_output_events.hex");
-const DEFINITION_HEADER_LEN: usize = b"dogpaddle.operation\0".len() + size_of::<u16>() * 2;
+const DEFINITION_HEADER_LEN: usize = b"dogpaddle.operation\0".len() + size_of::<u16>();
 
 #[test]
 fn sqlite_sink_definition_has_stable_v1_literal_and_public_contract() {
@@ -32,7 +32,6 @@ fn sqlite_sink_definition_has_stable_v1_literal_and_public_contract() {
     let decoded = assert_literal_definition(
         &sqlite,
         SQLITE_SINK_V1,
-        10,
         OperationKind::Sink(std::num::NonZeroU32::MIN),
     );
     assert_eq!(
@@ -49,18 +48,23 @@ fn sqlite_sink_definition_has_stable_v1_literal_and_public_contract() {
     let encoded = encode_definition(&sqlite.clone().into());
     assert_eq!(
         &encoded[DEFINITION_HEADER_LEN..],
-        br#"{"database_path":"/var/lib/dogpaddle/output.sqlite","table_name":"events"}"#
+        br#"{"sqlite_sink":{"database_path":"/var/lib/dogpaddle/output.sqlite","table_name":"events"}}"#
     );
 }
 
 #[test]
-fn public_json_deserialization_rejects_a_relative_sqlite_path() {
+fn raw_sqlite_plan_rejects_a_relative_path_during_binding() {
     let forged = r#"{"database_path":"relative.sqlite","table_name":"events"}"#;
-    assert!(serde_json::from_str::<SqliteSinkDefinition>(forged).is_err());
+    let plan = serde_json::from_str::<SqliteSinkDefinition>(forged).unwrap();
+    assert!(
+        OperationDefinition::from(plan)
+            .output_schema(&[value_schema()])
+            .is_err()
+    );
 }
 
 #[test]
-fn sqlite_sink_decoder_rejects_missing_fields_invalid_strings_and_paths() {
+fn sqlite_sink_codec_checks_structure_and_binding_checks_paths() {
     let canonical = encode_definition(
         &SqliteSinkDefinition::try_new("/var/lib/dogpaddle/output.sqlite", "events")
             .unwrap()
@@ -104,7 +108,7 @@ fn sqlite_sink_decoder_rejects_missing_fields_invalid_strings_and_paths() {
         let mut encoded = canonical[..DEFINITION_HEADER_LEN].to_vec();
         encoded.extend_from_slice(
             format!(
-                r#"{{"database_path":{},"table_name":{}}}"#,
+                r#"{{"sqlite_sink":{{"database_path":{},"table_name":{}}}}}"#,
                 serde_json::to_string(path).unwrap(),
                 serde_json::to_string(table).unwrap()
             )
@@ -120,10 +124,8 @@ fn sqlite_sink_decoder_rejects_missing_fields_invalid_strings_and_paths() {
         wrap("/tmp/output.sqlite", "bad\0table"),
         wrap("/tmp/output.sqlite", "SQLITE_reserved"),
     ] {
-        assert_eq!(
-            decode_definition(&invalid).unwrap_err(),
-            DefinitionCodecError::InvalidPayload("SQLite sink definition is invalid")
-        );
+        let plan = decode_definition(&invalid).unwrap();
+        assert!(plan.output_schema(&[value_schema()]).is_err());
     }
 }
 
@@ -797,5 +799,21 @@ fn retained_birth_comparison_replays_wide_rows_without_duplicate_payload_budget(
             (i64::MIN + 2, 3 * 1024 * 1024),
             (i64::MIN + 3, 3 * 1024 * 1024)
         ]
+    );
+}
+
+#[test]
+fn raw_plan_business_validation_precedes_store_handle_access() {
+    let mut payload = serde_json::to_value(
+        SqliteSinkDefinition::try_new("/tmp/events.sqlite", "events").unwrap(),
+    )
+    .unwrap();
+    payload["database_path"] = serde_json::json!("relative.sqlite");
+    let plan: OperationDefinition =
+        serde_json::from_value(serde_json::json!({"sqlite_sink": payload})).unwrap();
+    crate::support::assert_rejected_plan_before_data(
+        &plan,
+        &[value_schema()],
+        RuntimeResource::none(),
     );
 }

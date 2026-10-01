@@ -11,8 +11,6 @@ pub use config::{PostgresSinkConfig, PostgresTargetSpec};
 pub use definition::PostgresSinkDefinition;
 pub use error::{PostgresSinkError, PostgresSinkSchemaError};
 
-pub(crate) use definition::{TAG, decode_definition};
-
 use super::buffered;
 
 #[cfg(test)]

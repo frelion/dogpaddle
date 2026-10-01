@@ -1,7 +1,7 @@
 use std::{any::TypeId, sync::Arc};
 
 use arrow_schema::SchemaRef;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::{
     buffered,
@@ -10,17 +10,12 @@ use super::{
     schema::DorisLayout,
     target::DorisTarget,
 };
-use crate::{
-    ConstructedOperation, DefinitionCodecError, RuntimeResource,
-    codec::{parse_json_payload, require_canonical_json_payload},
-    definition::schema_error,
-};
+use crate::{ConstructedOperation, RuntimeResource, definition::schema_error};
 
-pub(crate) const TAG: u16 = 18;
 const MAX_DEFINITION_BYTES: usize = 1024 * 1024;
 
 /// Pure definition of a sink-owned Apache Doris relation target.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(transparent)]
 pub struct DorisSinkDefinition {
     target: DorisTargetSpec,
@@ -33,13 +28,19 @@ impl DorisSinkDefinition {
     ///
     /// Rejects invalid or oversized specifications.
     pub fn try_new(target: DorisTargetSpec) -> Result<Self, DorisSinkError> {
-        target.validate()?;
-        if encoded_target(&target).len() > MAX_DEFINITION_BYTES {
+        let definition = Self { target };
+        definition.validate()?;
+        Ok(definition)
+    }
+
+    fn validate(&self) -> Result<(), DorisSinkError> {
+        self.target.validate()?;
+        if encoded_target(&self.target).len() > MAX_DEFINITION_BYTES {
             return Err(invalid_spec(
                 "target specification exceeds the 1 MiB definition limit",
             ));
         }
-        Ok(Self { target })
+        Ok(())
     }
 
     /// Returns the persistent target identity.
@@ -51,8 +52,10 @@ impl DorisSinkDefinition {
 
 impl DorisSinkDefinition {
     pub(crate) fn output_schema_unchecked(
+        &self,
         inputs: &[SchemaRef],
     ) -> Result<(), crate::OperationSchemaError> {
+        self.validate()?;
         DorisLayout::try_new(Arc::clone(&inputs[0]))?;
         Ok(())
     }
@@ -63,6 +66,7 @@ impl DorisSinkDefinition {
         data: &mut dogpaddle_store::DataScope<'_>,
         resource: RuntimeResource,
     ) -> Result<ConstructedOperation, crate::OperationSetupError> {
+        self.validate().map_err(schema_error)?;
         let input_schema = input_schemas
             .first()
             .expect("the final binding entrypoint enforces Doris sink input arity");
@@ -76,24 +80,6 @@ impl DorisSinkDefinition {
     pub(crate) fn resource_type() -> TypeId {
         TypeId::of::<DorisSinkConfig>()
     }
-}
-
-pub(crate) fn decode_definition(
-    payload: &[u8],
-) -> Result<Box<DorisSinkDefinition>, DefinitionCodecError> {
-    let invalid =
-        || DefinitionCodecError::InvalidPayload("invalid Doris sink target specification");
-    if payload.len() > MAX_DEFINITION_BYTES {
-        return Err(invalid());
-    }
-    let target = parse_json_payload(payload)?;
-    let definition = DorisSinkDefinition::try_new(target).map_err(|_| invalid())?;
-    require_canonical_json_payload(
-        &definition,
-        payload,
-        "invalid Doris sink target specification",
-    )?;
-    Ok(Box::new(definition))
 }
 
 fn encoded_target(target: &DorisTargetSpec) -> Vec<u8> {

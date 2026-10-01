@@ -5,7 +5,7 @@
 
 ## Distinct
 
-`Distinct` 的 tag 是 13，是单输入、exact-Schema-preserving Transform，Definition 的 canonical JSON payload 为 `{}`，只声明 `distinct.weights: OrderedMap<Vec<u8>, NonZeroU64>`。
+`Distinct` 是单输入、exact-Schema-preserving Transform，Definition 的 canonical JSON payload 为 `{}`，只声明 `distinct.weights: OrderedMap<Vec<u8>, NonZeroU64>`。
 key 是完整 canonical row bytes，multiplicity 是 Store 维护的正 `u64`；缺失表示零，checked signed adjustment 归零即删除。
 输入按行序逐事件更新：负前缀和 overflow 回滚当前 Atomic 页，仅 `0 → positive` 输出 `+1`、`positive → 0` 输出 `-1`。页内连续相同 key 只缓存一个 key 和其当前 `u64` 权重；仍逐事件校验及产出边界，key 切换或页结束时才写回最终权重，净变化为零时不写。无效前缀继续毒化 Store 事务。
 每行先无拷贝检查完整 canonical 编码大小，并在分配 key 前扣共享预算；List 的 NULL children 也按实际 canonical marker 计费，不能用小 Arrow buffer 绕过页界。新 run 的固定 8-byte 权重读取和最终写回分别在访问前按完整 key 加权重计费；损坏权重仍由 Store 的严格正权重 codec 拒绝并毒化事务。预算不足回滚整页，包括已经写回的早先 run；部分输出的 Arrow filter 复制也先准入。
@@ -16,7 +16,7 @@ canonical Arrow row 编码和 diff 语义留在 operation crate 私有 `relation
 
 ## Aggregate
 
-`Aggregate` 的 tag 是 14，是单输入的 grouped relational Atomic Transform；至少一个 group expression，aggregate call 可以为空。Definition 保存有序命名 group expression 和有序 `AggregateCall`，输出固定为 group fields 后接 call fields。
+`Aggregate` 是单输入的 grouped relational Atomic Transform；至少一个 group expression，aggregate call 可以为空。Definition 保存有序命名 group expression 和有序 `AggregateCall`，输出固定为 group fields 后接 call fields。`AggregateCall<E = Expr>` 只有 `CountAll`、`Count(E)`、`Sum(E)`、`Avg(E)`、`Min(E)`、`Max(E)` 六个变体；持久参数使用同一 ADT 的 `StoredExpression`，未知函数和错误参数个数无法表示，不维护数字函数目录或 Descriptor。
 
 它只声明 `aggregate.groups: OrderedMap<Vec<u8>, GroupState>`、`aggregate.entries: OrderedMap<PartitionKey<EntryPartition, Vec<u8>>, NonZeroU64>` 和 `aggregate.control: Cell<u64>`。groups 以完整 canonical group 为 key，保存稳定 group ID、正 group weight、每个不同参数的充分统计和每个极值 slot 的缓存；entries 的 partition 是 `layout + group ID`，只维护排序参数的 key 和正份数；control 分配不复用的 group ID，不保存完整输入行。
 
@@ -34,7 +34,7 @@ group key 不能包含 Float32/Float64；global aggregate、grouping sets、aggr
 
 ## EquiJoin
 
-`EquiJoin` 的 tag 是 16，是两输入 `PagedTransform`；port 0 为 left，port 1 为 right。
+`EquiJoin` 是两输入 `PagedTransform`；port 0 为 left，port 1 为 right。
 Definition 保留 `Inner/LeftSemi/LeftAnti/LeftOuter/FullOuter`、非空 equality pairs、output names 和可选 residual。
 所有表达式 immutable；每对 key exact 同型、flat non-float，NULL 不匹配。
 residual 在 `left.* + right.*` candidate Schema 上绑定，必须 Boolean，只有 non-null true qualifying。
@@ -59,7 +59,7 @@ outer null correction 与对应 pair 共同占一个 head work item，即使该�
 
 ## AsOfJoin
 
-`AsOfJoin` 的 tag 是 17，是两输入 `PagedTransform`，固定 SQL left outer 输出。
+`AsOfJoin` 是两输入 `PagedTransform`，固定 SQL left outer 输出。
 Definition 只有 direction/exactness、SQL equality pairs、一个 order pair 和 left-then-right output names。
 所有表达式 immutable、pair exact 同型、flat 可索引 non-float scalar；NULL equality/order 不匹配。
 nearest、tolerance、lexicographic order、residual、tie-break、NotDistinct、canonical fallback 和额外 kind 退休。

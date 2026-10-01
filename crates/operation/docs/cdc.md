@@ -5,8 +5,8 @@
 
 ## PostgreSQL
 
-PostgresCdcScan 的 tag 是 11，只有一个具体 Scan，不另建公共 IngressScan 或 connector driver trait。
-Definition 保存非敏感身份、完整固定列声明、有序 `output_projection` 和必填 `NonZeroU64 bootstrap_spool_bytes`，canonical JSON 是 tag11 的持久 ABI。默认构造器保存 identity projection；投影构造器允许空输出，并要求索引无重复且保持 source 顺序。
+PostgresCdcScan 只有一个具体 Scan，不另建公共 IngressScan 或 connector driver trait。
+Definition 保存非敏感身份、完整固定列声明、有序 `output_projection` 和必填 `NonZeroU64 bootstrap_spool_bytes`，canonical JSON 使用 `postgres_cdc_scan` 稳定名称。默认构造器保存 identity projection；投影构造器允许空输出，并要求索引无重复且保持 source 顺序。
 它只声明 `postgres_cdc_scan.phase: Cell<u32>`、`postgres_cdc_scan.checkpoint: Cell<Vec<u8>>`、`postgres_cdc_scan.input: Queue<Vec<u8>>` 三个资源。
 首次运行按 `Fresh → Capturing → Sealed → Streaming` 推进：converter 仍以完整列声明校验每个 Debezium envelope 和完整 row image，只为 `output_projection` 构造 Arrow array；空投影显式保留 batch 行数和 diff。runtime 从这份 projected output Schema 构造唯一的 `SchemaBoundChangeCodec`；`initial` 快照期把 delivery 的可选 Change 编成 schema-bound entry，追加唯一 input Queue，并与整个 delivery 的 opaque checkpoint、phase 在同一事务提交，之后才 ACK；snapshot completed notification 将整个 delivery 封口。Fresh、Capturing、Resetting 的 input 不可见，也不得被公开消费者删除；Sealed、Streaming 直接读取和消费原 Queue。可见性只由 Store 中的 phase 决定，不依赖运行时缓存或是否已调用 restore。
 schema-bound entry 的 v1 持久布局固定为 format marker、canonical physical Schema 的 BLAKE3 fingerprint、单个 uncompressed RecordBatch IPC message 和 EOS，不在每项重复完整 Schema，也不接受 self-contained IPC fallback。封口额外只改变 phase，不移动、重写或重新编号已有 entry；不保留 published Queue 或 Publish maintenance delivery。封口提交并完成 barrier、ACK 原真实 Delivery 后停止 snapshot connector，随后从封口 checkpoint 开始 streaming。
@@ -24,7 +24,7 @@ ACK 不确定或提交不确定要求 fail-stop/reopen；不使用回调、通�
 
 ## MySQL
 
-MySqlCdcScan 的 tag 是 15，同样是单个具体 Scan，Definition 保存发现的非敏感单表身份、完整固定列、有序 `output_projection` 和必填 `NonZeroU64 bootstrap_spool_bytes`；完整 envelope/row image 校验、projected array 构造和零列行数语义与 PostgreSQL 相同。三个资源为 `mysql_cdc_scan.phase: Cell<u32>`、`mysql_cdc_scan.checkpoint: Cell<Vec<u8>>` 和 `mysql_cdc_scan.input: Queue<Vec<u8>>`。
+MySqlCdcScan 同样是单个具体 Scan，Definition 保存发现的非敏感单表身份、完整固定列、有序 `output_projection` 和必填 `NonZeroU64 bootstrap_spool_bytes`；完整 envelope/row image 校验、projected array 构造和零列行数语义与 PostgreSQL 相同。三个资源为 `mysql_cdc_scan.phase: Cell<u32>`、`mysql_cdc_scan.checkpoint: Cell<Vec<u8>>` 和 `mysql_cdc_scan.input: Queue<Vec<u8>>`。
 它也按 `Fresh → Capturing → Sealed → Streaming` 推进，使用 `initial_only` + `snapshot.locking.mode=minimal` 捕获 MySQL 8.4 一致初始快照，以 snapshot completed notification 的 checkpoint 封口，然后以 `recovery` 继续 binlog；沿用上述单 Queue 可见性、容量与真实 ACK 协议。
 捕获、封口、发布、背压和 ACK 与 PG 由同一个私有 CDC runtime 实现；数据库连接、记录转换和 checkpoint 身份校验仍由各具体源拥有。
 Capturing 期 reopen 通过 Resetting 每笔事务 `discard_front(256)` 至多清理 256 个 input entries，逐项写 tombstone 但整批只更新一次 Queue metadata；清空 checkpoint 后重做完整快照，不复制或解码废弃 entry，也不从中间 checkpoint 恢复。

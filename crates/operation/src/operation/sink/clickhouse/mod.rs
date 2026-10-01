@@ -11,8 +11,6 @@ pub use config::{ClickHouseSinkConfig, ClickHouseTargetSpec};
 pub use definition::ClickHouseSinkDefinition;
 pub use error::{ClickHouseSinkError, ClickHouseSinkSchemaError};
 
-pub(crate) use definition::{TAG, decode_definition};
-
 use super::buffered;
 
 #[cfg(test)]

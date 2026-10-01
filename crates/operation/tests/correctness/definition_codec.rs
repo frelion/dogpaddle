@@ -6,10 +6,10 @@ use dogpaddle_operation::{
 };
 
 const MAGIC: &[u8] = b"dogpaddle.operation\0";
-const HEADER_LEN: usize = MAGIC.len() + size_of::<u16>() * 2;
+const HEADER_LEN: usize = MAGIC.len() + size_of::<u16>();
 
 #[test]
-fn definition_envelope_rejects_invalid_magic_version_unknown_tag_and_trailing_bytes() {
+fn definition_envelope_rejects_invalid_magic_version_unknown_variant_and_trailing_bytes() {
     let canonical = encode_definition(&RunningEventCountDefinition::new().into());
     assert_eq!(&canonical[..MAGIC.len()], MAGIC);
     assert_eq!(
@@ -36,12 +36,15 @@ fn definition_envelope_rejects_invalid_magic_version_unknown_tag_and_trailing_by
         DefinitionCodecError::UnsupportedVersion(2)
     );
 
-    let mut unknown = canonical.clone();
-    unknown[MAGIC.len() + size_of::<u16>()..HEADER_LEN].copy_from_slice(&99_u16.to_be_bytes());
-    assert_eq!(
+    let mut unknown = canonical[..HEADER_LEN].to_vec();
+    unknown.extend_from_slice(br#"{"unknown_operation":{}}"#);
+    assert!(matches!(
         decode_definition(&unknown).unwrap_err(),
-        DefinitionCodecError::UnknownTag(99)
-    );
+        DefinitionCodecError::InvalidJsonPayload {
+            reason: "invalid value",
+            ..
+        }
+    ));
 
     let mut trailing = canonical;
     trailing.push(0);

@@ -35,13 +35,13 @@ Operation 的公共测试采用垂直所有权：每个内建算子各有一个 
 - `protocol`：Atomic 完整消费、Paged 的 `Resume/Progress` 与共享 `StepBudget`，以及 Source/Sink 的具体边界协议；
 - `metamorphic`：稳定重批和独立模型。
 
-生产 tag dispatch、`src/tests.rs` 中的白盒手写 tag 列表和各算子文件中的公共 literal golden 必须是三份独立证据。不得建立 `BuiltinContractCase` 或从产品 dispatch 反向生成期望值。
+OperationDefinition 的稳定 tagged JSON 名称由各算子公共 v1 literal golden 独立验证；`src/tests.rs` 覆盖公开 JSON 与持久 codec 使用同一计划表示。不得维护第二份数字 tag 目录、建立 `BuiltinContractCase` 或从产品 enum 反向生成期望值。
 
-Aggregate 的 owner 文件必须证明 tag `14`、精确资源布局与 Schema、Definition roundtrip、共享 argument/moment 与 COUNT/SUM/AVG readout、MIN/MAX layout 复用、正权重 underflow 的整页 rollback、极值缓存重取与 reopen，以及不变结果不产生冗余 output。组权重归零仍须检查统计量一致性。私有 state codec 和表达式去重证据归 Operation。
+Aggregate 的 owner 文件必须证明稳定 tagged JSON 名称 `aggregate` 与 v1 golden、精确资源布局与 Schema、Definition roundtrip、共享 argument/moment 与 COUNT/SUM/AVG readout、MIN/MAX layout 复用、正权重 underflow 的整页 rollback、极值缓存重取与 reopen，以及不变结果不产生冗余 output。组权重归零仍须检查统计量一致性。私有 state codec 和表达式去重证据归 Operation。
 
-EquiJoin 的 owner 文件用独立关系 oracle 覆盖 Inner、LeftSemi、LeftAnti、LeftOuter 和 FullOuter，固定 tag `16`、各 kind 的资源布局、NULL key、重复权重、residual 的 TRUE/FALSE/NULL、outer nullability、正负 diff 和溢出边界。用多个分页大小逐页 rollback/rebuild，证明 opaque Resume 不重复或漏过候选。晚期语义错误只回滚当前页，保留已提交页；reopen 必须再次到达确定性失败。SQL 只证明 lowering、Right swap/SchemaAlign 和最终关系。
+EquiJoin 的 owner 文件用独立关系 oracle 覆盖 Inner、LeftSemi、LeftAnti、LeftOuter 和 FullOuter，固定 tagged JSON 名称 `equi_join` 与 v1 golden、各 kind 的资源布局、NULL key、重复权重、residual 的 TRUE/FALSE/NULL、outer nullability、正负 diff 和溢出边界。用多个分页大小逐页 rollback/rebuild，证明 opaque Resume 不重复或漏过候选。晚期语义错误只回滚当前页，保留已提交页；reopen 必须再次到达确定性失败。SQL 只证明 lowering、Right swap/SchemaAlign 和最终关系。
 
-AsOfJoin 的 owner 文件固定 tag `17` 与 `asof_join.left_rows/right_rows` 两个索引，覆盖 LeftOuter、Backward/Forward、exact 开关、零/多 Equal 键、单 order、NULL、重复 multiplicity、两侧 insert/retract 和歧义拒绝。独立 winner oracle 验证相邻版本定义的受影响区间、旧负新正顺序、每页 rollback/rebuild，以及 RHS 更新只在最后一页提交。产品只保留 SQL 可表达的 ASOF 语义；不维护 nearest、tolerance、residual 或 tie policy 扩展。
+AsOfJoin 的 owner 文件固定 tagged JSON 名称 `asof_join`、v1 golden 与 `asof_join.left_rows/right_rows` 两个索引，覆盖 LeftOuter、Backward/Forward、exact 开关、零/多 Equal 键、单 order、NULL、重复 multiplicity、两侧 insert/retract 和歧义拒绝。独立 winner oracle 验证相邻版本定义的受影响区间、旧负新正顺序、每页 rollback/rebuild，以及 RHS 更新只在最后一页提交。产品只保留 SQL 可表达的 ASOF 语义；不维护 nearest、tolerance、residual 或 tie policy 扩展。
 
 ### Flow
 

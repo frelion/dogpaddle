@@ -6,13 +6,10 @@ use dogpaddle_store::TransactionAccess;
 use thiserror::Error;
 
 use crate::{
-    ConstructedOperation, DefinitionCodecError,
-    codec::decode_json_payload,
+    ConstructedOperation,
     definition::schema_error,
     operation::{AtomicOperation, OperationError, OperationInput},
 };
-
-pub(crate) const TAG: u16 = 8;
 
 /// Pure definition of an order-preserving `UNION ALL` operation.
 ///
@@ -157,11 +154,4 @@ impl AtomicOperation for UnionAllOperation {
         budget.charge(crate::operation::logical_change_bytes(input.change))?;
         Ok(Some(input.change.clone()))
     }
-}
-
-pub(crate) fn decode_definition(
-    payload: &[u8],
-) -> Result<Box<UnionAllDefinition>, DefinitionCodecError> {
-    let definition: UnionAllDefinition = decode_json_payload(payload, "invalid UnionAll payload")?;
-    Ok(Box::new(definition))
 }

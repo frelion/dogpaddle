@@ -8,13 +8,10 @@ use dogpaddle_store::{Cell, TransactionAccess};
 use thiserror::Error;
 
 use crate::{
-    DefinitionCodecError,
-    codec::decode_json_payload,
     definition::ConstructedOperation,
     operation::{AtomicOperation, OperationError, OperationInput},
 };
 
-pub(crate) const TAG: u16 = 2;
 const COUNT: &str = "running_event_count.count";
 
 /// Pure definition of a running event-count operation.
@@ -135,12 +132,4 @@ fn output_schema() -> SchemaRef {
             false,
         )]))
     }))
-}
-
-pub(crate) fn decode_definition(
-    payload: &[u8],
-) -> Result<Box<RunningEventCountDefinition>, DefinitionCodecError> {
-    let definition: RunningEventCountDefinition =
-        decode_json_payload(payload, "invalid RunningEventCount payload")?;
-    Ok(Box::new(definition))
 }

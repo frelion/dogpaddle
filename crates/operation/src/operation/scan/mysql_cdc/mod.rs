@@ -13,7 +13,5 @@ pub use error::MySqlCdcScanError;
 use runtime::MySqlCdcScanOperation;
 pub use schema::{MySqlColumn, MySqlType};
 
-pub(crate) use definition::{TAG, decode_definition};
-
 #[cfg(test)]
 mod tests;

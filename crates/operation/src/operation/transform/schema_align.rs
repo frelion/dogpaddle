@@ -10,14 +10,10 @@ use datafusion_common::DFSchema;
 use thiserror::Error;
 
 use crate::{
-    ConstructedOperation, DefinitionCodecError, Expr, ExpressionBindError,
-    ExpressionDefinitionError,
-    codec::decode_json_payload,
+    ConstructedOperation, Expr, ExpressionBindError, ExpressionDefinitionError,
     definition::schema_error,
     expression::{BoundProjection, StoredExpression},
 };
-
-pub(crate) const TAG: u16 = 9;
 
 /// One ordered output field of a [`SchemaAlignDefinition`].
 ///
@@ -354,13 +350,6 @@ impl SchemaAlignDefinition {
         let (output_schema, operation) = self.bind_operation(input_schema).map_err(schema_error)?;
         Ok(ConstructedOperation::atomic(output_schema, operation))
     }
-}
-
-pub(crate) fn decode_definition(
-    payload: &[u8],
-) -> Result<Box<SchemaAlignDefinition>, DefinitionCodecError> {
-    let definition = decode_json_payload(payload, "invalid SchemaAlign payload")?;
-    Ok(Box::new(definition))
 }
 
 #[derive(Clone)]

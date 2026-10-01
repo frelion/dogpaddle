@@ -99,12 +99,11 @@ fn open_reports_the_full_name_and_kind_for_a_wrong_collection() {
 }
 
 #[test]
-fn literal_definition_has_tag_13_exact_schema_and_one_weight_multiset() {
+fn literal_definition_has_variant_exact_schema_and_one_weight_multiset() {
     let definition = DistinctDefinition::new();
     let decoded = assert_literal_definition(
         &definition,
         DISTINCT_V1,
-        13,
         OperationKind::AtomicTransform(NonZeroU32::MIN),
     );
     let input = schema();

@@ -13,7 +13,5 @@ pub use error::PostgresCdcScanError;
 use runtime::PostgresCdcScanOperation;
 pub use schema::{PostgresColumn, PostgresType};
 
-pub(crate) use definition::{TAG, decode_definition};
-
 #[cfg(test)]
 mod tests;

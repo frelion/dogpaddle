@@ -11,13 +11,10 @@ use std::num::NonZeroU64;
 use thiserror::Error;
 
 use crate::{
-    DefinitionCodecError,
-    codec::decode_json_payload,
     definition::{ConstructedOperation, schema_error},
     operation::{OperationError, SourceOperation},
 };
 
-pub(crate) const TAG: u16 = 1;
 const PUBLISHED: &str = "sequence_scan.published";
 const POSITION: &str = "sequence_scan.position";
 const PUBLISHED_BYTES: u64 = 64 * 1024 * 1024;
@@ -168,12 +165,4 @@ fn output_schema() -> SchemaRef {
             false,
         )]))
     }))
-}
-
-pub(crate) fn decode_definition(
-    payload: &[u8],
-) -> Result<Box<SequenceScanDefinition>, DefinitionCodecError> {
-    let definition: SequenceScanDefinition =
-        decode_json_payload(payload, "invalid sequence scan payload")?;
-    Ok(Box::new(definition))
 }

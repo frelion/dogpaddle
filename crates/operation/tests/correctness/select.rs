@@ -25,7 +25,7 @@ use super::support::{
 };
 
 const SELECT_V1: &str = include_str!("../fixtures/v1/select_named_expressions.hex");
-const DEFINITION_HEADER_LEN: usize = b"dogpaddle.operation\0".len() + size_of::<u16>() * 2;
+const DEFINITION_HEADER_LEN: usize = b"dogpaddle.operation\0".len() + size_of::<u16>();
 
 fn persisted_definition() -> SelectDefinition {
     SelectDefinition::try_new([
@@ -41,7 +41,6 @@ fn literal_definition_reconstructs_ordered_fields_binding_and_runtime() {
     let decoded = assert_literal_definition(
         &definition,
         SELECT_V1,
-        7,
         OperationKind::AtomicTransform(NonZeroU32::MIN),
     );
     let expected_fields = [
@@ -118,7 +117,7 @@ fn literal_definition_reconstructs_ordered_fields_binding_and_runtime() {
 fn decoder_rejects_unknown_fields_and_invalid_utf8_without_panicking() {
     let canonical = encode_definition(&persisted_definition().into());
     let payload = std::str::from_utf8(&canonical[DEFINITION_HEADER_LEN..]).unwrap();
-    assert!(payload.starts_with("{\"fields\":"));
+    assert!(payload.starts_with("{\"select\":{\"fields\":"));
 
     let mut missing_fields = canonical[..DEFINITION_HEADER_LEN].to_vec();
     missing_fields.extend_from_slice(

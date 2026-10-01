@@ -31,14 +31,19 @@ fn filter(predicate: Expr) -> FilterDefinition {
     FilterDefinition::try_new(predicate).unwrap()
 }
 
-const DEFINITION_HEADER_LEN: usize = b"dogpaddle.operation\0".len() + size_of::<u16>() * 2;
+const DEFINITION_HEADER_LEN: usize = b"dogpaddle.operation\0".len() + size_of::<u16>();
 const MAP_EXPRESSION_PROBE: &str = "DOGPADDLE_MAP_EXPRESSION_PROBE";
 
 fn filter_with_protobuf(protobuf: &[u8]) -> Vec<u8> {
     let canonical = encode_definition(&filter(lit(true)).into());
     let mut encoded = canonical[..DEFINITION_HEADER_LEN].to_vec();
-    encoded
-        .extend_from_slice(format!(r#"{{"predicate":"{}"}}"#, BASE64.encode(protobuf)).as_bytes());
+    encoded.extend_from_slice(
+        format!(
+            r#"{{"filter":{{"predicate":"{}"}}}}"#,
+            BASE64.encode(protobuf)
+        )
+        .as_bytes(),
+    );
     encoded
 }
 
@@ -60,7 +65,11 @@ fn expression_payloads_are_base64_canonical_datafusion_protobuf() {
         let encoded = encode_definition(&filter(expression).into());
         assert_eq!(
             &encoded[DEFINITION_HEADER_LEN..],
-            format!(r#"{{"predicate":"{}"}}"#, BASE64.encode(protobuf.as_ref())).as_bytes()
+            format!(
+                r#"{{"filter":{{"predicate":"{}"}}}}"#,
+                BASE64.encode(protobuf.as_ref())
+            )
+            .as_bytes()
         );
 
         let decoded = decode_definition(&encoded).unwrap();
@@ -84,7 +93,7 @@ fn expression_decoder_rejects_invalid_base64_malformed_and_noncanonical_protobuf
     }
 
     let mut invalid_base64 = canonical[..DEFINITION_HEADER_LEN].to_vec();
-    invalid_base64.extend_from_slice(br#"{"predicate":"***"}"#);
+    invalid_base64.extend_from_slice(br#"{"filter":{"predicate":"***"}}"#);
     assert!(matches!(
         decode_definition(&invalid_base64).unwrap_err(),
         DefinitionCodecError::InvalidJsonPayload {
@@ -114,7 +123,7 @@ fn expression_decoder_rejects_invalid_base64_malformed_and_noncanonical_protobuf
     noncanonical_json.insert(DEFINITION_HEADER_LEN + 1, b' ');
     assert_eq!(
         decode_definition(&noncanonical_json).unwrap_err(),
-        DefinitionCodecError::InvalidPayload("invalid Filter payload")
+        DefinitionCodecError::InvalidPayload("non-canonical operation definition")
     );
 }
 

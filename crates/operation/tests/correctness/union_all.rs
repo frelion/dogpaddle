@@ -19,7 +19,7 @@ use super::support::{
 };
 
 const UNION_ALL_V1: &str = include_str!("../fixtures/v1/union_all_two_inputs.hex");
-const DEFINITION_HEADER_LEN: usize = b"dogpaddle.operation\0".len() + size_of::<u16>() * 2;
+const DEFINITION_HEADER_LEN: usize = b"dogpaddle.operation\0".len() + size_of::<u16>();
 
 fn decoded_definition() -> OperationDefinition {
     decode_definition(&decode_hex(UNION_ALL_V1)).unwrap()
@@ -78,7 +78,6 @@ fn literal_definition_preserves_arity_binding_and_data_contract() {
     let decoded = assert_literal_definition(
         &definition,
         UNION_ALL_V1,
-        8,
         OperationKind::AtomicTransform(NonZeroU32::new(2).unwrap()),
     );
     assert_eq!(definition.input_count().get(), 2);
@@ -93,9 +92,9 @@ fn literal_definition_preserves_arity_binding_and_data_contract() {
 fn decoder_rejects_zero_input_count() {
     let canonical = encode_definition(&UnionAllDefinition::new(NonZeroU32::new(2).unwrap()).into());
     let payload = std::str::from_utf8(&canonical[DEFINITION_HEADER_LEN..]).unwrap();
-    assert_eq!(payload, "{\"input_count\":2}");
+    assert_eq!(payload, "{\"union_all\":{\"input_count\":2}}");
     let mut zero = canonical[..DEFINITION_HEADER_LEN].to_vec();
-    zero.extend_from_slice(b"{\"input_count\":0}");
+    zero.extend_from_slice(b"{\"union_all\":{\"input_count\":0}}");
     assert!(matches!(
         decode_definition(&zero).unwrap_err(),
         DefinitionCodecError::InvalidJsonPayload {

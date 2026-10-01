@@ -1,31 +1,15 @@
-use crate::operation::{scan, sink, transform};
+use crate::operation::transform::RunningEventCountDefinition;
+use crate::{OperationDefinition, decode_definition, encode_definition};
 
 #[test]
-fn builtin_definition_tags_are_unique_and_stable() {
-    let mut tags = [
-        scan::mysql_cdc::TAG,
-        scan::postgres_cdc::TAG,
-        scan::sequence::TAG,
-        transform::aggregate::TAG,
-        transform::asof_join::TAG,
-        transform::distinct::TAG,
-        transform::running_event_count::TAG,
-        transform::filter::TAG,
-        transform::equi_join::TAG,
-        transform::select::TAG,
-        transform::union_all::TAG,
-        transform::schema_align::TAG,
-        sink::clickhouse::TAG,
-        sink::discard::TAG,
-        sink::doris::TAG,
-        sink::postgres::TAG,
-        sink::sqlite::TAG,
-    ];
-    tags.sort_unstable();
+fn json_plan_and_persistent_definition_share_the_same_variant() {
+    let definition: OperationDefinition = RunningEventCountDefinition::new().into();
+    let json = serde_json::to_string(&definition).unwrap();
+    assert_eq!(json, r#"{"running_event_count":{}}"#);
+    let plan: OperationDefinition = serde_json::from_str(&json).unwrap();
+    let bytes = encode_definition(&plan);
     assert_eq!(
-        tags.to_vec(),
-        (1..=19)
-            .filter(|tag| ![4, 6].contains(tag))
-            .collect::<Vec<_>>()
+        serde_json::to_string(&decode_definition(&bytes).unwrap()).unwrap(),
+        json
     );
 }

@@ -3,18 +3,13 @@ use std::{any::TypeId, num::NonZeroU64, sync::Arc};
 use arrow_schema::SchemaRef;
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    ConstructedOperation, DefinitionCodecError, RuntimeResource,
-    codec::{parse_json_payload, require_canonical_json_payload},
-    definition::schema_error,
-};
+use crate::{ConstructedOperation, RuntimeResource, definition::schema_error};
 
 use super::{
     PostgresCdcScanConfig, PostgresCdcScanError, PostgresCdcScanOperation, PostgresColumn, schema,
 };
 use dogpaddle_store::{Cell, Queue};
 
-pub(crate) const TAG: u16 = 11;
 const MAX_DEFINITION_BYTES: usize = 1024 * 1024;
 pub(super) const PHASE: &str = "postgres_cdc_scan.phase";
 pub(super) const CHECKPOINT: &str = "postgres_cdc_scan.checkpoint";
@@ -60,7 +55,8 @@ pub struct PostgresCdcScanSpec {
 /// initial snapshot remains private until sealed, then becomes visible in the
 /// input queue. WAL streaming resumes from the sealed checkpoint while Flow
 /// consumes that input, with streaming capture bounded by its queue capacity.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PostgresCdcScanDefinition {
     spec: PostgresCdcScanSpec,
     output_projection: Vec<u32>,
@@ -117,20 +113,25 @@ impl PostgresCdcScanDefinition {
         output_projection: Vec<u32>,
         bootstrap_spool_bytes: NonZeroU64,
     ) -> Result<Self, PostgresCdcScanError> {
-        validate(&spec)?;
-        super::super::ordered_projection(&output_projection, spec.columns.len())
-            .ok_or_else(invalid_projection)?;
         let definition = Self {
             spec,
             output_projection,
             bootstrap_spool_bytes,
         };
-        if encode(&definition)?.len() > MAX_DEFINITION_BYTES {
+        definition.validate()?;
+        Ok(definition)
+    }
+
+    fn validate(&self) -> Result<(), PostgresCdcScanError> {
+        validate_spec(&self.spec)?;
+        super::super::ordered_projection(&self.output_projection, self.spec.columns.len())
+            .ok_or_else(invalid_projection)?;
+        if encode(self)?.len() > MAX_DEFINITION_BYTES {
             return Err(PostgresCdcScanError::InvalidDefinition(
                 "scan definition exceeds 1 MiB".to_owned(),
             ));
         }
-        Ok(definition)
+        Ok(())
     }
 
     /// Returns the frozen, non-sensitive Scan specification.
@@ -156,6 +157,7 @@ impl PostgresCdcScanDefinition {
     pub(crate) fn output_schema_unchecked(
         &self,
     ) -> Result<Option<SchemaRef>, crate::OperationSchemaError> {
+        self.validate()?;
         output_schema(&self.spec, &self.output_projection)
             .map(Some)
             .map_err(Into::into)
@@ -166,6 +168,7 @@ impl PostgresCdcScanDefinition {
         scope: &mut dogpaddle_store::DataScope<'_>,
         resource: RuntimeResource,
     ) -> Result<ConstructedOperation, crate::OperationSetupError> {
+        self.validate().map_err(schema_error)?;
         let output = output_schema(&self.spec, &self.output_projection).map_err(schema_error)?;
         let phase = scope.data::<Cell<u32>>(PHASE)?;
         let checkpoint = scope.data::<Cell<Vec<u8>>>(CHECKPOINT)?;
@@ -188,45 +191,13 @@ impl PostgresCdcScanDefinition {
     }
 }
 
-pub(crate) fn decode_definition(
-    payload: &[u8],
-) -> Result<Box<PostgresCdcScanDefinition>, DefinitionCodecError> {
-    let invalid =
-        || DefinitionCodecError::InvalidPayload("invalid PostgreSQL CDC scan specification");
-    if payload.len() > MAX_DEFINITION_BYTES {
-        return Err(invalid());
-    }
-    let persistent: PersistentDefinition = parse_json_payload(payload)?;
-    let capacity = NonZeroU64::new(persistent.bootstrap_spool_bytes).ok_or_else(invalid)?;
-    let definition = PostgresCdcScanDefinition::try_new_projected(
-        persistent.spec,
-        persistent.output_projection,
-        capacity,
-    )
-    .map_err(|_| invalid())?;
-    require_canonical_json_payload(
-        &definition,
-        payload,
-        "invalid PostgreSQL CDC scan specification",
-    )?;
-    Ok(Box::new(definition))
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PersistentDefinition {
-    spec: PostgresCdcScanSpec,
-    output_projection: Vec<u32>,
-    bootstrap_spool_bytes: u64,
-}
-
 fn encode(definition: &PostgresCdcScanDefinition) -> Result<Vec<u8>, PostgresCdcScanError> {
     serde_json::to_vec(definition).map_err(|_| {
         PostgresCdcScanError::InvalidDefinition("cannot encode scan definition".to_owned())
     })
 }
 
-fn validate(spec: &PostgresCdcScanSpec) -> Result<(), PostgresCdcScanError> {
+fn validate_spec(spec: &PostgresCdcScanSpec) -> Result<(), PostgresCdcScanError> {
     let invalid = |message: &str| PostgresCdcScanError::InvalidDefinition(message.to_owned());
     for value in [
         &spec.engine_name,

@@ -38,20 +38,16 @@ fn config(database: &str) -> DorisSinkConfig {
 }
 
 fn literal_definition_bytes() -> Vec<u8> {
-    let mut expected = b"dogpaddle.operation\0\0\x01\0\x12".to_vec();
-    expected.extend_from_slice(br#"{"sink_id":"orders_sink","database":"shop","table":"orders_materialized","cluster_id":42}"#);
+    let mut expected = b"dogpaddle.operation\0\0\x01".to_vec();
+    expected.extend_from_slice(br#"{"doris_sink":{"sink_id":"orders_sink","database":"shop","table":"orders_materialized","cluster_id":42}}"#);
     expected
 }
 
 #[test]
-fn doris_sink_has_canonical_non_secret_tag_18_bytes() {
+fn doris_sink_has_canonical_non_secret_variant_bytes() {
     let definition = definition();
     let encoded = encode_definition(&definition.clone().into());
     assert_eq!(encoded, literal_definition_bytes());
-    assert_eq!(
-        OperationDefinition::from(definition.clone()).persistence_tag(),
-        18
-    );
     assert_eq!(
         OperationDefinition::from(definition.clone()).kind(),
         OperationKind::Sink(NonZeroU32::MIN)
@@ -160,4 +156,17 @@ fn doris_definition_rejects_every_truncated_prefix() {
     for length in 0..encoded.len() {
         assert!(decode_definition(&encoded[..length]).is_err());
     }
+}
+
+#[test]
+fn raw_plan_business_validation_precedes_store_handle_access() {
+    let mut payload = serde_json::to_value(definition()).unwrap();
+    payload["sink_id"] = serde_json::json!("");
+    let plan: OperationDefinition =
+        serde_json::from_value(serde_json::json!({"doris_sink": payload})).unwrap();
+    crate::support::assert_rejected_plan_before_data(
+        &plan,
+        &[schema()],
+        RuntimeResource::new(config("shop")),
+    );
 }

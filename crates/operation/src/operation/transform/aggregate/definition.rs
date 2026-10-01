@@ -1,24 +1,20 @@
 use std::sync::Arc;
 
-use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
+use serde::{Deserialize, Serialize};
 
 use arrow_schema::{Field, Schema, SchemaRef};
 
 use crate::{
-    ConstructedOperation, DefinitionCodecError, Expr, OperationSchemaError,
-    codec::{parse_json_payload, require_canonical_json_payload},
-    definition::schema_error,
+    ConstructedOperation, Expr, OperationSchemaError, definition::schema_error,
     expression::StoredExpression,
 };
 
 use super::{
     AggregateDefinitionError, AggregateSchemaError,
-    functions::{AVG, COUNT, COUNT_ALL, ExtremaDirection, MAX, MIN, Reduction, SUM, descriptor},
+    functions::{ExtremaDirection, Reduction, bind},
     runtime::{BoundAggregate, BoundArgument, BoundCall, BoundLayout, BoundStatistic, ExtremaSlot},
     value::contains_float,
 };
-
-pub(crate) const TAG: u16 = 14;
 
 pub(super) const GROUPS: &str = "aggregate.groups";
 pub(super) const ENTRIES: &str = "aggregate.entries";
@@ -39,10 +35,21 @@ pub(crate) struct AggregateLayout {
 ///
 /// Constructors are infallible. The enclosing [`AggregateDefinition`] owns
 /// canonical expression persistence and reports any encoding failure once.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AggregateCall {
-    function: u16,
-    arguments: Box<[Expr]>,
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AggregateCall<E = Expr> {
+    /// Counts every row, including rows containing NULL.
+    CountAll,
+    /// Counts non-NULL values.
+    Count(E),
+    /// Sums non-NULL integer values.
+    Sum(E),
+    /// Averages non-NULL integer values.
+    Avg(E),
+    /// Finds the smallest non-NULL value.
+    Min(E),
+    /// Finds the largest non-NULL value.
+    Max(E),
 }
 
 /// Pure definition of one grouped relational aggregate.
@@ -50,7 +57,8 @@ pub struct AggregateCall {
 /// All grouping expressions and calls are evaluated by one Operation so group
 /// ownership, tracked-weight validation, state, and output transitions share one
 /// transaction.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AggregateDefinition {
     groups: Box<[NamedExpression]>,
     calls: Box<[NamedCall]>,
@@ -67,86 +75,60 @@ struct NamedExpression {
 #[serde(deny_unknown_fields)]
 struct NamedCall {
     name: String,
-    function: u16,
-    arguments: Box<[StoredExpression]>,
+    call: AggregateCall<StoredExpression>,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Payload {
-    groups: Box<[NamedExpression]>,
-    calls: Box<[NamedCall]>,
-}
-
-impl Payload {
-    fn into_definition(self) -> Result<AggregateDefinition, &'static str> {
-        if self.groups.is_empty() {
-            return Err("Aggregate GROUP BY is empty");
-        }
-        for call in &self.calls {
-            let Some(descriptor) = descriptor(call.function) else {
-                return Err("Aggregate function tag is unknown");
-            };
-            if call.arguments.len() != descriptor.arguments {
-                return Err("Aggregate function argument count is invalid");
-            }
-        }
-        Ok(AggregateDefinition {
-            groups: self.groups,
-            calls: self.calls,
-        })
-    }
-}
-
-impl<'de> Deserialize<'de> for AggregateDefinition {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Payload::deserialize(deserializer)?
-            .into_definition()
-            .map_err(D::Error::custom)
-    }
-}
-
-impl AggregateCall {
+impl<E> AggregateCall<E> {
     /// Creates `COUNT(*)`.
     #[must_use]
-    pub fn count_all() -> Self {
-        Self::new(COUNT_ALL, [])
+    pub const fn count_all() -> Self {
+        Self::CountAll
     }
-
     /// Creates `COUNT(expression)`.
     #[must_use]
-    pub fn count(expression: Expr) -> Self {
-        Self::new(COUNT, [expression])
+    pub fn count(expression: E) -> Self {
+        Self::Count(expression)
     }
-
     /// Creates `SUM(expression)`.
     #[must_use]
-    pub fn sum(expression: Expr) -> Self {
-        Self::new(SUM, [expression])
+    pub fn sum(expression: E) -> Self {
+        Self::Sum(expression)
     }
-
     /// Creates `AVG(expression)`.
     #[must_use]
-    pub fn avg(expression: Expr) -> Self {
-        Self::new(AVG, [expression])
+    pub fn avg(expression: E) -> Self {
+        Self::Avg(expression)
     }
-
     /// Creates `MIN(expression)`.
     #[must_use]
-    pub fn min(expression: Expr) -> Self {
-        Self::new(MIN, [expression])
+    pub fn min(expression: E) -> Self {
+        Self::Min(expression)
     }
-
     /// Creates `MAX(expression)`.
     #[must_use]
-    pub fn max(expression: Expr) -> Self {
-        Self::new(MAX, [expression])
+    pub fn max(expression: E) -> Self {
+        Self::Max(expression)
     }
 
-    fn new(function: u16, arguments: impl IntoIterator<Item = Expr>) -> Self {
-        Self {
-            function,
-            arguments: arguments.into_iter().collect(),
+    fn try_map<T, F>(self, mut map: impl FnMut(E) -> Result<T, F>) -> Result<AggregateCall<T>, F> {
+        Ok(match self {
+            Self::CountAll => AggregateCall::CountAll,
+            Self::Count(value) => AggregateCall::Count(map(value)?),
+            Self::Sum(value) => AggregateCall::Sum(map(value)?),
+            Self::Avg(value) => AggregateCall::Avg(map(value)?),
+            Self::Min(value) => AggregateCall::Min(map(value)?),
+            Self::Max(value) => AggregateCall::Max(map(value)?),
+        })
+    }
+
+    fn argument(&self) -> Option<&E> {
+        match self {
+            Self::CountAll => None,
+            Self::Count(value)
+            | Self::Sum(value)
+            | Self::Avg(value)
+            | Self::Min(value)
+            | Self::Max(value) => Some(value),
         }
     }
 }
@@ -174,38 +156,27 @@ impl AggregateDefinition {
     {
         let mut stored_groups = Vec::new();
         for (group, (name, expression)) in groups.into_iter().enumerate() {
-            ensure_count(group)?;
             let name = name.into();
-            ensure_name(&name)?;
             let expression = StoredExpression::try_new(expression)
                 .map_err(|source| AggregateDefinitionError::GroupExpression { group, source })?;
             stored_groups.push(NamedExpression { name, expression });
         }
-        if stored_groups.is_empty() {
-            return Err(AggregateDefinitionError::EmptyGroupBy);
-        }
-
         let mut stored_calls = Vec::new();
         for (aggregate, (name, call)) in aggregates.into_iter().enumerate() {
-            ensure_count(aggregate)?;
             let name = name.into();
-            ensure_name(&name)?;
-            let mut arguments = Vec::with_capacity(call.arguments.len());
-            for expression in call.arguments {
-                arguments.push(StoredExpression::try_new(expression).map_err(|source| {
+            let call = call.try_map(|expression| {
+                StoredExpression::try_new(expression).map_err(|source| {
                     AggregateDefinitionError::AggregateExpression { aggregate, source }
-                })?);
-            }
-            stored_calls.push(NamedCall {
-                name,
-                function: call.function,
-                arguments: arguments.into_boxed_slice(),
-            });
+                })
+            })?;
+            stored_calls.push(NamedCall { name, call });
         }
-        Ok(Self {
+        let definition = Self {
             groups: stored_groups.into_boxed_slice(),
             calls: stored_calls.into_boxed_slice(),
-        })
+        };
+        definition.validate()?;
+        Ok(definition)
     }
 }
 
@@ -234,10 +205,26 @@ impl AggregateDefinition {
 }
 
 impl AggregateDefinition {
+    fn validate(&self) -> Result<(), AggregateDefinitionError> {
+        if self.groups.is_empty() {
+            return Err(AggregateDefinitionError::EmptyGroupBy);
+        }
+        for (index, field) in self.groups.iter().enumerate() {
+            ensure_count(index)?;
+            ensure_name(&field.name)?;
+        }
+        for (index, field) in self.calls.iter().enumerate() {
+            ensure_count(index)?;
+            ensure_name(&field.name)?;
+        }
+        Ok(())
+    }
+
     fn compile_layout(
         &self,
         input_schema: &SchemaRef,
     ) -> Result<AggregateLayout, OperationSchemaError> {
+        self.validate()?;
         let mut output_fields = Vec::with_capacity(self.groups.len() + self.calls.len());
         let group_expressions = self.bind_groups(input_schema, &mut output_fields)?;
         let BoundAggregate {
@@ -251,6 +238,7 @@ impl AggregateDefinition {
             output_fields,
             input_schema.metadata().clone(),
         ));
+        dogpaddle_change::validate_schema(&output_schema)?;
         Ok(AggregateLayout {
             input_schema: Arc::clone(input_schema),
             output_schema,
@@ -301,25 +289,24 @@ impl AggregateDefinition {
         let mut layouts: Vec<BoundLayout> = Vec::new();
         let mut slots = Vec::new();
         for (aggregate, call) in self.calls.iter().enumerate() {
-            let function = descriptor(call.function).expect("definitions admit known functions");
-            let bound_arguments = call
-                .arguments
-                .iter()
-                .map(|argument| argument.bind(Arc::clone(input_schema)))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|source| -> OperationSchemaError {
-                    Box::new(AggregateSchemaError::AggregateExpression { aggregate, source })
-                })?;
-            let bound = (function.bind)(&bound_arguments)
-                .map_err(|error| Box::new(error) as OperationSchemaError)?;
+            let bound_call = call.call.clone().try_map(|argument| {
+                argument
+                    .bind(Arc::clone(input_schema))
+                    .map_err(|source| -> OperationSchemaError {
+                        Box::new(AggregateSchemaError::AggregateExpression { aggregate, source })
+                    })
+            })?;
+            let (bound_argument, bound) = bind(bound_call)?;
             output_fields.push(Arc::new(Field::new(
                 &call.name,
                 bound.output_type,
                 bound.nullable,
             )));
-            let argument = bound_arguments.into_iter().next().map(|expression| {
-                indexed_argument(&mut arguments, &call.arguments[0], expression, aggregate)
-            });
+            let argument = bound_argument
+                .zip(call.call.argument())
+                .map(|(expression, stored)| {
+                    indexed_argument(&mut arguments, stored, expression, aggregate)
+                });
             calls.push(match bound.reduction {
                 Reduction::RowsCount => BoundCall::RowsCount,
                 Reduction::Extrema(direction) => {
@@ -446,16 +433,6 @@ fn indexed_slot(
     slots.push(ExtremaSlot { layout });
     *cached_slot = Some(slot);
     slot
-}
-
-pub(crate) fn decode_definition(
-    payload: &[u8],
-) -> Result<Box<AggregateDefinition>, DefinitionCodecError> {
-    let definition = parse_json_payload::<Payload>(payload)?
-        .into_definition()
-        .map_err(DefinitionCodecError::InvalidPayload)?;
-    require_canonical_json_payload(&definition, payload, "invalid Aggregate payload")?;
-    Ok(Box::new(definition))
 }
 
 fn ensure_count(index: usize) -> Result<(), AggregateDefinitionError> {

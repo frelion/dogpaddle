@@ -6,14 +6,10 @@ use datafusion_common::DFSchema;
 use thiserror::Error;
 
 use crate::{
-    ConstructedOperation, DefinitionCodecError, Expr, ExpressionBindError,
-    ExpressionDefinitionError,
-    codec::decode_json_payload,
+    ConstructedOperation, Expr, ExpressionBindError, ExpressionDefinitionError,
     definition::schema_error,
     expression::{BoundProjection, StoredExpression},
 };
-
-pub(crate) const TAG: u16 = 7;
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -207,11 +203,4 @@ impl SelectDefinition {
         let (output_schema, operation) = self.bind_operation(input_schema).map_err(schema_error)?;
         Ok(ConstructedOperation::atomic(output_schema, operation))
     }
-}
-
-pub(crate) fn decode_definition(
-    payload: &[u8],
-) -> Result<Box<SelectDefinition>, DefinitionCodecError> {
-    let definition: SelectDefinition = decode_json_payload(payload, "invalid Select payload")?;
-    Ok(Box::new(definition))
 }

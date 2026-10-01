@@ -25,7 +25,7 @@ use super::support::{
 };
 
 const SCHEMA_ALIGN_V1: &str = include_str!("../fixtures/v1/schema_align_explicit.hex");
-const DEFINITION_HEADER_LEN: usize = b"dogpaddle.operation\0".len() + size_of::<u16>() * 2;
+const DEFINITION_HEADER_LEN: usize = b"dogpaddle.operation\0".len() + size_of::<u16>();
 
 fn align(fields: impl IntoIterator<Item = SchemaAlignField>) -> SchemaAlignDefinition {
     SchemaAlignDefinition::try_new(fields).unwrap()
@@ -67,7 +67,6 @@ fn literal_definition_reconstructs_metadata_binding_and_runtime() {
     let decoded = assert_literal_definition(
         &definition,
         SCHEMA_ALIGN_V1,
-        9,
         OperationKind::AtomicTransform(NonZeroU32::MIN),
     );
     let fields = definition.fields().collect::<Vec<_>>();
@@ -211,7 +210,7 @@ fn encoding_canonicalizes_metadata_and_decoder_rejects_noncanonical_payloads() {
     assert_ne!(unsorted, canonical);
     assert_eq!(
         decode_definition(&unsorted).unwrap_err(),
-        DefinitionCodecError::InvalidPayload("invalid SchemaAlign payload")
+        DefinitionCodecError::InvalidPayload("non-canonical operation definition")
     );
 }
 

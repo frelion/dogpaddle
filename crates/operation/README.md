@@ -27,7 +27,7 @@ immutable input + opaque Resume + TransactionAccess + StepBudget
 ## Definition 与 checked construction
 
 Definition 是可持久化的纯计划，不持有数据库句柄、连接、密码或执行位置。
-`OperationDefinition` 是全部内建算子的封闭 enum；具体模块拥有 tag、canonical JSON payload 和业务校验。
+`OperationDefinition` 是全部内建算子的封闭 enum，也是唯一的稳定名称 JSON 计划表示；具体模块拥有纯业务验证与编译。反序列化证明结构和表达式可重放性，`output_schema`/`construct` 在访问 Store 句柄前完成业务验证。
 不保留旧 tag、格式识别、fallback、迁移或兼容入口。开发期 v1 布局变更后直接重建受影响的状态和目标。
 
 构造过程按同一路径服务新建和 reopen：
@@ -100,17 +100,17 @@ head item 额度限制输入事件、扫描候选或修正原子；Atomic tail �
 
 ## 内建计算算子
 
-| 算子 / tag | 能力 | 关系行为与状态 |
+| 算子 | 能力 | 关系行为与状态 |
 | --- | --- | --- |
-| `RunningEventCount` / 2 | Atomic | 逐事件递增 count，忽略输入 diff；私有 `Cell<u64>` |
-| Filter / 5 | Atomic | 只保留 non-null true；不声明 state |
-| Select / 7 | Atomic | 有序投影与计算；纯列引用共享 arrays 和 diffs |
-| `UnionAll` / 8 | Atomic | exact-Schema 输入按端口原样转发 |
-| `SchemaAlign` / 9 | Atomic | 显式名字、metadata 和 nullability 对齐 |
-| Distinct / 13 | Atomic | exact canonical row positive weights 的零/正边界 |
-| Aggregate / 14 | Atomic | grouped COUNT/SUM/AVG/MIN/MAX，unique argument statistics 与 extrema indexes |
-| `EquiJoin` / 16 | Paged / 2 | Inner、LeftSemi、LeftAnti、LeftOuter、FullOuter，保留可选 residual |
-| `AsOfJoin` / 17 | Paged / 2 | SQL left outer、单 order、Forward/Backward、strict/inclusive、Reject ties |
+| `RunningEventCount` | Atomic | 逐事件递增 count，忽略输入 diff；私有 `Cell<u64>` |
+| Filter | Atomic | 只保留 non-null true；不声明 state |
+| Select | Atomic | 有序投影与计算；纯列引用共享 arrays 和 diffs |
+| `UnionAll` | Atomic | exact-Schema 输入按端口原样转发 |
+| `SchemaAlign` | Atomic | 显式名字、metadata 和 nullability 对齐 |
+| Distinct | Atomic | exact canonical row positive weights 的零/正边界 |
+| Aggregate | Atomic | grouped COUNT/SUM/AVG/MIN/MAX，unique argument statistics 与 extrema indexes |
+| `EquiJoin` | Paged / 2 | Inner、LeftSemi、LeftAnti、LeftOuter、FullOuter，保留可选 residual |
+| `AsOfJoin` | Paged / 2 | SQL left outer、单 order、Forward/Backward、strict/inclusive、Reject ties |
 
 关系计算共享私有 canonical row 和有序 scalar 编码，不在 Store 建立关系框架。
 参数和状态的精确维护规则见 [关系契约](docs/relations.md)。

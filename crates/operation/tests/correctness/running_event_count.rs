@@ -28,7 +28,6 @@ fn definition_has_stable_v1_literal_exact_schema_and_count_declaration() {
     let decoded = assert_literal_definition(
         &definition,
         RUNNING_EVENT_COUNT_V1,
-        2,
         OperationKind::AtomicTransform(NonZeroU32::MIN),
     );
     assert_eq!(

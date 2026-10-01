@@ -16,8 +16,8 @@ mod index;
 mod runtime;
 pub(crate) mod state;
 
+pub(crate) use definition::AsOfJoinLayout;
 pub use definition::{AsOfEqualityKey, AsOfJoinDefinition, AsOfOrderKey};
-pub(crate) use definition::{AsOfJoinLayout, TAG, decode_definition};
 pub(crate) use runtime::AsOfJoinOperation;
 
 use crate::{OperationSetupError, operation::Operation};

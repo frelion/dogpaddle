@@ -36,24 +36,21 @@ impl TestStore {
 pub fn assert_literal_definition<D: Clone + Into<OperationDefinition>>(
     definition: &D,
     fixture: &str,
-    expected_tag: u16,
     expected_kind: OperationKind,
 ) -> OperationDefinition {
     let definition = definition.clone().into();
     let literal = decode_hex(fixture);
-    assert_eq!(definition.persistence_tag(), expected_tag);
     assert_eq!(definition.kind(), expected_kind);
     assert_eq!(encode_definition(&definition), literal);
 
     let decoded = decode_definition(&literal).unwrap();
-    assert_eq!(decoded.persistence_tag(), expected_tag);
     assert_eq!(decoded.kind(), expected_kind);
     assert_eq!(encode_definition(&decoded), literal);
     for length in 0..literal.len() {
         assert_eq!(
             decode_definition(&literal[..length]).unwrap_err(),
             DefinitionCodecError::Truncated,
-            "wrong error for definition prefix {length}/{} for tag {expected_tag}",
+            "wrong error for definition prefix {length}/{}",
             literal.len()
         );
     }
@@ -315,4 +312,24 @@ fn hex_nibble(digit: u8) -> u8 {
         b'A'..=b'F' => digit - b'A' + 10,
         _ => panic!("invalid hex digit {digit:?}"),
     }
+}
+
+/// Binding rejects raw semantic mistakes before attempting to retrieve owner data.
+pub fn assert_rejected_plan_before_data(
+    definition: &OperationDefinition,
+    inputs: &[SchemaRef],
+    resource: RuntimeResource,
+) {
+    let encoded = encode_definition(definition);
+    let plan = decode_definition(&encoded).unwrap();
+    assert!(plan.output_schema(inputs).is_err());
+    let root = TestStore::new();
+    let transactions = StoreSetup::new().commit(root.path(), |_| Ok(())).unwrap();
+    drop(transactions);
+    let store = Store::open(root.path()).unwrap();
+    let result = plan.construct(inputs, &mut store.data_scope().scoped("absent"), resource);
+    assert!(matches!(
+        result,
+        Err(dogpaddle_operation::OperationSetupError::Schema { .. })
+    ));
 }

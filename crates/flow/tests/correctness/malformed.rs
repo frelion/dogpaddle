@@ -102,15 +102,18 @@ fn open_reports_semantic_errors_after_a_valid_checksum() {
     let mut unknown_operation = original.clone();
     let operation = find_first(&unknown_operation, OPERATION_MAGIC);
     let tag = operation + OPERATION_MAGIC.len() + size_of::<u16>();
-    unknown_operation[tag..tag + 2].copy_from_slice(&99_u16.to_be_bytes());
+    unknown_operation[tag + 2] = b'x';
     rewrite_checksum(&mut unknown_operation);
-    assert_eq!(
+    assert!(matches!(
         definition_error(root.path(), "unknown-operation", &unknown_operation),
         FlowDefinitionError::Operation {
-            operation_id: "scan".to_owned(),
-            source: DefinitionCodecError::UnknownTag(99),
-        }
-    );
+            operation_id,
+            source: DefinitionCodecError::InvalidJsonPayload {
+                reason: "invalid value",
+                ..
+            },
+        } if operation_id == "scan"
+    ));
 
     let mut truncated_operation = original;
     let operation = find_first(&truncated_operation, OPERATION_MAGIC);
@@ -202,16 +205,19 @@ fn open_locates_an_invalid_operation_by_logical_identity() {
         .nth(1)
         .unwrap();
     let tag = second_operation + OPERATION_MAGIC.len() + size_of::<u16>();
-    encoded[tag..tag + size_of::<u16>()].copy_from_slice(&99_u16.to_be_bytes());
+    encoded[tag + 2] = b'x';
     rewrite_checksum(&mut encoded);
 
-    assert_eq!(
+    assert!(matches!(
         definition_error(root.path(), "invalid-second-operation", &encoded),
         FlowDefinitionError::Operation {
-            operation_id: "project".to_owned(),
-            source: DefinitionCodecError::UnknownTag(99),
-        }
-    );
+            operation_id,
+            source: DefinitionCodecError::InvalidJsonPayload {
+                reason: "invalid value",
+                ..
+            },
+        } if operation_id == "project"
+    ));
 }
 
 fn open_error(root: &std::path::Path, name: &str, encoded: &[u8]) -> FlowError {

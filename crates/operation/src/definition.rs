@@ -3,7 +3,7 @@ use std::{any::TypeId, error::Error, num::NonZeroU32};
 use arrow_schema::SchemaRef;
 use dogpaddle_change::{SchemaError, validate_schema};
 use dogpaddle_store::DataScope;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
@@ -70,11 +70,15 @@ impl OperationKind {
 ///
 /// This enum is the complete set of operations accepted by Flow. Each variant
 /// contains only persistent plan data; runtime clients and state handles are
-/// acquired through [`Self::construct`].
-#[derive(Clone, Debug, Serialize)]
-#[serde(untagged)]
+/// acquired through [`Self::construct`]. Deserialization checks plan structure and
+/// canonical, replayable expressions; it does not prove operation-specific
+/// business rules. Both [`Self::output_schema`] and [`Self::construct`] validate
+/// those rules before obtaining owner data handles.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OperationDefinition {
     /// `MySqlCdcScan` operation plan.
+    #[serde(rename = "mysql_cdc_scan")]
     MySqlCdcScan(Box<scan::MySqlCdcScanDefinition>),
     /// `PostgresCdcScan` operation plan.
     PostgresCdcScan(Box<scan::PostgresCdcScanDefinition>),
@@ -83,6 +87,7 @@ pub enum OperationDefinition {
     /// `Aggregate` operation plan.
     Aggregate(Box<transform::AggregateDefinition>),
     /// `AsOfJoin` operation plan.
+    #[serde(rename = "asof_join")]
     AsOfJoin(Box<transform::AsOfJoinDefinition>),
     /// `Distinct` operation plan.
     Distinct(Box<transform::DistinctDefinition>),
@@ -99,6 +104,7 @@ pub enum OperationDefinition {
     /// `SchemaAlign` operation plan.
     SchemaAlign(Box<transform::SchemaAlignDefinition>),
     /// `ClickHouseSink` operation plan.
+    #[serde(rename = "clickhouse_sink")]
     ClickHouseSink(Box<sink::ClickHouseSinkDefinition>),
     /// `Discard` operation plan.
     Discard(Box<sink::DiscardDefinition>),
@@ -282,30 +288,6 @@ impl OperationDefinition {
         }
     }
 
-    /// Returns the stable v1 payload tag for this operation.
-    #[must_use]
-    pub fn persistence_tag(&self) -> u16 {
-        match self {
-            Self::MySqlCdcScan(_) => scan::mysql_cdc::TAG,
-            Self::PostgresCdcScan(_) => scan::postgres_cdc::TAG,
-            Self::SequenceScan(_) => scan::sequence::TAG,
-            Self::Aggregate(_) => transform::aggregate::TAG,
-            Self::AsOfJoin(_) => transform::asof_join::TAG,
-            Self::Distinct(_) => transform::distinct::TAG,
-            Self::RunningEventCount(_) => transform::running_event_count::TAG,
-            Self::Filter(_) => transform::filter::TAG,
-            Self::EquiJoin(_) => transform::equi_join::TAG,
-            Self::Select(_) => transform::select::TAG,
-            Self::UnionAll(_) => transform::union_all::TAG,
-            Self::SchemaAlign(_) => transform::schema_align::TAG,
-            Self::ClickHouseSink(_) => sink::clickhouse::TAG,
-            Self::Discard(_) => sink::discard::TAG,
-            Self::DorisSink(_) => sink::doris::TAG,
-            Self::PostgresSink(_) => sink::postgres::TAG,
-            Self::SqliteSink(_) => sink::sqlite::TAG,
-        }
-    }
-
     fn output_schema_unchecked(
         &self,
         inputs: &[SchemaRef],
@@ -329,21 +311,21 @@ impl OperationDefinition {
             Self::Select(definition) => definition.output_schema_unchecked(inputs),
             Self::UnionAll(_) => transform::UnionAllDefinition::compile_schema(inputs).map(Some),
             Self::SchemaAlign(definition) => definition.output_schema_unchecked(inputs),
-            Self::ClickHouseSink(_) => {
-                sink::ClickHouseSinkDefinition::output_schema_unchecked(inputs)?;
+            Self::ClickHouseSink(definition) => {
+                definition.output_schema_unchecked(inputs)?;
                 Ok(None)
             }
             Self::Discard(_) => Ok(None),
-            Self::DorisSink(_) => {
-                sink::DorisSinkDefinition::output_schema_unchecked(inputs)?;
+            Self::DorisSink(definition) => {
+                definition.output_schema_unchecked(inputs)?;
                 Ok(None)
             }
-            Self::PostgresSink(_) => {
-                sink::PostgresSinkDefinition::output_schema_unchecked(inputs)?;
+            Self::PostgresSink(definition) => {
+                definition.output_schema_unchecked(inputs)?;
                 Ok(None)
             }
-            Self::SqliteSink(_) => {
-                sink::SqliteSinkDefinition::output_schema_unchecked(inputs)?;
+            Self::SqliteSink(definition) => {
+                definition.output_schema_unchecked(inputs)?;
                 Ok(None)
             }
         }
@@ -399,7 +381,7 @@ impl OperationDefinition {
     /// declares no Store data and creates no runtime operation.
     ///
     /// # Errors
-    /// Returns an error for invalid input arity or Schemas, a concrete Schema rejection, or an
+    /// Returns an error for invalid plan data, input arity or Schemas, a concrete Schema rejection, or an
     /// output whose presence or logical Schema violates the declared operation kind.
     pub fn output_schema(
         &self,
@@ -420,7 +402,7 @@ impl OperationDefinition {
     /// Construction performs no transactions, state reads, or external I/O.
     ///
     /// # Errors
-    /// Returns an error for invalid arity/Schemas, resources, typed data, or execution capability.
+    /// Returns an error for invalid plan data, arity/Schemas, resources, typed data, or execution capability.
     pub fn construct(
         &self,
         inputs: &[SchemaRef],

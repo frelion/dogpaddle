@@ -9,8 +9,6 @@ use dogpaddle_store::{OrderedMap, OrderedMapAccess, StoreError, TransactionAcces
 use thiserror::Error;
 
 use crate::{
-    DefinitionCodecError,
-    codec::decode_json_payload,
     definition::ConstructedOperation,
     operation::{
         AtomicOperation, BudgetExceeded, OperationError, OperationInput, StepBudget,
@@ -19,7 +17,6 @@ use crate::{
     },
 };
 
-pub(crate) const TAG: u16 = 13;
 const WEIGHTS: &str = "distinct.weights";
 
 /// Pure definition of an exact, order-preserving distinct operation.
@@ -237,11 +234,4 @@ fn map_weight_error(error: StoreError) -> DistinctError {
         StoreError::MultiplicityOverflow => DistinctError::WeightOverflow,
         source => DistinctError::Store(source),
     }
-}
-
-pub(crate) fn decode_definition(
-    payload: &[u8],
-) -> Result<Box<DistinctDefinition>, DefinitionCodecError> {
-    let definition: DistinctDefinition = decode_json_payload(payload, "invalid Distinct payload")?;
-    Ok(Box::new(definition))
 }

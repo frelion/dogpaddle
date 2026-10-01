@@ -2,21 +2,19 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion_common::ScalarValue;
-use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
+use serde::{Deserialize, Serialize};
 
 use super::{
     AsOfDirection, AsOfJoinDefinitionError, AsOfJoinSchemaError,
     runtime::{BoundPair, BoundScalar},
 };
 use crate::{
-    DefinitionCodecError, Expr, OperationSchemaError,
-    codec::{parse_json_payload, require_canonical_json_payload},
+    Expr, OperationSchemaError,
     definition::{ConstructedOperation, schema_error},
     expression::StoredExpression,
     operation::relation::indexable,
 };
 
-pub(crate) const TAG: u16 = 17;
 pub(super) const LEFT_ROWS: &str = "asof_join.left_rows";
 pub(super) const RIGHT_ROWS: &str = "asof_join.right_rows";
 
@@ -88,43 +86,13 @@ struct StoredPair {
 ///
 /// Equality uses SQL NULL semantics. Repeated copies of one exact right row
 /// remain one candidate; distinct rows at the selected time are rejected.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AsOfJoinDefinition {
     direction: AsOfDirection,
     equalities: Box<[StoredPair]>,
     order: StoredPair,
     output_names: Box<[String]>,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Payload {
-    direction: AsOfDirection,
-    equalities: Box<[StoredPair]>,
-    order: StoredPair,
-    output_names: Box<[String]>,
-}
-impl Payload {
-    fn into_definition(self) -> Result<AsOfJoinDefinition, &'static str> {
-        if self.equalities.len() > 1024
-            || self.output_names.len() > 4096
-            || self.output_names.iter().any(|name| name.len() > 65536)
-        {
-            return Err("ASOF definition exceeds control limits");
-        }
-        Ok(AsOfJoinDefinition {
-            direction: self.direction,
-            equalities: self.equalities,
-            order: self.order,
-            output_names: self.output_names,
-        })
-    }
-}
-impl<'de> Deserialize<'de> for AsOfJoinDefinition {
-    fn deserialize<D: Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
-        Payload::deserialize(decoder)?
-            .into_definition()
-            .map_err(D::Error::custom)
-    }
 }
 impl AsOfJoinDefinition {
     /// Reports whether this type has a stable ordered index encoding.
@@ -153,17 +121,28 @@ impl AsOfJoinDefinition {
             .collect::<Result<Vec<_>, _>>()?;
         let order = store_pair(order.left, order.right, "order", 0)?;
         let output_names = output_names.into_iter().map(Into::into).collect::<Vec<_>>();
-        Payload {
+        let definition = Self {
             direction,
             equalities: equalities.into_boxed_slice(),
             order,
             output_names: output_names.into_boxed_slice(),
-        }
-        .into_definition()
-        .map_err(|_| AsOfJoinDefinitionError::TooMany {
-            kind: "definition fields",
-        })
+        };
+        definition.validate()?;
+        Ok(definition)
     }
+
+    fn validate(&self) -> Result<(), AsOfJoinDefinitionError> {
+        if self.equalities.len() > 1024
+            || self.output_names.len() > 4096
+            || self.output_names.iter().any(|name| name.len() > 65536)
+        {
+            return Err(AsOfJoinDefinitionError::TooMany {
+                kind: "definition fields",
+            });
+        }
+        Ok(())
+    }
+
     /// Returns the ordered search direction and exactness.
     #[must_use]
     pub const fn direction(&self) -> AsOfDirection {
@@ -209,6 +188,7 @@ impl AsOfJoinDefinition {
         left: &SchemaRef,
         right: &SchemaRef,
     ) -> Result<AsOfJoinLayout, OperationSchemaError> {
+        self.validate()?;
         let expected = left.fields().len() + right.fields().len();
         if expected != self.output_names.len() {
             return Err(Box::new(AsOfJoinSchemaError::OutputNameCount {
@@ -246,10 +226,12 @@ impl AsOfJoinDefinition {
                     .with_nullable(true),
             ));
         }
+        let output_schema = Arc::new(Schema::new(fields));
+        dogpaddle_change::validate_schema(&output_schema)?;
         Ok(AsOfJoinLayout {
             direction: self.direction,
             input_schemas: [Arc::clone(left), Arc::clone(right)],
-            output_schema: Arc::new(Schema::new(fields)),
+            output_schema,
             equalities: equalities.into_boxed_slice(),
             order,
             right_nulls,
@@ -319,13 +301,4 @@ fn bind_pair(
         }));
     }
     Ok(BoundPair { left, right })
-}
-pub(crate) fn decode_definition(
-    payload: &[u8],
-) -> Result<Box<AsOfJoinDefinition>, DefinitionCodecError> {
-    let definition = parse_json_payload::<Payload>(payload)?
-        .into_definition()
-        .map_err(DefinitionCodecError::InvalidPayload)?;
-    require_canonical_json_payload(&definition, payload, "invalid ASOF join payload")?;
-    Ok(Box::new(definition))
 }

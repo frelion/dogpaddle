@@ -13,85 +13,29 @@ use datafusion_functions_aggregate::{
 };
 use dogpaddle_operation::operation::transform::AggregateCall;
 
-struct Builtin {
-    name: &'static str,
-    udf: fn() -> Arc<AggregateUDF>,
-    lower: fn(Vec<Expr>) -> Option<AggregateCall>,
-}
-
-const BUILTINS: &[Builtin] = &[
-    Builtin {
-        name: "count",
-        udf: count_udaf,
-        lower: lower_count,
-    },
-    Builtin {
-        name: "sum",
-        udf: sum_udaf,
-        lower: lower_sum,
-    },
-    Builtin {
-        name: "avg",
-        udf: avg_udaf,
-        lower: lower_avg,
-    },
-    Builtin {
-        name: "min",
-        udf: min_udaf,
-        lower: lower_min,
-    },
-    Builtin {
-        name: "max",
-        udf: max_udaf,
-        lower: lower_max,
-    },
-];
-
 pub(crate) fn planning_builtins() -> HashMap<&'static str, Arc<AggregateUDF>> {
-    BUILTINS
-        .iter()
-        .map(|builtin| (builtin.name, (builtin.udf)()))
-        .collect()
+    HashMap::from([
+        ("count", count_udaf()),
+        ("sum", sum_udaf()),
+        ("avg", avg_udaf()),
+        ("min", min_udaf()),
+        ("max", max_udaf()),
+    ])
 }
 
 pub(crate) fn lower(name: &str, arguments: Vec<Expr>) -> Option<AggregateCall> {
-    let builtin = BUILTINS.iter().find(|builtin| builtin.name == name)?;
-    (builtin.lower)(arguments)
-}
-
-fn lower_count(arguments: Vec<Expr>) -> Option<AggregateCall> {
     let [argument] = arguments.try_into().ok()?;
-    Some(
-        if matches!(&argument, Expr::Literal(value, _) if value == &COUNT_STAR_EXPANSION) {
-            AggregateCall::count_all()
-        } else {
-            AggregateCall::count(argument)
-        },
-    )
-}
-
-fn lower_sum(arguments: Vec<Expr>) -> Option<AggregateCall> {
-    lower_unary(arguments, AggregateCall::sum)
-}
-
-fn lower_avg(arguments: Vec<Expr>) -> Option<AggregateCall> {
-    lower_unary(arguments, AggregateCall::avg)
-}
-
-fn lower_min(arguments: Vec<Expr>) -> Option<AggregateCall> {
-    lower_unary(arguments, AggregateCall::min)
-}
-
-fn lower_max(arguments: Vec<Expr>) -> Option<AggregateCall> {
-    lower_unary(arguments, AggregateCall::max)
-}
-
-fn lower_unary(
-    arguments: Vec<Expr>,
-    constructor: fn(Expr) -> AggregateCall,
-) -> Option<AggregateCall> {
-    let [argument] = arguments.try_into().ok()?;
-    Some(constructor(argument))
+    Some(match name {
+        "count" if matches!(&argument, Expr::Literal(value, _) if value == &COUNT_STAR_EXPANSION) => {
+            AggregateCall::CountAll
+        }
+        "count" => AggregateCall::Count(argument),
+        "sum" => AggregateCall::Sum(argument),
+        "avg" => AggregateCall::Avg(argument),
+        "min" => AggregateCall::Min(argument),
+        "max" => AggregateCall::Max(argument),
+        _ => return None,
+    })
 }
 
 fn avg_udaf() -> Arc<AggregateUDF> {

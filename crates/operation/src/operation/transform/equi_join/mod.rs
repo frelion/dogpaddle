@@ -14,7 +14,7 @@ mod runtime;
 pub(crate) mod state;
 
 pub use definition::EquiJoinDefinition;
-pub(crate) use definition::{EquiJoinLayout, TAG, decode_definition};
+pub(crate) use definition::EquiJoinLayout;
 pub(crate) use runtime::EquiJoinOperation;
 
 use crate::{OperationSetupError, operation::Operation};

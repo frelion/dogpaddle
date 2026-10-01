@@ -22,7 +22,6 @@ fn definition_has_stable_v1_literal_and_is_a_data_free_exact_sink() {
     let decoded = assert_literal_definition(
         &definition,
         DISCARD_V1,
-        3,
         OperationKind::Sink(NonZeroU32::MIN),
     );
     assert!(

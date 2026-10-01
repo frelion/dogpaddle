@@ -59,14 +59,19 @@ fn definition() -> AggregateDefinition {
 }
 
 #[test]
-fn public_json_deserialization_cannot_bypass_aggregate_validation() {
+fn aggregate_plan_structure_and_binding_validate_separate_invariants() {
     let mut unknown_function = serde_json::to_value(definition()).unwrap();
-    unknown_function["calls"][0]["function"] = serde_json::json!(u16::MAX);
-    assert!(serde_json::from_value::<AggregateDefinition>(unknown_function).is_err());
+    unknown_function["calls"][0]["call"] = serde_json::json!({"unknown":null});
+    assert!(serde_json::from_str::<AggregateDefinition>(&unknown_function.to_string()).is_err());
 
     let mut empty_groups = serde_json::to_value(definition()).unwrap();
     empty_groups["groups"] = serde_json::json!([]);
-    assert!(serde_json::from_value::<AggregateDefinition>(empty_groups).is_err());
+    let plan = serde_json::from_str::<AggregateDefinition>(&empty_groups.to_string()).unwrap();
+    assert!(
+        OperationDefinition::from(plan)
+            .output_schema(&[input_schema()])
+            .is_err()
+    );
 }
 
 fn change(departments: &[&str], values: &[Option<i64>], diffs: &[i64]) -> Change {
@@ -281,16 +286,11 @@ fn definition_binds_schema_and_typed_setup_requires_the_stable_three_resource_la
     let decoded = assert_literal_definition(
         &definition,
         AGGREGATE_V1,
-        14,
         OperationKind::AtomicTransform(NonZeroU32::MIN),
     );
     assert_eq!(
         OperationDefinition::from(definition.clone()).kind(),
         OperationKind::AtomicTransform(NonZeroU32::MIN)
-    );
-    assert_eq!(
-        OperationDefinition::from(definition.clone()).persistence_tag(),
-        14
     );
     let input = input_schema();
     let binding = construct_checked(&definition, std::slice::from_ref(&input)).unwrap();
@@ -1771,5 +1771,44 @@ fn aggregate_budget_failure_rolls_back_pending_state_and_does_not_consume_tail_i
     assert_eq!(
         output_rows(&output),
         [a((1, 1, Some(10), Some(10.0), Some(10), Some(10), 1))]
+    );
+}
+
+#[test]
+fn raw_plan_business_validation_precedes_store_handle_access() {
+    let mut payload = serde_json::to_value(definition()).unwrap();
+    payload["groups"] = serde_json::json!([]);
+    let plan: OperationDefinition =
+        serde_json::from_str(&serde_json::json!({"aggregate": payload}).to_string()).unwrap();
+    crate::support::assert_rejected_plan_before_data(
+        &plan,
+        &[input_schema()],
+        RuntimeResource::none(),
+    );
+}
+
+#[test]
+fn aggregate_call_shape_rejects_unknown_functions_and_wrong_arity() {
+    for call in [
+        serde_json::json!({"unknown": null}),
+        serde_json::json!({"sum": []}),
+        serde_json::json!({"count_all": ["argument"]}),
+    ] {
+        let mut payload = serde_json::to_value(definition()).unwrap();
+        payload["calls"][0]["call"] = call;
+        assert!(serde_json::from_str::<AggregateDefinition>(&payload.to_string()).is_err());
+    }
+}
+
+#[test]
+fn raw_duplicate_output_names_are_rejected_before_store_handle_access() {
+    let mut payload = serde_json::to_value(definition()).unwrap();
+    payload["calls"][0]["name"] = payload["groups"][0]["name"].clone();
+    let plan: OperationDefinition =
+        serde_json::from_str(&serde_json::json!({"aggregate": payload}).to_string()).unwrap();
+    crate::support::assert_rejected_plan_before_data(
+        &plan,
+        &[input_schema()],
+        RuntimeResource::none(),
     );
 }
