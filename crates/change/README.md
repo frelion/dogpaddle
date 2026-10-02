@@ -190,6 +190,12 @@ Schema。
 继续共享传入的 `Vec<u8>` 分配，[`SchemaBoundChangeCodec::encode_bounded`] 同时限制未压缩 body 与完整
 entry。
 
+`RecordBatch` layout 预验按绑定 Schema 顺序直接消费已验证的 `FlatBuffer` field nodes 和 buffer 描述，
+不另存节点或 buffer range 的 Vec。节点检查行数与 null 约束；buffer 检查非负长度、连续的 canonical
+offset、八字节对齐与字段所需的精确宽度，结束时拒绝未消费描述和未覆盖 body。layout 拒绝仍早于借用解码的 body
+复制；offset 内容、值与 diff 继续由 checked Arrow reader 和 Change 验证。多项损坏时不承诺首个
+诊断文案或顺序。减少 metadata scratch 不构成进程 RSS 硬界，持久 entry 字节与布局保持不变。
+
 绑定格式也是开发期 v1 持久边界。marker、fingerprint 输入、writer options、物理布局或 framing 变化
 必须同步更新 bound golden/layout/reopen 证据并重建受影响资源，不增加旧格式兼容分支。
 

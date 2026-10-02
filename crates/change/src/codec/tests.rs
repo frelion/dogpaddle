@@ -15,6 +15,7 @@ fn malformed_batches_do_not_invoke_the_panic_hook() {
         let previous_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| exit(86)));
         batch_layout::borrowed_and_owned_decoders_validate_all_batch_metadata();
+        batch_layout::conflicting_metadata_errors_keep_long_field_names_out_of_diagnostics();
         batch_layout::non_nullable_null_still_requires_an_all_null_field_node();
         batch_layout::temporal_and_decimal_buffer_widths_are_validated();
         batch_layout::batch_layout_rejects_missing_extra_negative_and_noncanonical_descriptors();

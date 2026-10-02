@@ -4,7 +4,7 @@ use arrow_array::{Int64Array, NullArray, RecordBatch};
 use arrow_ipc::{Buffer as IpcBuffer, FieldNode};
 use arrow_schema::{DataType, Field, Schema};
 
-use super::super::SchemaBoundChangeCodec;
+use super::super::{CodecError, SchemaBoundChangeCodec};
 use super::support::*;
 use crate::Change;
 
@@ -36,13 +36,76 @@ pub(super) fn borrowed_and_owned_decoders_validate_all_batch_metadata() {
         0
     });
 
+    let invalid_payload_offset = corrupt_layout(&encoded, &codec, |parsed, layout, _, buffers| {
+        let index = field_layout(parsed, layout, "label").buffers.start + 2;
+        buffers[index] = IpcBuffer::new(-1, buffers[index].length());
+        0
+    });
+    let invalid_payload_length = corrupt_layout(&encoded, &codec, |parsed, layout, _, buffers| {
+        let index = field_layout(parsed, layout, "label").buffers.start + 2;
+        buffers[index] = IpcBuffer::new(buffers[index].offset(), -1);
+        0
+    });
+    let payload_out_of_body = corrupt_layout(&encoded, &codec, |parsed, layout, _, buffers| {
+        let index = field_layout(parsed, layout, "label").buffers.start + 2;
+        buffers[index] = IpcBuffer::new(
+            buffers[index].offset(),
+            i64::try_from(parsed.body.len()).unwrap() + 8,
+        );
+        0
+    });
+
     for malformed in [
         short_fixed_width,
         invalid_struct,
         invalid_non_nullable,
         out_of_body,
+        invalid_payload_offset,
+        invalid_payload_length,
+        payload_out_of_body,
     ] {
         assert_both_invalid_encoding(&malformed, &codec);
+    }
+}
+
+#[test]
+pub(super) fn conflicting_metadata_errors_keep_long_field_names_out_of_diagnostics() {
+    let name = "x".repeat(64 * 1024);
+    let schema = Arc::new(Schema::new(vec![Field::new(&name, DataType::Null, true)]));
+    let records = RecordBatch::try_new(schema, vec![Arc::new(NullArray::new(1))]).unwrap();
+    let change = Change::try_new(records, Int64Array::from(vec![1])).unwrap();
+    let codec = SchemaBoundChangeCodec::try_new(change.schema()).unwrap();
+    let encoded = codec.encode(&change).unwrap();
+    let (parsed, layout) = parsed_layout(&encoded, &codec);
+    let field_node = field_layout(&parsed, &layout, &name).nodes.start;
+    let mut nodes = layout.nodes;
+    nodes[field_node] = FieldNode::new(-1, 0);
+    nodes.push(FieldNode::new(0, 0));
+    let buffers = parsed
+        .batch
+        .buffers()
+        .unwrap()
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    let malformed = replace_batch_layout(
+        &encoded,
+        parsed.batch.length(),
+        &nodes,
+        &buffers,
+        parsed.body,
+    );
+
+    for result in [
+        codec.decode(&malformed),
+        codec.decode_owned(malformed.clone()),
+    ] {
+        let Err(CodecError::InvalidEncoding { message }) = result else {
+            panic!("conflicting malformed metadata must be rejected");
+        };
+        assert!(message.len() <= 256, "layout diagnostics must stay short");
+        assert!(!message.contains(&name));
+        assert_ne!(message, "Arrow IPC decoding panicked");
     }
 }
 
@@ -132,9 +195,22 @@ pub(super) fn batch_layout_rejects_missing_extra_negative_and_noncanonical_descr
     let mut overlap = buffers.clone();
     overlap[1] = IpcBuffer::new(0, overlap[1].length());
 
+    let mut trailing_body = body.clone();
+    trailing_body.extend_from_slice(&[0; 8]);
+    let metadata = ipc_batch_metadata(
+        row_count,
+        Some(&nodes),
+        Some(&buffers),
+        i64::try_from(trailing_body.len()).unwrap(),
+        false,
+    );
+    let uncovered_body = replace_batch_message(&encoded, &metadata, &trailing_body);
+
     let malformed = [
         replace(None, Some(&buffers)),
         replace(Some(&nodes), None),
+        replace(Some(&nodes[..nodes.len() - 1]), Some(&buffers)),
+        replace(Some(&nodes), Some(&buffers[..buffers.len() - 1])),
         replace(Some(&extra_nodes), Some(&buffers)),
         replace(Some(&nodes), Some(&extra_buffers)),
         replace(Some(&negative_length_node), Some(&buffers)),
@@ -144,6 +220,7 @@ pub(super) fn batch_layout_rejects_missing_extra_negative_and_noncanonical_descr
         replace(Some(&nodes), Some(&negative_buffer_length)),
         replace(Some(&nodes), Some(&gap)),
         replace(Some(&nodes), Some(&overlap)),
+        uncovered_body,
     ];
     for encoded in malformed {
         assert_both_invalid_encoding(&encoded, &codec);

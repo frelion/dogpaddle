@@ -45,15 +45,6 @@ impl<'a> DataTypeLayout<'a> {
             _ => None,
         }
     }
-
-    pub(crate) const fn own_buffer_count(self) -> usize {
-        match self {
-            Self::Null => 0,
-            Self::Struct(_) => 1,
-            Self::Bitmap | Self::FixedWidth(_) | Self::List(_) => 2,
-            Self::VariableWidth => 3,
-        }
-    }
 }
 
 /// Validates a logical `DogPaddle` record schema.
