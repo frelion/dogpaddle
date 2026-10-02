@@ -18,8 +18,6 @@ const MAX_ENTRIES: u32 = 1_000_000;
 #[derive(Clone, PartialEq, Eq)]
 pub struct Checkpoint {
     bytes: Box<[u8]>,
-    engine_name: Box<str>,
-    connector_class: Box<str>,
 }
 
 impl Checkpoint {
@@ -32,11 +30,9 @@ impl Checkpoint {
     /// offset entry.
     pub fn from_bytes(bytes: impl Into<Vec<u8>>) -> Result<Self, Error> {
         let bytes = bytes.into();
-        let (engine_name, connector_class) = validate(&bytes)?;
+        validate(&bytes)?;
         Ok(Self {
             bytes: bytes.into_boxed_slice(),
-            engine_name: engine_name.into_boxed_str(),
-            connector_class: connector_class.into_boxed_str(),
         })
     }
 
@@ -53,22 +49,35 @@ impl Checkpoint {
     /// it does not expose or interpret connector-specific source offsets.
     #[must_use]
     pub fn matches(&self, engine_name: &str, connector_class: &str) -> bool {
-        self.engine_name.as_ref() == engine_name && self.connector_class.as_ref() == connector_class
+        let mut input = Input::new(&self.bytes[MAGIC.len() + size_of::<u16>()..]);
+        input
+            .bytes_u32(MAX_BINDING_BYTES, "engine name")
+            .is_ok_and(|stored| stored == engine_name.as_bytes())
+            && input
+                .bytes_u32(MAX_BINDING_BYTES, "connector class")
+                .is_ok_and(|stored| stored == connector_class.as_bytes())
     }
 }
 
 impl fmt::Debug for Checkpoint {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut input = Input::new(&self.bytes[MAGIC.len() + size_of::<u16>()..]);
+        let engine_name = input
+            .utf8_u32("engine name", MAX_BINDING_BYTES)
+            .expect("validated checkpoint binding");
+        let connector_class = input
+            .utf8_u32("connector class", MAX_BINDING_BYTES)
+            .expect("validated checkpoint binding");
         formatter
             .debug_struct("Checkpoint")
             .field("bytes", &self.bytes.len())
-            .field("engine_name", &self.engine_name)
-            .field("connector_class", &self.connector_class)
+            .field("engine_name", &engine_name)
+            .field("connector_class", &connector_class)
             .finish()
     }
 }
 
-fn validate(bytes: &[u8]) -> Result<(String, String), Error> {
+fn validate(bytes: &[u8]) -> Result<(), Error> {
     if bytes.len() > MAX_CHECKPOINT_BYTES {
         return Err(invalid("checkpoint exceeds the 64 MiB protocol limit"));
     }
@@ -130,7 +139,7 @@ fn validate(bytes: &[u8]) -> Result<(String, String), Error> {
     if !input.is_empty() {
         return Err(invalid("checkpoint has trailing bytes"));
     }
-    Ok((engine_name, connector_class))
+    Ok(())
 }
 
 pub(crate) struct Input<'a> {
@@ -191,9 +200,9 @@ impl<'a> Input<'a> {
         self.take(length)
     }
 
-    fn utf8_u32(&mut self, label: &str, maximum: usize) -> Result<String, Error> {
+    fn utf8_u32(&mut self, label: &str, maximum: usize) -> Result<&'a str, Error> {
         let bytes = self.bytes_u32(maximum, label)?;
-        String::from_utf8(bytes.to_vec())
+        std::str::from_utf8(bytes)
             .map_err(|_| invalid(format!("checkpoint {label} is not valid UTF-8")))
     }
 

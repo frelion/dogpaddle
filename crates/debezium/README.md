@@ -120,7 +120,9 @@ Java 预演结果只保留原始 delta 和不可变的候选 checkpoint。checkp
 不另建完整 body 数组，也不为追加校验和扩大内部缓冲区。内部缓冲区、最终 frame、原始 offset map 和
 `RawBytes` 的防御性复制仍存在；这不构成 JVM 堆峰值或 RSS 上限保证。Checkpoint v1 字节格式不变。
 
-Checkpoint 绑定稳定的 engine name 和 connector class，可能包含多个 source partition。它不是 delivery ID，
+Checkpoint 绑定稳定的 engine name 和 connector class，可能包含多个 source partition。
+Rust `Checkpoint` 只拥有已完整校验的原始字节，不复制名字或缓存其位置。身份比较用现有读取器借用两个绑定字段；
+`Debug` 按需读取并校验 UTF-8，clone 只复制整份 checkpoint bytes。构造时仍先验证完整 framing、CRC、绑定和全部 offset entries。它不是 delivery ID，
 也不是某一种数据库位置。这个绑定不检查其余 connector properties 是否兼容；具体 source identity、固定 Schema
 和 schema-history 责任仍由上层 Operation 保证。恢复时只读取显式传入的 checkpoint，不使用 Java offset 文件。
 

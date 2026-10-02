@@ -93,6 +93,103 @@ fn checkpoint_validation_is_complete_and_debug_is_opaque() {
 }
 
 #[test]
+fn checkpoint_binding_and_debug_survive_cloning_and_original_drop() {
+    for (engine, class) in [
+        ("orders", "example.Connector"),
+        (" ordérs\0 ", "例.Connector "),
+        ("\0", "\0"),
+    ] {
+        let bytes = checkpoint_bytes(engine, class, &[(b"a", Some(b"private-offset"))]);
+        let original = Checkpoint::from_bytes(bytes.clone()).unwrap();
+        let cloned = original.clone();
+        assert_eq!(cloned, original);
+        drop(original);
+
+        assert_eq!(cloned.as_bytes(), bytes);
+        assert!(cloned.matches(engine, class));
+        assert!(!cloned.matches("different-engine", class));
+        assert!(!cloned.matches(engine, "different-class"));
+        assert_eq!(
+            format!("{cloned:?}"),
+            format!(
+                "Checkpoint {{ bytes: {}, engine_name: {engine:?}, connector_class: {class:?} }}",
+                bytes.len()
+            )
+        );
+        let changed =
+            Checkpoint::from_bytes(checkpoint_bytes(engine, class, &[(b"a", Some(b"next"))]))
+                .unwrap();
+        assert_ne!(cloned, changed);
+    }
+}
+
+#[test]
+fn checkpoint_binding_bounds_utf8_and_error_order_remain_strict() {
+    let maximum = "x".repeat(1024 * 1024);
+    let bytes = checkpoint_bytes(&maximum, &maximum, &[]);
+    let checkpoint = Checkpoint::from_bytes(bytes.clone()).unwrap();
+    assert!(checkpoint.matches(&maximum, &maximum));
+    let cloned = checkpoint.clone();
+    drop(checkpoint);
+    assert_eq!(cloned.as_bytes(), bytes);
+    assert!(cloned.matches(&maximum, &maximum));
+
+    let excessive = format!("{maximum}x");
+    for (engine, class, message) in [
+        (
+            excessive.as_str(),
+            "c",
+            "checkpoint engine name exceeds the protocol limit",
+        ),
+        (
+            "e",
+            excessive.as_str(),
+            "checkpoint connector class exceeds the protocol limit",
+        ),
+    ] {
+        let error = Checkpoint::from_bytes(checkpoint_bytes(engine, class, &[])).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidCheckpoint);
+        assert_eq!(error.to_string(), message);
+    }
+
+    let engine = "engine";
+    let class = "connector";
+    let engine_start = 8 + 2 + 4;
+    let class_start = engine_start + engine.len() + 4;
+    for (index, name) in [
+        (engine_start, "engine name"),
+        (engine_start + engine.len() - 1, "engine name"),
+        (class_start, "connector class"),
+        (class_start + class.len() - 1, "connector class"),
+    ] {
+        let mut bytes = checkpoint_bytes(engine, class, &[]);
+        bytes[index] = 0xff;
+        let body = bytes.len() - 4;
+        let checksum = crc32fast::hash(&bytes[..body]).to_be_bytes();
+        bytes[body..].copy_from_slice(&checksum);
+        let error = Checkpoint::from_bytes(bytes).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidCheckpoint);
+        assert_eq!(
+            error.to_string(),
+            format!("checkpoint {name} is not valid UTF-8")
+        );
+    }
+
+    // Both bindings are decoded before the joint blank-binding check.
+    let mut bytes = checkpoint_bytes(" ", "c", &[]);
+    bytes[8 + 2 + 4 + 1 + 4] = 0xff;
+    let body = bytes.len() - 4;
+    let checksum = crc32fast::hash(&bytes[..body]).to_be_bytes();
+    bytes[body..].copy_from_slice(&checksum);
+    let error = Checkpoint::from_bytes(bytes).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidCheckpoint);
+    assert_eq!(
+        error.to_string(),
+        "checkpoint connector class is not valid UTF-8"
+    );
+}
+
+#[test]
 fn checkpoint_wire_matches_the_java_bridge_golden() {
     let bytes = checkpoint_bytes(
         "engine-a",
