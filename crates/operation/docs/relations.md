@@ -16,6 +16,8 @@ canonical Arrow row 编码和 diff 语义留在 operation crate 私有 `relation
 
 ## Aggregate
 
+分组输出保留绑定 Field 的完整嵌套 name、nullable 与 metadata；非 NULL List 的单行临时值只保存两个本行 offset，并借用对应 child slice，不保留整列父 offsets 计费。NULL List 仍正规化为空 child 的同类型 NULL 值。
+
 `Aggregate` 是单输入的 grouped relational Atomic Transform；至少一个 group expression，aggregate call 可以为空。Definition 保存有序命名 group expression 和有序 `AggregateCall`，输出固定为 group fields 后接 call fields。`AggregateCall<E = Expr>` 只有 `CountAll`、`Count(E)`、`Sum(E)`、`Avg(E)`、`Min(E)`、`Max(E)` 六个变体；持久参数使用同一 ADT 的 `StoredExpression`，未知函数和错误参数个数无法表示，不维护数字函数目录或 Descriptor。
 
 它只声明 `aggregate.groups: OrderedMap<Vec<u8>, GroupState>`、`aggregate.entries: OrderedMap<PartitionKey<EntryPartition, Vec<u8>>, NonZeroU64>` 和 `aggregate.control: Cell<u64>`。groups 以完整 canonical group 为 key，保存稳定 group ID、正 group weight、每个不同参数的充分统计和每个极值 slot 的缓存；entries 的 partition 是 `layout + group ID`，只维护排序参数的 key 和正份数；control 分配不复用的 group ID，不保存完整输入行。

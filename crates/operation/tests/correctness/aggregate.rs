@@ -1950,3 +1950,338 @@ fn raw_duplicate_output_names_are_rejected_before_store_handle_access() {
         RuntimeResource::none(),
     );
 }
+
+fn list_group_metadata_records(nested: u8, child_nullable: bool, state: u8) -> RecordBatch {
+    use arrow_array::{ArrayRef, ListArray, StructArray};
+    use arrow_buffer::{NullBuffer, OffsetBuffer};
+
+    let tag = |name: &str, data_type, nullable| {
+        Field::new(name, data_type, nullable).with_metadata(HashMap::from([(
+            "arbitrary-key".to_owned(),
+            format!("metadata for {name}"),
+        )]))
+    };
+    // Every selected parent is a nonzero-offset slice of a three-row array.
+    let primitive = Arc::new(Int64Array::from(vec![99, 7, 8, 66])) as ArrayRef;
+    let values: ArrayRef = match nested {
+        0 => primitive,
+        1 => Arc::new(ListArray::new(
+            Arc::new(tag("deep-item", DataType::Int64, false)),
+            OffsetBuffer::from_lengths([1, 1, 1, 1]),
+            primitive,
+            None,
+        )),
+        2 => Arc::new(StructArray::new(
+            vec![tag("deep-field", DataType::Int64, false)].into(),
+            vec![primitive],
+            None,
+        )),
+        _ => unreachable!(),
+    };
+    let field = Arc::new(tag(
+        "custom-item",
+        values.data_type().clone(),
+        child_nullable,
+    ));
+    let lengths = if state == 1 { [1, 0, 3] } else { [1, 2, 1] };
+    let full = ListArray::new(
+        Arc::clone(&field),
+        OffsetBuffer::from_lengths(lengths),
+        values,
+        (state == 2).then(|| NullBuffer::from(vec![true, false, true])),
+    );
+    let selected = full.slice(1, 1);
+    assert_eq!(selected.value_offsets()[0], 1);
+    let schema = Arc::new(Schema::new_with_metadata(
+        vec![tag("g", DataType::List(field), true)],
+        HashMap::from([("schema-key".to_owned(), "schema-value".to_owned())]),
+    ));
+    RecordBatch::try_new(schema, vec![Arc::new(selected)]).unwrap()
+}
+
+fn assert_list_group_metadata_output(
+    output: Option<Change>,
+    expected: &[(i64, i64)],
+    expected_schema: &SchemaRef,
+    nested: u8,
+    state: u8,
+) {
+    use arrow_array::{ListArray, StructArray};
+
+    let output = output.expect("count transition emits rows");
+    assert_eq!(output.records().schema_ref(), expected_schema);
+    assert_eq!(output.num_rows(), expected.len());
+    let group = output
+        .records()
+        .column(0)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    let count = output
+        .records()
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    for (row, &(value, difference)) in expected.iter().enumerate() {
+        assert_eq!(count.value(row), value);
+        assert_eq!(output.diffs().value(row), difference);
+        assert_eq!(group.is_null(row), state == 2);
+        if state == 2 {
+            assert_eq!(group.value(row).len(), 0);
+            continue;
+        }
+        let child = group.value(row);
+        assert_eq!(child.len(), if state == 1 { 0 } else { 2 });
+        if state == 1 {
+            continue;
+        }
+        let values = match nested {
+            0 => child,
+            1 => {
+                let list = child.as_any().downcast_ref::<ListArray>().unwrap();
+                for (index, expected) in [7, 8].into_iter().enumerate() {
+                    let item = list.value(index);
+                    let item = item.as_any().downcast_ref::<Int64Array>().unwrap();
+                    assert_eq!(item.values().as_ref(), &[expected]);
+                }
+                continue;
+            }
+            2 => Arc::clone(
+                child
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .unwrap()
+                    .column(0),
+            ),
+            _ => unreachable!(),
+        };
+        let values = values.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(values.values().as_ref(), &[7, 8]);
+    }
+}
+
+#[test]
+fn list_group_fields_survive_weighted_output_rollback_and_reopen() {
+    for nested in 0..3 {
+        for child_nullable in [false, true] {
+            for state in 0..3 {
+                // nonempty, empty, NULL with hidden child values
+                let records = list_group_metadata_records(nested, child_nullable, state);
+                let schema = records.schema();
+                let input = |difference| {
+                    Change::try_new(records.clone(), Int64Array::from(vec![difference])).unwrap()
+                };
+                let expected_schema = Arc::new(Schema::new_with_metadata(
+                    vec![
+                        schema.field(0).clone(),
+                        Field::new("count", DataType::Int64, false),
+                    ],
+                    schema.metadata().clone(),
+                ));
+                let check = |output: Option<Change>, expected: &[(i64, i64)]| {
+                    assert_list_group_metadata_output(
+                        output,
+                        expected,
+                        &expected_schema,
+                        nested,
+                        state,
+                    );
+                };
+                let definition = AggregateDefinition::try_new(
+                    [("g", col("g"))],
+                    [("count", AggregateCall::CountAll)],
+                )
+                .unwrap();
+                let root = TestStore::new();
+                let (operation, mut transactions) =
+                    construct_aggregate_for_schema(&root, &definition, Arc::clone(&schema));
+                check(
+                    run_input(&operation, step_input(&input(2)), &mut transactions).unwrap(),
+                    &[(2, 1)],
+                );
+                check(
+                    rollback_input(&operation, step_input(&input(1)), &mut transactions).unwrap(),
+                    &[(2, -1), (3, 1)],
+                );
+                drop((operation, transactions));
+                let store = Store::open(root.path()).unwrap();
+                let operation =
+                    reopen_aggregate_for_schema(&store, &definition, Arc::clone(&schema));
+                let mut transactions = store.into_transactions();
+                check(
+                    run_input(&operation, step_input(&input(-1)), &mut transactions).unwrap(),
+                    &[(2, -1), (1, 1)],
+                );
+                check(
+                    run_input(&operation, step_input(&input(-1)), &mut transactions).unwrap(),
+                    &[(1, -1)],
+                );
+                // Rebirth after complete retraction proves no phantom surviving group.
+                check(
+                    run_input(&operation, step_input(&input(1)), &mut transactions).unwrap(),
+                    &[(1, 1)],
+                );
+                check(
+                    run_input(&operation, step_input(&input(-1)), &mut transactions).unwrap(),
+                    &[(1, -1)],
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn many_empty_list_group_updates_keep_single_row_offset_budget() {
+    use arrow_array::ListArray;
+    use arrow_buffer::OffsetBuffer;
+    const ROWS: usize = 4096;
+    let child = Arc::new(Field::new("item", DataType::Int64, false));
+    // Empty metadata intentionally lets the pre-fix baseline prove this valid case.
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "g",
+        DataType::List(Arc::clone(&child)),
+        false,
+    )]));
+    let groups = ListArray::new(
+        child,
+        OffsetBuffer::from_lengths(std::iter::repeat_n(0, ROWS)),
+        Arc::new(Int64Array::from(Vec::<i64>::new())),
+        None,
+    );
+    let differences = [vec![1; ROWS / 2], vec![-1; ROWS / 2]].concat();
+    let input = Change::try_new(
+        RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(groups)]).unwrap(),
+        Int64Array::from(differences.clone()),
+    )
+    .unwrap();
+    let definition =
+        AggregateDefinition::try_new([("g", col("g"))], [("count", AggregateCall::CountAll)])
+            .unwrap();
+    let root = TestStore::new();
+    let (operation, mut transactions) =
+        construct_aggregate_for_schema(&root, &definition, Arc::clone(&schema));
+    let Operation::Atomic(atomic) = &operation else {
+        panic!("Aggregate is Atomic")
+    };
+    let output = {
+        let transaction = transactions.begin();
+        let output = atomic
+            .apply(
+                step_input(&input),
+                transaction.access(),
+                &mut StepBudget::new(0, 64 * 1024 * 1024),
+            )
+            .unwrap()
+            .unwrap();
+        transaction.commit().unwrap();
+        output
+    };
+    assert_eq!(output.num_rows(), 2 * ROWS - 2);
+    assert_eq!(output.records().schema().field(0), schema.field(0));
+    let groups = output
+        .records()
+        .column(0)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    assert!(groups.values().is_empty());
+    assert!(groups.value_offsets().iter().all(|offset| *offset == 0));
+    let counts = output
+        .records()
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let mut count = 0_i64;
+    let mut row = 0;
+    for difference in differences {
+        if count != 0 {
+            assert_eq!((counts.value(row), output.diffs().value(row)), (count, -1));
+            row += 1;
+        }
+        count += difference;
+        if count != 0 {
+            assert_eq!((counts.value(row), output.diffs().value(row)), (count, 1));
+            row += 1;
+        }
+    }
+    assert_eq!((count, row), (0, output.num_rows()));
+}
+
+#[test]
+fn sliced_empty_list_group_does_not_charge_unselected_parent_offsets() {
+    use arrow_array::ListArray;
+    use arrow_buffer::OffsetBuffer;
+    let child = Arc::new(Field::new("item", DataType::Int64, false));
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "g",
+        DataType::List(Arc::clone(&child)),
+        false,
+    )]));
+    let groups = ListArray::new(
+        child,
+        OffsetBuffer::from_lengths(std::iter::repeat_n(0, 100_000)),
+        Arc::new(Int64Array::from(Vec::<i64>::new())),
+        None,
+    );
+    let large = Change::try_new(
+        RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(groups)]).unwrap(),
+        Int64Array::from(vec![1; 100_000]),
+    )
+    .unwrap();
+    let input = large.try_slice(0, 64).unwrap();
+    let definition =
+        AggregateDefinition::try_new([("g", col("g"))], [("count", AggregateCall::CountAll)])
+            .unwrap();
+    let root = TestStore::new();
+    let (operation, mut transactions) =
+        construct_aggregate_for_schema(&root, &definition, Arc::clone(&schema));
+    let Operation::Atomic(atomic) = &operation else {
+        panic!("Aggregate is Atomic")
+    };
+    let output = {
+        let transaction = transactions.begin();
+        let output = atomic
+            .apply(
+                step_input(&input),
+                transaction.access(),
+                &mut StepBudget::new(0, 64 * 1024 * 1024),
+            )
+            .unwrap()
+            .unwrap();
+        transaction.commit().unwrap();
+        output
+    };
+    assert_eq!(output.num_rows(), 127);
+    assert_eq!(output.records().schema().field(0), schema.field(0));
+    let groups = output
+        .records()
+        .column(0)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    assert!(groups.values().is_empty());
+    assert!(groups.value_offsets().iter().all(|offset| *offset == 0));
+    let counts = output
+        .records()
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!((counts.value(0), output.diffs().value(0)), (1, 1));
+    for count in 1..64_i64 {
+        let row = usize::try_from(2 * count - 1).unwrap();
+        assert_eq!((counts.value(row), output.diffs().value(row)), (count, -1));
+        assert_eq!(
+            (counts.value(row + 1), output.diffs().value(row + 1)),
+            (count + 1, 1)
+        );
+    }
+    let retract = Change::try_new(input.records().clone(), Int64Array::from(vec![-1; 64])).unwrap();
+    let output = run_input(&operation, step_input(&retract), &mut transactions)
+        .unwrap()
+        .unwrap();
+    assert_eq!(output.num_rows(), 127);
+    assert_eq!(output.diffs().value(126), -1);
+}

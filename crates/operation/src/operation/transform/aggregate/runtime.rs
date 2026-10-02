@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Int64Array, RecordBatch};
+use arrow_array::{Array, ArrayRef, Int64Array, ListArray, RecordBatch};
+use arrow_buffer::OffsetBuffer;
 use arrow_schema::{Field, SchemaRef};
 use datafusion_common::ScalarValue;
 use dogpaddle_change::Change;
@@ -745,7 +746,20 @@ impl OutputRows {
                 .saturating_add(8),
         )?;
         for (column, group) in self.columns.iter_mut().zip(groups) {
-            let value = ScalarValue::try_from_array(group.as_ref(), row)?;
+            let value = if let Some(list) = group.as_any().downcast_ref::<ListArray>()
+                && !list.is_null(row)
+            {
+                // Keep the exact child Field while retaining only this row's offsets.
+                let values = list.value(row);
+                ScalarValue::List(Arc::new(ListArray::new(
+                    Arc::clone(list.value_field()),
+                    OffsetBuffer::from_lengths([values.len()]),
+                    values,
+                    None,
+                )))
+            } else {
+                ScalarValue::try_from_array(group.as_ref(), row)?
+            };
             budget.charge(value.size())?;
             column.push(value);
         }
