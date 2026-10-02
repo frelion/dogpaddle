@@ -304,3 +304,74 @@ Discard 的逐值结果；未测 native heap、RSS、启动延迟或运行吞吐
 六文件 candidate patch SHA-256 为 `5b7957a93ef744384c0bfbbf356454ea7857f503fbe62d77781a21aa79059a1a`。
 首个元数据核对脚本误用 Sink 程序的 351 条共有依赖预期，在四次测量完成后拒绝；
 改正为实际 352 条后逐项核对，保留原始测量和该失败记录。focused correctness 与 Clippy 已通过。
+
+## 2026-10-02：恢复时交接已解码的父页
+
+基线 `c2e6ca9`；最终候选 runtime 源码 SHA-256 前缀为 `3a171002`，生产代码净减少 1 行。
+父 Send 已严格解码的输出直接作为下一 child 的输入，保留 head、端口、调用边、Schema、
+页形状和 Resume 校验；root 仍使用 Source 原始 codec，持久格式、事务与执行路径不变。
+这消除一次重复完整解码，不是新的持久事实或整栈缓存，也不声称代码量突破。
+
+公共 build/advance 生成真实挂起栈：Source 从 u64::MAX 捕获一行，经改名 Select、重复端口 UnionAll
+下降，在末端融合 Select 的整数除零处安全失败；此前 D−1 个 Send 页及栈顶 Run 保留。
+宽字段为 960 KiB Utf8，嵌套为 128×960 个 Int64；实际编码分别为 983,392 与 999,368 字节。
+两版各通过 81 项 Flow release correctness，包括改名融合及两个真实 child 端口逐动作重开。
+
+最终源码独立重新编译并验证，固定 A/B/B/A：13 场景完整 warm open，Flat10、100 ms warmup、
+5 s measurement；52 个独立 DHAT child；另跑未修改的 flow_lifecycle 六场景，
+Flat30、2 s warmup、5 s measurement。全部 60 child 验证通过，保留 76 个 Criterion cell、
+1,240 组原始 iters/times、完整估计及 95% CI；Flat slope 为 null。
+下表变化是两组 B/A−1，均值/中位数来自完整 open 耗时，不是 process CPU。
+fixture、factory、advance、校验与 Flow drop 在计时外；Definition 解码、绑定及 Store 重开在内。
+
+| 深度 / 数据 | 均值变化，首组 / 末组 | 中位数变化，首组 / 末组 | 累计 Rust 分配字节变化，两组相同 |
+| --- | ---: | ---: | ---: |
+| 1 / narrow | +1.01% / -3.32% | +2.27% / -3.48% | +0 |
+| 2 / narrow | +1.68% / -1.28% | +0.26% / -0.33% | -1,009 |
+| 2 / wide_960k | -0.20% / -2.31% | +0.58% / -3.17% | -1,967,465 |
+| 2 / nested_128x960_i64 | +0.75% / -1.49% | +0.48% / -0.20% | -2,001,929 |
+| 8 / narrow | +2.24% / -0.04% | +1.25% / +1.76% | -7,063 |
+| 8 / wide_960k | -3.21% / -5.75% | -3.34% / -5.75% | -13,772,255 |
+| 8 / nested_128x960_i64 | -1.62% / -4.68% | -1.35% / -3.84% | -14,013,503 |
+| 32 / narrow | +2.38% / -2.84% | +2.44% / -3.81% | -31,279 |
+| 32 / wide_960k | -11.40% / -10.41% | -11.31% / -10.96% | -60,991,415 |
+| 32 / nested_128x960_i64 | -10.73% / -12.12% | -11.52% / -12.33% | -62,059,799 |
+| 64 / narrow | +0.95% / -0.23% | +0.20% / +0.63% | -63,567 |
+| 64 / wide_960k | -16.34% / -17.31% | -16.51% / -17.84% | -123,950,295 |
+| 64 / nested_128x960_i64 | -15.10% / -19.83% | -16.43% / -19.62% | -126,121,527 |
+
+所有 allocator current/peak bytes/blocks 在两组对照中均不变；减少的是累计分配，
+并非峰值、常驻内存或 RSS。DHAT 只统计本次 open 及 drop 的 Rust 全局分配，
+同时保留 Flow 存活时与 drop 后各六个 counter；不包括原有 fixture、RocksDB native heap。
+32/64 层宽数据与嵌套数据的两组均值区间分别不重叠；窄数据均重叠，不宣称普遍提速。
+
+| 原有生命周期 / Operation 数 | 均值变化，首组 / 末组 | 中位数变化，首组 / 末组 |
+| --- | ---: | ---: | ---: |
+| fresh_durable_build / 2 | +2.87% / -6.36% | +3.96% / -5.31% |
+| fresh_durable_build / 64 | +1.61% / -4.75% | +1.92% / -4.61% |
+| fresh_durable_build / 1024 | +1.36% / -2.20% | +0.82% / -2.32% |
+| warm_reopen / 2 | +1.66% / -3.97% | +1.31% / -4.65% |
+| warm_reopen / 64 | +1.06% / -3.43% | +1.02% / -4.89% |
+| warm_reopen / 1024 | +1.23% / -0.62% | +1.47% / +0.76% |
+
+三个 fresh build 场景均在首组变慢、末组变快，各自均值区间不重叠；六个生命周期场景
+两组均异向，保留全部结果。build 同样检查空调用栈，不能从没有活跃父页推断零影响，
+也不能把首组回退全判为噪声。各自区间是否重叠只是描述，不是配对变化的置信区间；
+本轮没有测进程 CPU 或 RSS。
+
+临时 owner witness 源码在 `/tmp/dogpaddle-flow-restore-witness-v1/`；最终 build/oracle 证据在
+`/private/var/folders/16/1dvtn08j5d15sssx4qdzy_r80000gn/T/dp-flow-restore-witness-actual-v3-8jglx4fg/`；
+最终完整对照在 `/private/var/folders/16/1dvtn08j5d15sssx4qdzy_r80000gn/T/dp-flow-restore-witness-perf-v2-pvwww_ug/`。
+`/tmp/dogpaddle-flow-restore-witness-root-analysis-v2.json` 保留逐 cell 原始数据、完整估计和全部 heap 对象；
+相邻 root analysis、actual/perf driver 和 outer receipt 留存来源、二进制 SHA、失败记录及全部输出。
+
+初版 runtime 文件 SHA-256 前缀 `c7f533ad` 的全部 60 child 对照及完整结果另存于
+`/private/var/folders/16/1dvtn08j5d15sssx4qdzy_r80000gn/T/dp-flow-restore-witness-perf-v1-eb6cb102/` 和
+`/tmp/dogpaddle-flow-restore-witness-root-analysis-v1.json`，原始性能段落保存在
+`/tmp/dogpaddle-flow-restore-handoff-initial-performance-doc-v1.md`。其中两节点 fresh build
+两组 +1.95%/+3.08% 回退，均值区间均不重叠，保留该结果；不可转用于最终源码。
+初版完整 gate 的 debug/release correctness 通过，但 Clippy 拒绝 107 行的恢复函数。
+最终候选复用同一输出只读访问，保留全部检查，没有拆 helper 或放宽 lint。
+初次 scratch 注册 DHAT 因缺少 Flow lock 依赖边被 --locked 拒绝；失败原样保留，
+后续 scratch 只补临时 package 的该边，未更新依赖版本，实际验证仍使用 --locked。
+临时 witness 和注册只存在于独立证据快照，不加入产品 API 或仓库 benchmark 协议。

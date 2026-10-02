@@ -93,4 +93,6 @@ open 逐层检查：depth 连续；只有零层 Source；head 是实际 head 且
 和算法位置与 input 相符；Run 无 pending 且在栈顶；Send 有合法 pending，consumer 未越界。有 child 的父必须为 Send，
 child head/port 等于父 consumers[next_consumer - 1]，child input 唯一来自父 pending 页。
 拒绝 orphan payload、缺失资源、错 schema 和错误 control。只保留有界 control 与相邻 payload，不一次解码整栈。
+父 pending 页只严格解码一次；使用父融合段末端 codec 得到的 Change 直接交给下一层验证 input 和 Resume。
+所有权沿恢复遍历向下交接，仅在本次检查中临时存活，不增加缓存或持久状态。
 源与目标恢复通过各自只读接口验证必要持久事实，Flow 不复制其状态机。

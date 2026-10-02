@@ -72,9 +72,26 @@ fn codecs_cover_source_and_segment_outputs_across_reopen() {
     drop(flow);
     let mut flow = FlowFactory::new(&path).open().unwrap();
     check(&flow);
+    capture(&mut flow, 0);
+    let mut child_ports = Vec::new();
     for _ in 0..10 {
-        if flow.advance().unwrap() == AdvanceOutcome::Idle {
+        let outcome = one_action(&mut flow);
+        if let Some((depth, frame)) = flow
+            .runtime
+            .frames
+            .top(flow.reads.begin().access())
+            .unwrap()
+            && depth != 0
+        {
+            assert_eq!(frame.head, 3);
+            child_ports.push(frame.input_port.unwrap());
+        }
+        drop(flow);
+        flow = FlowFactory::new(&path).open().unwrap();
+        check(&flow);
+        if outcome == AdvanceOutcome::Idle {
             assert_eq!(flow.status().unwrap().depth, 0);
+            assert_eq!(child_ports, [0, 1]);
             return;
         }
     }

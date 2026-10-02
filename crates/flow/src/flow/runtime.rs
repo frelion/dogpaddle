@@ -132,10 +132,8 @@ impl Runtime {
             return Err("call stack exceeds depth bound".into());
         }
         let count = controls.entries.len();
-        if let Some((last, _)) = self
-            .frames
-            .outputs
-            .read(access)?
+        let outputs = self.frames.outputs.read(access)?;
+        if let Some((last, _)) = outputs
             .scan(
                 ..,
                 ScanDirection::Descending,
@@ -148,6 +146,7 @@ impl Runtime {
         {
             return Err("orphan frame output".into());
         }
+        let mut parent_output = None;
         for (expected, (depth, frame)) in controls.entries.iter().enumerate() {
             if *depth as usize != expected {
                 return Err("call stack depths are not continuous".into());
@@ -166,7 +165,6 @@ impl Runtime {
                         && port < node.inputs.len() => {}
                 _ => return Err("frame has invalid input port or source depth".into()),
             }
-            let input_bytes = self.input(*depth, frame, access)?;
             if expected > 0 {
                 let parent_frame = &controls.entries[expected - 1].1;
                 let FramePhase::Send { next_consumer, .. } = parent_frame.phase else {
@@ -180,7 +178,12 @@ impl Runtime {
                     return Err("child does not match its parent's pending call".into());
                 }
             }
-            let input = self.input_codec(frame).decode_owned(input_bytes)?;
+            let input = if expected == 0 {
+                let bytes = self.input(*depth, frame, access)?;
+                self.input_codec(frame).decode_owned(bytes)?
+            } else {
+                parent_output.take().ok_or("child has no parent output")?
+            };
             check_shape(
                 &input,
                 if expected == 0 { 4096 } else { 256 },
@@ -193,13 +196,7 @@ impl Runtime {
             match &frame.phase {
                 FramePhase::Run(resume) => {
                     node.operation.validate_resume(input, resume)?;
-                    if self
-                        .frames
-                        .outputs
-                        .read(access)?
-                        .get_bounded(depth, 0)?
-                        .is_some()
-                    {
+                    if outputs.get_bounded(depth, 0)?.is_some() {
                         return Err("running frame retains an output".into());
                     }
                     if expected + 1 < count {
@@ -216,8 +213,10 @@ impl Runtime {
                     if let Progress::More(resume) = after {
                         node.operation.validate_resume(input, resume)?;
                     }
-                    let output = self.frames.output(*depth, access)?;
-                    check_shape(&self.output_codec(frame.head).decode(&output)?, 256, 16384)?;
+                    let bytes = self.frames.output(*depth, access)?;
+                    let output = self.output_codec(frame.head).decode_owned(bytes)?;
+                    check_shape(&output, 256, 16384)?;
+                    parent_output = Some(output);
                 }
             }
         }
