@@ -181,9 +181,7 @@ impl SchemaBoundChangeCodec {
     }
 
     fn require_schema(&self, actual: &SchemaRef) -> Result<(), CodecError> {
-        if Arc::ptr_eq(&self.logical_schema, actual)
-            || self.logical_schema.as_ref() == actual.as_ref()
-        {
+        if &self.logical_schema == actual {
             Ok(())
         } else {
             Err(CodecError::SchemaMismatch)

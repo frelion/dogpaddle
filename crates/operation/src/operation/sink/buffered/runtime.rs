@@ -217,7 +217,7 @@ impl<T: RelationTarget> SinkOperation for BufferedSink<T> {
         access: TransactionAccess<'_>,
         page: &Change,
     ) -> Result<bool, OperationError> {
-        if self.codec.schema().as_ref() != page.records().schema_ref().as_ref() {
+        if &self.codec.schema() != page.records().schema_ref() {
             return Err(invalid("input Schema differs from the bound Schema"));
         }
         let encoded = self

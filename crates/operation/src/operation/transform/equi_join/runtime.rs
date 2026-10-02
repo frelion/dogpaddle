@@ -139,7 +139,7 @@ impl EquiJoinOperation {
         if input.port >= self.input_schemas.len() {
             return Err(EquiJoinError::InvalidInputPort { port: input.port });
         }
-        if input.change.schema().as_ref() != self.input_schemas[input.port].as_ref() {
+        if input.change.records().schema_ref() != &self.input_schemas[input.port] {
             return Err(EquiJoinError::InputSchemaMismatch { port: input.port });
         }
         Ok(())

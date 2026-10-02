@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use arrow_schema::{ArrowError, Schema, SchemaRef};
+use arrow_schema::{ArrowError, SchemaRef};
 use thiserror::Error;
 
 use crate::schema::{SchemaError, validate_schema};
@@ -78,8 +78,8 @@ impl ChangeProjection {
         &self.output_schema
     }
 
-    pub(crate) fn require_schema(&self, actual: &Schema) -> Result<(), ProjectionError> {
-        if self.input_schema.as_ref() == actual {
+    pub(crate) fn require_schema(&self, actual: &SchemaRef) -> Result<(), ProjectionError> {
+        if &self.input_schema == actual {
             Ok(())
         } else {
             Err(ProjectionError::SchemaMismatch)

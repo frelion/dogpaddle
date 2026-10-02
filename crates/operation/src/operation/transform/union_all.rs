@@ -141,12 +141,12 @@ impl AtomicOperation for UnionAllOperation {
             }
             .into());
         }
-        let actual_schema = input.change.schema();
-        if actual_schema.as_ref() != self.input_schema.as_ref() {
+        let actual_schema = input.change.records().schema_ref();
+        if actual_schema != &self.input_schema {
             return Err(UnionAllError::InputSchemaMismatch {
                 port: input.port,
                 expected: Arc::clone(&self.input_schema),
-                actual: actual_schema,
+                actual: Arc::clone(actual_schema),
             }
             .into());
         }

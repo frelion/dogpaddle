@@ -82,7 +82,7 @@ impl AsOfJoinOperation {
         if input.port > 1 {
             return Err(AsOfJoinError::InvalidInputPort { port: input.port });
         }
-        if input.change.schema() != self.layout.input_schemas[input.port] {
+        if input.change.records().schema_ref() != &self.layout.input_schemas[input.port] {
             return Err(AsOfJoinError::InputSchemaMismatch { port: input.port });
         }
         Ok(())

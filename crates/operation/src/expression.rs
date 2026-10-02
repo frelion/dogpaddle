@@ -154,7 +154,7 @@ impl BoundProjection {
         assert!(
             expressions
                 .iter()
-                .all(|expression| expression.input_schema.as_ref() == input_schema.as_ref()),
+                .all(|expression| expression.input_schema == input_schema),
             "projection expressions must share the bound input Schema"
         );
         let column_projection = expressions
@@ -167,7 +167,7 @@ impl BoundProjection {
             })
             .collect::<Option<Vec<_>>>()
             .and_then(|indices| ChangeProjection::try_new(Arc::clone(&input_schema), indices).ok())
-            .filter(|projection| projection.output_schema().as_ref() == output_schema.as_ref());
+            .filter(|projection| projection.output_schema() == output_schema);
         // Exact pure selection needs no physical expressions at runtime. The
         // Change projection retains the original no-revalidation fast path.
         let expressions = if column_projection.is_some() {
@@ -194,7 +194,7 @@ impl BoundProjection {
                     other => ProjectionError::Columns(other),
                 });
         }
-        if input.records().schema_ref().as_ref() != self.input_schema.as_ref() {
+        if input.records().schema_ref() != &self.input_schema {
             return Err(ProjectionError::InputSchemaMismatch);
         }
         let columns = self
@@ -460,7 +460,7 @@ impl BoundExpression {
     }
 
     pub(crate) fn evaluate(&self, records: &RecordBatch) -> Result<ArrayRef, ExpressionError> {
-        if records.schema().as_ref() != self.input_schema.as_ref() {
+        if records.schema_ref() != &self.input_schema {
             return Err(ExpressionError::SchemaMismatch);
         }
         self.physical

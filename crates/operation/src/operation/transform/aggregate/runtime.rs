@@ -455,7 +455,7 @@ impl AtomicOperation for AggregateOperation {
         if input.port != 0 {
             return Err(AggregateError::InvalidInputPort { port: input.port }.into());
         }
-        if input.change.schema().as_ref() != self.input_schema.as_ref() {
+        if input.change.records().schema_ref() != &self.input_schema {
             return Err(AggregateError::InputSchemaMismatch.into());
         }
 

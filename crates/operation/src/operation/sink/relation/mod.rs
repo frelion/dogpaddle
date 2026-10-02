@@ -148,7 +148,7 @@ pub(crate) fn encode_target_values<V>(
     row_index: usize,
     mut value: impl FnMut(&Field, &[u8]) -> V,
 ) -> Result<(Vec<u8>, Vec<V>), RowError> {
-    if batch.schema_ref().as_ref() != schema.as_ref() {
+    if batch.schema_ref() != schema {
         return Err(RowError::SchemaMismatch);
     }
     if row_index >= batch.num_rows() {
