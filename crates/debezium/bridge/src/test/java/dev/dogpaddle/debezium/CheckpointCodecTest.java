@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.HexFormat;
 import java.util.Map;
 import java.util.TreeMap;
@@ -174,5 +175,52 @@ class CheckpointCodecTest {
 
         assertEquals(28, encoded.length);
         assertEquals(checkpoint, CheckpointCodec.decode(encoded));
+    }
+
+    @Test
+    void validated_binding_keeps_exact_utf8_bytes_at_the_protocol_limit() {
+        for (String binding : new String[] {
+                "x".repeat(1024 * 1024), "é".repeat(512 * 1024), "  名字\u0000  "}) {
+            byte[] expected = binding.getBytes(StandardCharsets.UTF_8);
+            Checkpoint checkpoint = new Checkpoint(binding, binding, Map.of());
+            byte[] encoded = CheckpointCodec.encode(checkpoint);
+            ByteBuffer frame = ByteBuffer.wrap(encoded);
+            frame.position(CheckpointCodec.MAGIC.length + Short.BYTES);
+            for (int field = 0; field < 2; field++) {
+                assertEquals(expected.length, frame.getInt());
+                byte[] actual = new byte[expected.length];
+                frame.get(actual);
+                assertArrayEquals(expected, actual);
+            }
+            assertEquals(checkpoint, CheckpointCodec.decode(encoded));
+        }
+        for (boolean engine : new boolean[] {true, false}) {
+            String tooLarge = "é".repeat(512 * 1024) + "x";
+            String description = engine ? "engine name" : "connector class";
+            assertEquals(description + " exceeds 1048576 UTF-8 bytes", assertThrows(
+                    IllegalArgumentException.class,
+                    () -> new Checkpoint(engine ? tooLarge : "e", engine ? "c" : tooLarge,
+                            Map.of())).getMessage());
+            assertEquals(description + " is not canonical UTF-8", assertThrows(
+                    IllegalArgumentException.class,
+                    () -> new Checkpoint(engine ? "\ud800" : "e", engine ? "c" : "\ud800",
+                            Map.of())).getMessage());
+        }
+    }
+
+    @Test
+    void incoming_binding_bytes_are_validated_even_with_a_valid_checksum() {
+        byte[] encoded = CheckpointCodec.encode(new Checkpoint("é", "é", Map.of()));
+        for (int badByte : new int[] {14, 15, 20, 21}) {
+            byte[] malformed = encoded.clone();
+            malformed[badByte] = (byte) 0xff;
+            CRC32 checksum = new CRC32();
+            checksum.update(malformed, 0, malformed.length - Integer.BYTES);
+            ByteBuffer.wrap(malformed, malformed.length - Integer.BYTES, Integer.BYTES)
+                    .putInt((int) checksum.getValue());
+            assertEquals("checkpoint binding is not canonical UTF-8", assertThrows(
+                    IllegalArgumentException.class,
+                    () -> CheckpointCodec.decode(malformed)).getMessage());
+        }
     }
 }

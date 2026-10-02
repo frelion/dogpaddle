@@ -98,7 +98,7 @@ final class OffsetStoreRegistry {
                     current.engineName(), records);
             Checkpoint candidate = current.merge(delta);
             return new PreparedCheckpoint(
-                    Collections.unmodifiableMap(new TreeMap<>(delta)),
+                    delta,
                     candidate);
         }
 
@@ -122,16 +122,15 @@ final class OffsetStoreRegistry {
                         "Debezium attempted an offset write outside an acknowledged delivery");
             }
             Map<RawBytes, RawBytes> actual = rawMap(values);
+            if (expectedCommit != expected) {
+                throw new IllegalStateException(
+                        "armed checkpoint changed while reading actual offsets");
+            }
             if (!actual.equals(expected.delta())) {
                 throw new IllegalStateException(
                         "Debezium offset write differs from the pre-ACK checkpoint preview");
             }
-            Checkpoint candidate = current.merge(actual);
-            if (!candidate.equals(expected.checkpoint())) {
-                throw new IllegalStateException(
-                        "Debezium offset write produced a different complete checkpoint");
-            }
-            current = candidate;
+            current = expected.checkpoint();
             expectedCommit = null;
         }
 
@@ -205,5 +204,8 @@ final class OffsetStoreRegistry {
     record PreparedCheckpoint(
             Map<RawBytes, RawBytes> delta,
             Checkpoint checkpoint) {
+        PreparedCheckpoint {
+            delta = Collections.unmodifiableMap(new TreeMap<>(delta));
+        }
     }
 }

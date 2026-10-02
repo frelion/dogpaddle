@@ -11,11 +11,14 @@ final class RawBytes implements Comparable<RawBytes> {
         this.bytes = bytes.clone();
     }
 
-    static RawBytes from(ByteBuffer buffer) {
+    private RawBytes(ByteBuffer buffer) {
         ByteBuffer copy = buffer.asReadOnlyBuffer();
-        byte[] bytes = new byte[copy.remaining()];
-        copy.get(bytes);
-        return new RawBytes(bytes);
+        this.bytes = new byte[copy.remaining()];
+        copy.get(this.bytes);
+    }
+
+    static RawBytes from(ByteBuffer buffer) {
+        return new RawBytes(buffer);
     }
 
     byte[] bytes() {

@@ -34,8 +34,8 @@ final class CheckpointCodec {
             DataOutputStream output = new DataOutputStream(bytes);
             output.write(MAGIC);
             output.writeShort(VERSION);
-            writeRequiredUtf8(output, checkpoint.engineName());
-            writeRequiredUtf8(output, checkpoint.connectorClass());
+            writeRequiredBytes(output, checkpoint.engineName().getBytes(StandardCharsets.UTF_8));
+            writeRequiredBytes(output, checkpoint.connectorClass().getBytes(StandardCharsets.UTF_8));
             if (checkpoint.entries().size() > MAX_ENTRIES) {
                 throw new IllegalArgumentException(
                         "checkpoint has too many offset entries");
@@ -128,19 +128,6 @@ final class CheckpointCodec {
         catch (IOException error) {
             throw new IllegalArgumentException("cannot decode checkpoint", error);
         }
-    }
-
-    private static void writeRequiredUtf8(DataOutputStream output, String value)
-            throws IOException {
-        byte[] encoded = value.getBytes(StandardCharsets.UTF_8);
-        if (!value.equals(new String(encoded, StandardCharsets.UTF_8))) {
-            throw new IllegalArgumentException(
-                    "checkpoint binding is not canonical UTF-8");
-        }
-        if (encoded.length == 0 || encoded.length > MAX_BINDING_BYTES) {
-            throw new IllegalArgumentException("checkpoint binding has invalid length");
-        }
-        writeRequiredBytes(output, encoded);
     }
 
     private static String readRequiredUtf8(DataInputStream input) throws IOException {

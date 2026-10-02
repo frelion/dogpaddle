@@ -110,15 +110,19 @@ Java bridge 因此新建一个 `OffsetStorageWriter`、只捕获写入的内存 
 2. 合并当前 records 的 partition/offset。
 3. 返回候选完整 map，在发布 Delivery 前编码成 `Checkpoint`。
 4. 调用方持久化 records 与 checkpoint。
-5. `ack()` 先把预演 delta 设为本次期望值，再运行真正的 Debezium committer；实际 backing store 收到写入后，
-   按原始字节核对 delta 和最终完整 checkpoint 都完全一致。
+5. `ack()` 先以当前完整 map 和冻结的预演 delta 核对候选 checkpoint，再运行真正的 Debezium committer。
+   实际 backing store 收到写入后，确认本次预演仍持有 ACK，并按原始字节核对完整 delta；一致后直接接受已经核对的
+   不可变候选，不第三次重建完整 map。ACK 返回前仍核对当前完整 checkpoint 与候选完全一致。
 
-Java 预演结果只保留原始 delta 和不可变的候选 checkpoint。checkpoint 的编码容量检查在预演返回后、
+Java 预演结果在构造时冻结原始 delta，只保留这一份 delta 和不可变的候选 checkpoint。checkpoint 的编码容量检查在预演返回后、
 发布 Delivery 前完成；编码失败不会发布批次、进入 ACK 或改写当前 offset。完整编码只作为构造 Delivery 的临时输入，
 不再随预演结果保留至 ACK；已发布的 Delivery frame 本身仍包含 checkpoint bytes。
 检查点编码器保持每次写入前的容量检查，直接从内部缓冲区计算 CRC，再一次复制到包含校验和的最终数组，
 不另建完整 body 数组，也不为追加校验和扩大内部缓冲区。内部缓冲区、最终 frame、原始 offset map 和
 `RawBytes` 的防御性复制仍存在；这不构成 JVM 堆峰值或 RSS 上限保证。Checkpoint v1 字节格式不变。
+不可变绑定在 `Checkpoint` 构造时校验，编码时直接转成 UTF-8 bytes；输入解码仍完整校验绑定，
+编码器每次写入前仍检查容量。从 `ByteBuffer` 构造 `RawBytes` 时，只复制其 remaining bytes 一次，
+不移动调用方的位置；从 byte array 构造和对外导出仍防御性复制，保留对调用方修改的隔离。
 
 Checkpoint 绑定稳定的 engine name 和 connector class，可能包含多个 source partition。
 Rust `Checkpoint` 只拥有已完整校验的原始字节，不复制名字或缓存其位置。身份比较用现有读取器借用两个绑定字段；
