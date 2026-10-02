@@ -38,9 +38,10 @@ impl SqlProgram {
     ///
     /// # Errors
     ///
-    /// Returns an error for invalid SQL, syntax outside the supported query
-    /// subset, any outer statement other than direct `INSERT INTO sink(...) Query`,
-    /// or malformed endpoint parameters.
+    /// Returns an error for invalid SQL, any outer statement other than direct
+    /// `INSERT INTO sink(...) Query`, malformed endpoint parameters, or syntax
+    /// whose meaning the pinned planner would discard. Relational capabilities
+    /// are checked with real source Schemas when [`Self::start`] builds new state.
     pub fn parse(sql: &str) -> Result<Self, SqlError> {
         let (sink, query, scans) = syntax::parse(sql)?;
         Ok(Self { sink, query, scans })
@@ -70,8 +71,9 @@ impl SqlProgram {
     /// # Errors
     ///
     /// Returns an error when endpoint parameters cannot be resolved, a new
-    /// program cannot be planned or discovered, existing state is incomplete
-    /// or belongs to another program, or the underlying Flow cannot start.
+    /// program cannot be discovered, type-checked or lowered, existing state is
+    /// incomplete or belongs to another program, or the underlying Flow cannot
+    /// start.
     pub fn start(&self, path: impl AsRef<Path>) -> Result<Flow, SqlError> {
         let supplied_path = path.as_ref();
         let endpoints = self.resolve_endpoints()?;

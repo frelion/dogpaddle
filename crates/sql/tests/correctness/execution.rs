@@ -1,7 +1,10 @@
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dogpaddle_flow::{AdvanceOutcome, Flow, FlowError};
+use dogpaddle_operation::OperationDefinition;
 use dogpaddle_sql::{SqlError, SqlProgram};
+use dogpaddle_store::{Cell, Store};
 use rusqlite::{Connection, OpenFlags};
 
 const TABLE: &str = "selected_numbers";
@@ -951,6 +954,399 @@ fn sql_file_builds_and_reopens_a_filtered_union_into_sqlite() {
         SqlError::Flow(FlowError::OwnerIdentityMismatch)
     ));
     assert!(!replacement_path.exists());
+}
+
+#[test]
+fn having_filters_complete_aggregate_changes_across_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    let schema = grouped_schema();
+    for (name, predicate, prefix, expected) in [
+        ("at_least_two", ">= 2", vec![], vec![(0, 2), (1, 2)]),
+        ("only_one", "= 1", vec![(0, 1), (1, 1)], vec![]),
+    ] {
+        let state = root.path().join(format!("{name}-state"));
+        let target = root.path().join(format!("{name}.sqlite"));
+        let query = format!(
+            "SELECT CAST(value % 2 AS BIGINT) AS parity, COUNT(*) AS row_count \
+             FROM sequence(start => 18446744073709551612) \
+             GROUP BY CAST(value % 2 AS BIGINT) HAVING COUNT(*) {predicate}"
+        );
+        let program = capability_program(&target, &query);
+        let definition = start_midway(&program, &state, &schema, 2);
+        assert_eq!(grouped_rows(&target), prefix);
+        finish(&program, &state);
+        assert_eq!(grouped_rows(&target), expected);
+        assert_completed_reopen(&program, &state, &definition);
+        assert_eq!(grouped_rows(&target), expected);
+    }
+}
+
+#[test]
+fn union_distinct_coerces_nullable_rows_and_deduplicates_the_full_bag_across_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let target = root.path().join("union.sqlite");
+    let program = capability_program(
+        &target,
+        "SELECT CAST(value % 2 AS BIGINT) AS \"value.code\" \
+         FROM sequence(start => 18446744073709551612) \
+         UNION \
+         SELECT CASE WHEN value % 2 = 0 THEN NULL \
+                     ELSE CAST(value % 2 AS SMALLINT) END AS ignored_name \
+         FROM sequence(start => 18446744073709551612)",
+    );
+    let schema = Schema::new(vec![Field::new("value.code", DataType::Int64, true)]);
+    let definition = start_midway(&program, &state, &schema, 2);
+    assert_eq!(nullable_codes(&target), [None, Some(0)]);
+    finish(&program, &state);
+    assert_eq!(nullable_codes(&target), [None, Some(0), Some(1)]);
+    assert_completed_reopen(&program, &state, &definition);
+    assert_eq!(nullable_codes(&target), [None, Some(0), Some(1)]);
+}
+
+#[test]
+fn union_by_name_preserves_reordering_null_fill_and_multiplicity_across_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    let schema = Schema::new(vec![
+        Field::new("value.code", DataType::Int64, false),
+        Field::new("label", DataType::Utf8, true),
+    ]);
+    for (name, quantifier, prefix, expected) in [
+        (
+            "all",
+            "ALL BY NAME",
+            vec![(0, None), (0, None)],
+            vec![
+                (0, None),
+                (0, None),
+                (0, None),
+                (1, None),
+                (1, Some("ok".to_owned())),
+                (1, Some("ok".to_owned())),
+            ],
+        ),
+        (
+            "distinct",
+            "BY NAME",
+            vec![(0, None)],
+            vec![(0, None), (1, None), (1, Some("ok".to_owned()))],
+        ),
+        (
+            "explicit_distinct",
+            "DISTINCT BY NAME",
+            vec![(0, None)],
+            vec![(0, None), (1, None), (1, Some("ok".to_owned()))],
+        ),
+    ] {
+        let state = root.path().join(format!("{name}-state"));
+        let target = root.path().join(format!("{name}.sqlite"));
+        let final_fields = if quantifier == "DISTINCT BY NAME" {
+            "CAST(value % 2 AS BIGINT) AS \"value.code\", CAST(NULL AS VARCHAR) AS label"
+        } else {
+            "CAST(value % 2 AS BIGINT) AS \"value.code\""
+        };
+        let query = format!(
+            "SELECT CAST(value % 2 AS BIGINT) AS \"value.code\", \
+                    CASE WHEN value % 2 = 0 THEN CAST(NULL AS VARCHAR) \
+                         ELSE 'ok' END AS label \
+             FROM sequence(start => 18446744073709551614) \
+             UNION {quantifier} \
+             SELECT CASE WHEN value % 2 = 0 THEN CAST(NULL AS VARCHAR) \
+                         ELSE 'ok' END AS label, \
+                    CAST(value % 2 AS SMALLINT) AS \"value.code\" \
+             FROM sequence(start => 18446744073709551614) \
+             UNION {quantifier} \
+             SELECT {final_fields} \
+             FROM sequence(start => 18446744073709551614)"
+        );
+        let program = capability_program(&target, &query);
+        let definition = start_midway(&program, &state, &schema, 2);
+        assert_eq!(named_rows(&target), prefix);
+        finish(&program, &state);
+        assert_eq!(named_rows(&target), expected);
+        assert_completed_reopen(&program, &state, &definition);
+        assert_eq!(named_rows(&target), expected);
+    }
+}
+
+#[test]
+fn explicit_union_distinct_by_name_rejects_different_branch_widths_without_creating_state() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let target = root.path().join("union.sqlite");
+    let program = capability_program(
+        &target,
+        "SELECT CAST(value % 2 AS BIGINT) AS code, 'ok' AS label \
+         FROM sequence(start => 18446744073709551614) \
+         UNION DISTINCT BY NAME \
+         SELECT CAST(value % 2 AS BIGINT) AS code \
+         FROM sequence(start => 18446744073709551614)",
+    );
+    assert!(matches!(program.start(&state), Err(SqlError::Planning(_))));
+    assert!(!state.exists());
+    assert!(!target.exists());
+}
+
+#[test]
+fn group_by_all_and_unsorted_pipe_aggregate_use_existing_grouped_semantics() {
+    let root = tempfile::tempdir().unwrap();
+    let schema = grouped_schema();
+    for (name, query) in [
+        (
+            "all",
+            "SELECT CAST(value % 2 AS BIGINT) AS parity, COUNT(*) AS row_count \
+             FROM sequence(start => 18446744073709551612) GROUP BY ALL",
+        ),
+        (
+            "pipe",
+            "SELECT value FROM sequence(start => 18446744073709551612) \
+             |> AGGREGATE COUNT(*) AS row_count \
+             GROUP BY CAST(value % 2 AS BIGINT) AS parity",
+        ),
+    ] {
+        let state = root.path().join(format!("{name}-state"));
+        let target = root.path().join(format!("{name}.sqlite"));
+        let program = capability_program(&target, query);
+        let definition = start_midway(&program, &state, &schema, 2);
+        assert_eq!(grouped_rows(&target), [(0, 1), (1, 1)]);
+        finish(&program, &state);
+        assert_eq!(grouped_rows(&target), [(0, 2), (1, 2)]);
+        assert_completed_reopen(&program, &state, &definition);
+        assert_eq!(grouped_rows(&target), [(0, 2), (1, 2)]);
+    }
+}
+
+#[test]
+fn unused_cte_sorts_do_not_change_the_executed_relation() {
+    let root = tempfile::tempdir().unwrap();
+    let schema = Schema::new(vec![Field::new("code", DataType::Int64, false)]);
+    for (name, query) in [
+        (
+            "constant",
+            "WITH unused AS (SELECT 1 AS x ORDER BY x) \
+             SELECT CAST(value % 2 AS BIGINT) AS code \
+             FROM sequence(start => 18446744073709551614)",
+        ),
+        (
+            "shared_scan",
+            "WITH s AS (\
+                 SELECT CAST(value % 2 AS BIGINT) AS code \
+                 FROM sequence(start => 18446744073709551614)\
+             ), unused AS (SELECT code FROM s ORDER BY code) SELECT code FROM s",
+        ),
+    ] {
+        let state = root.path().join(format!("{name}-state"));
+        let target = root.path().join(format!("{name}.sqlite"));
+        let program = capability_program(&target, query);
+        let definition = start_midway(&program, &state, &schema, 1);
+        finish(&program, &state);
+        assert_eq!(codes(&target), [0, 1]);
+        assert_completed_reopen(&program, &state, &definition);
+        assert_eq!(codes(&target), [0, 1]);
+    }
+}
+
+#[test]
+fn reachable_sorts_are_rejected_during_start_without_creating_state_or_target() {
+    let root = tempfile::tempdir().unwrap();
+    let queries = [
+        "SELECT value FROM sequence(start => 0) ORDER BY value",
+        "SELECT value FROM (SELECT value FROM sequence(start => 0) ORDER BY value) AS q",
+        "WITH q AS (SELECT value FROM sequence(start => 0) ORDER BY value) SELECT value FROM q",
+        "SELECT value FROM (SELECT value FROM \
+         (SELECT value FROM sequence(start => 0) ORDER BY value) AS a) AS b",
+        "SELECT value FROM (SELECT value FROM sequence(start => 0) \
+         ORDER BY value LIMIT 1) AS q",
+        "SELECT value FROM sequence(start => 0) |> ORDER BY value DESC",
+        "SELECT value FROM (SELECT value FROM sequence(start => 0) \
+         |> ORDER BY value DESC) AS q",
+    ];
+    for (index, query) in queries.into_iter().enumerate() {
+        let parent = root.path().join(format!("parent-{index}"));
+        let state = parent.join("state");
+        let target = root.path().join(format!("{index}.sqlite"));
+        let program = capability_program(&target, query);
+        assert!(matches!(
+            program.start(&state),
+            Err(SqlError::Unsupported(_))
+        ));
+        assert!(parent.is_dir());
+        assert!(!state.exists());
+        assert!(!target.exists());
+    }
+}
+
+#[test]
+fn ignored_pipe_order_locks_and_alias_types_are_rejected_during_parse() {
+    for query in [
+        "SELECT value FROM sequence(start => 0) \
+         |> AGGREGATE COUNT(*) AS n GROUP BY value DESC",
+        "SELECT value FROM sequence(start => 0) \
+         |> AGGREGATE COUNT(*) AS n ASC GROUP BY value",
+        "WITH s AS (SELECT value FROM sequence(start => 0)), \
+         unused AS (SELECT (SELECT value FROM s FOR UPDATE) AS x FROM s) \
+         SELECT value FROM s",
+        "WITH unused AS (SELECT * FROM UNNEST(CAST(NULL AS BIGINT[])) AS t(x TEXT)) \
+         SELECT value FROM sequence(start => 18446744073709551615)",
+    ] {
+        let result = SqlProgram::parse(&format!("INSERT INTO discard() {query}"));
+        assert!(
+            matches!(&result, Err(SqlError::Unsupported(_))),
+            "{query}: {:?}",
+            result.map(|_| ())
+        );
+    }
+}
+
+#[test]
+fn long_unsupported_values_and_sort_diagnostics_remain_short() {
+    let root = tempfile::tempdir().unwrap();
+    let literal = "x".repeat(64 * 1024);
+    for (index, query) in [
+        format!("VALUES ('{literal}')"),
+        format!("SELECT value FROM sequence(start => 0) ORDER BY '{literal}'"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let state = root.path().join(format!("parent-{index}/state"));
+        let target = root.path().join(format!("{index}.sqlite"));
+        let program = capability_program(&target, &query);
+        let Err(SqlError::Unsupported(message)) = program.start(&state) else {
+            panic!("unsupported large plan must be rejected by lowering");
+        };
+        assert_eq!(message, "relational plan node");
+        assert!(message.len() < 64);
+        assert!(!message.contains(&literal));
+        assert!(!state.exists());
+        assert!(!target.exists());
+    }
+}
+
+fn capability_program(target: &Path, query: &str) -> SqlProgram {
+    let path = sql_string(target);
+    SqlProgram::parse(&format!(
+        "INSERT INTO sqlite(path => '{path}', table => 'result') {query}"
+    ))
+    .unwrap()
+}
+
+fn grouped_schema() -> Schema {
+    Schema::new(vec![
+        Field::new("parity", DataType::Int64, false),
+        Field::new("row_count", DataType::Int64, false),
+    ])
+}
+
+fn start_midway(program: &SqlProgram, state: &Path, schema: &Schema, rounds: usize) -> Vec<u8> {
+    let mut flow = program.start(state).unwrap();
+    for _ in 0..rounds {
+        assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Progressed);
+    }
+    drop(flow);
+    let definition = read_definition(state);
+    assert_sink_schema(&definition, schema);
+    definition
+}
+
+fn finish(program: &SqlProgram, state: &Path) {
+    let mut flow = program.start(state).unwrap();
+    assert_restores_to_idle(&mut flow);
+}
+
+fn assert_completed_reopen(program: &SqlProgram, state: &Path, definition: &[u8]) {
+    let mut flow = program.start(state).unwrap();
+    for _ in 0..=flow.operation_count() {
+        assert_eq!(flow.advance().unwrap(), AdvanceOutcome::Idle);
+    }
+    assert_eq!(flow.status().unwrap().depth, 0);
+    drop(flow);
+    assert_eq!(read_definition(state), definition);
+}
+
+fn read_definition(state: &Path) -> Vec<u8> {
+    let store = Store::open(state).unwrap();
+    let definition: Cell<Vec<u8>> = store.open_data("flow/definition").unwrap();
+    let read = store.read_transaction();
+    definition
+        .read(read.access())
+        .unwrap()
+        .get()
+        .unwrap()
+        .unwrap()
+}
+
+fn assert_sink_schema(encoded: &[u8], expected: &Schema) {
+    let magic = b"dogpaddle.flow\0";
+    let header = magic.len() + 2;
+    assert!(encoded.len() >= header + 4);
+    assert_eq!(&encoded[..magic.len()], magic);
+    assert_eq!(&encoded[magic.len()..header], &[0, 1]);
+    let plan: serde_json::Value =
+        serde_json::from_slice(&encoded[header..encoded.len() - 4]).unwrap();
+    let mut schemas: Vec<Option<SchemaRef>> = Vec::new();
+    for node in plan["operations"].as_array().unwrap() {
+        let inputs = node["inputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|input| {
+                let index = usize::try_from(input.as_u64().unwrap()).unwrap();
+                Arc::clone(schemas[index].as_ref().unwrap())
+            })
+            .collect::<Vec<_>>();
+        let definition: OperationDefinition =
+            serde_json::from_str(&node["definition"].to_string()).unwrap();
+        if node["id"] == "sql/sink" {
+            assert!(matches!(&definition, OperationDefinition::SqliteSink(_)));
+            assert_eq!(inputs.len(), 1);
+            assert_eq!(inputs[0].as_ref(), expected);
+            assert!(definition.output_schema(&inputs).unwrap().is_none());
+            return;
+        }
+        schemas.push(definition.output_schema(&inputs).unwrap());
+    }
+    panic!("persisted SQL definition is missing its sink");
+}
+
+fn grouped_rows(target: &Path) -> Vec<(i64, i64)> {
+    sqlite(target)
+        .prepare("SELECT parity, row_count FROM result ORDER BY parity, row_count")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+fn nullable_codes(target: &Path) -> Vec<Option<i64>> {
+    sqlite(target)
+        .prepare("SELECT \"value.code\" FROM result ORDER BY \"value.code\"")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+fn named_rows(target: &Path) -> Vec<(i64, Option<String>)> {
+    sqlite(target)
+        .prepare("SELECT \"value.code\", label FROM result ORDER BY \"value.code\", label")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+fn codes(target: &Path) -> Vec<i64> {
+    sqlite(target)
+        .prepare("SELECT code FROM result ORDER BY code")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
 }
 
 fn operation_ids(flow: &Flow) -> Vec<String> {

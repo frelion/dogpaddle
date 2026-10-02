@@ -78,9 +78,11 @@ let outcome = flow.advance()?;
 
 | API | 行为 |
 | --- | --- |
-| `SqlProgram::parse(sql)` | 纯解析 UTF-8 SQL；不读文件、不解析环境变量值、不连接外部系统 |
+| `SqlProgram::parse(sql)` | 纯解析 UTF-8 SQL，校验 endpoint 参数及会被 planner 擦除的语义；不读文件、环境值或外部系统 |
 | `SqlProgram::read(path)` | 读取 UTF-8 SQL 文件并走同一解析路径 |
 | `program.start(state)` | 状态路径不存在时编译并构建；存在时校验身份并恢复 |
+
+`parse` 校验外层语句、endpoint 参数和会被固定 planner 擦除的语义；新状态的关系能力由 `start` 用真实 source Schema 规划和 lowering 后决定。部分不支持的关系查询因此可以形成 `SqlProgram`，在 `start` 才失败。失败前可能已经解析环境值、规范化 CDC runtime 路径、创建状态父目录或读取 source 元数据；Sink 发现、Flow 数据库创建和运行构造仍在 lowering 成功之后。关系能力拒绝不会创建 Flow 状态或目标表，但缺失的父目录可能已经创建。已有状态继续直接校验身份并恢复，不重新规划。
 
 `start` 不会在恢复失败后回退为构建。状态不完整、损坏、被占用或属于另一份 Program 时都会失败，已有目录和数据保持不动。低层 Rust 用户若要直接声明 Operation 和拓扑，使用 `dogpaddle-flow` 的 `FlowFactory::build/open`。
 
@@ -191,10 +193,13 @@ CDC runtime 默认位于 executable 安装根下的 `libexec/dogpaddle/debezium`
 
 - `SELECT`、`WHERE`、字段别名、非递归 CTE 和派生查询；
 - `CAST`、`TRY_CAST`、`CASE`，以及当前表达式层支持的比较、布尔和算术表达式；
-- `SELECT DISTINCT` 和 positional `UNION ALL`；
+- `SELECT DISTINCT`、positional `UNION ALL` 和 `UNION`，以及 `UNION [ALL | DISTINCT] BY NAME`；
 - Inner、Left/Right/Full Outer、Left/Right Semi、Left/Right Anti Join；
 - left-preserving `ASOF JOIN ... MATCH_CONDITION (...) [ON ... | USING (...)]`；
-- 非空 `GROUP BY`，`COUNT`、`SUM`、`AVG`、`MIN`、`MAX`，以及只有分组字段的查询。
+- 非空 `GROUP BY`（包括 `GROUP BY ALL`）、`COUNT`、`SUM`、`AVG`、`MIN`、`MAX`、`HAVING`，以及只有分组字段的查询；
+- 经固定 planner 降为现有受支持节点的 pipe 查询；`AGGREGATE` 的表达式和分组字段不接受排序选项。
+
+`HAVING` 对聚合产生的完整正负变化执行普通 Filter。`UNION` 和 `UNION DISTINCT` 在 common Schema 的 `UnionAll` 后执行现有 Distinct；`BY NAME` 先按名称重排列并为缺失字段补 NULL，`ALL` 保留重复行，其余形式去重。固定 `DataFusion` 对显式 `UNION DISTINCT BY NAME` 另要求两个分支列数相同；普通 `UNION BY NAME` 和 `UNION ALL BY NAME` 可以接受不同列数。字段名、类型、nullability 和 metadata 仍由现有 positional `Select` 精确对齐，没有新增执行算子。
 
 每个普通 Join 至少有一个跨左右输入的等值 key。其余 `ON` 合取作为原生 residual 编译进 `EquiJoin`，
 Inner、Outer、Semi 和 Anti 都以完整条件决定记录对是否匹配；predicate 的 `false` 与 `NULL` 都不匹配。
@@ -220,11 +225,15 @@ watermark 或 retention 合同时，ASOF 仍保存两侧关系并让 right 侧�
 明确拒绝：
 
 - 普通表或未注册函数；
-- `SELECT ALL`、`DISTINCT ON`、普通 `UNION` 和非 positional `UNION ALL`；
+- `SELECT ALL` 和 `DISTINCT ON`；
 - Cross、Natural、普通等值 Join 的 `USING`，以及没有跨输入等值 key 的普通纯非等值 Join；
 - 空 `GROUP BY` 的 global aggregate、grouping sets、aggregate modifier、聚合 UDF 和不支持的类型；
-- Sort、Limit、Offset、Window、Values、EmptyRelation、DML、DDL、递归 CTE；
+- 执行关系计划中的 Sort、Limit、Offset、Window、Values、EmptyRelation、DML、DDL、递归 CTE；
 - 会在规划时丢失语义的 sampling、hint、row lock、typed alias 等语法。
+
+关闭 `enable_subquery_sort_elimination` 后，进入执行计划的普通或 pipe 排序保留为 Sort，并由同一 lowering 拒绝。固定 planner 不把未引用的 CTE 放入最终执行计划：其中不增加不可达 Scan 的排序可以接受，但不会排序或改变实际输出。AST 护栏仍遍历全部查询位置，包括投影、WHERE 的表达式子查询和未引用 CTE；被 planner 忽略的 row lock、hint、typed alias、`LIMIT ALL` 与 pipe `AGGREGATE` 排序选项仍直接拒绝。因此这里不是原有 AST 接受集合的逐项保留：先前未遍历的表达式子查询 modifier 也会在解析时被拒绝。
+
+未支持关系节点只返回短的 `relational plan node` 诊断，不把完整计划、表达式或大 literal 格式化进错误。该规则限制本层诊断的复制量，不承诺 `DataFusion` 整个解析和规划过程的内存上限。
 
 `DataFusion` 只做 parser、`SqlToRel`、`TypeCoercion` 和单条 `OptimizeProjections` 规则；SQL crate 不运行完整 logical optimizer、physical planner 或 `SessionContext`。列裁剪会把下游确实使用的列穿过 Join 和 Aggregate 推回 Scan，避免这些持久算子保存无关宽列。CDC Definition 在 Flow build 前直接采用同源引用的列并集，因此 bootstrap input Queue 和 Scan output 都不写入无用 source 列；Sequence 保持通用的 Scan 后 positional `Select`。Projection、Union 分支和 query 最终输出也通过 positional `Select` 精确保留分析后的 Arrow Schema；即使优化器删除根部 identity Projection，Sink 仍收到 SQL 字段名、nullability 和 metadata。
 
@@ -236,7 +245,7 @@ Scan ID 为 `sql/scan/{index:08x}`，logical Transform 使用稠密 `sql/transfo
 
 构建时 lowering 只接受 endpoint `TableScan`、`Filter`、`Projection`、`SubqueryAlias`、`Join`、`AsOfJoin`、`Union`、`Distinct::All` 和非空分组 `Aggregate`。
 `SubqueryAlias` 透明，Distinct 在完整 child projection 后追加，`UnionAll` 只接受 exact Schema；分支不同于 common Schema 时先 `Select`。
-只执行 `TypeCoercion` Analyzer 并关闭 `Utf8View` 映射；语法层先拒绝会被 planner 擦除的 modifier。
+只执行 `TypeCoercion` Analyzer，关闭 `Utf8View` 映射和子查询排序消除；语法层先拒绝会被 planner 擦除的 modifier，其余关系能力统一由真实 Schema 的 lowering 判断。
 SQL 的唯一静态 aggregate descriptor 同时提供 `DataFusion` UDAF metadata 与 `AggregateCall` lowering，不重复函数目录。
 同一 CTE 的重复引用复用 Scan identity。lowering 先收集各次引用投影的最小并集，让共享 CDC Scan 从 source converter 起只输出这份并集；每个引用再在进入自己的分支前选择所需子集，因此一条分支的额外列不会扩大另一条分支的 Join 或 Aggregate 状态。空并集保留事件行数与 diff。CDC Definition 的 `output_projection` 属于开发期 v1 持久布局，旧状态直接重建。任何已声明却不可达的 Scan 都在创建状态前拒绝。
 这次列并集预遍历是共享 Scan 在第一次声明前确定持久投影所必需的；随后 lowering 在每个 Scan 的同一绑定中保存列并集，将待声明的 Definition 转成 `OperationRef`，重复引用只复用该声明并做自己的列选择。

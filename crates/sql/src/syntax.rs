@@ -7,9 +7,8 @@ use crate::{
 };
 use datafusion_sql::sqlparser::{
     ast::{
-        BinaryOperator, Cte, Distinct as SelectDistinct, Expr, GroupByExpr, Ident, JoinConstraint,
-        JoinOperator, ObjectName, Query, Select, SelectFlavor, SetExpr, SetOperator, SetQuantifier,
-        TableAlias, TableAliasColumnDef, TableFactor, TableWithJoins, VisitMut, VisitorMut, With,
+        Distinct as SelectDistinct, Expr, GroupByExpr, Ident, ObjectName, PipeOperator, Query,
+        Select, SelectFlavor, TableAlias, TableFactor, TableWithJoins, VisitMut, VisitorMut,
     },
     dialect::GenericDialect,
     keywords::Keyword,
@@ -42,7 +41,6 @@ pub(crate) fn parse(sql: &str) -> Result<(SinkEndpoint, Query, Vec<ScanEndpoint>
     if contains_limit_all(&parser.into_tokens()) {
         return Err(SqlError::Unsupported("LIMIT".to_owned()));
     }
-    validate_query(&query)?;
 
     let mut collector = ScanCollector::default();
     let _ = query.visit(&mut collector);
@@ -61,10 +59,30 @@ struct ScanCollector {
 impl VisitorMut for ScanCollector {
     type Break = ();
 
+    fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
+        if let Err(error) = reject_ignored_query_parts(query) {
+            self.error = Some(error);
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_select(&mut self, select: &mut Select) -> ControlFlow<Self::Break> {
+        if let Err(error) = reject_ignored_select_parts(select) {
+            self.error = Some(error);
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    }
+
     fn pre_visit_table_factor(
         &mut self,
         table_factor: &mut TableFactor,
     ) -> ControlFlow<Self::Break> {
+        if let Err(error) = reject_ignored_table_parts(table_factor) {
+            self.error = Some(error);
+            return ControlFlow::Break(());
+        }
         let TableFactor::Table {
             name, alias, args, ..
         } = table_factor
@@ -144,187 +162,72 @@ fn contains_limit_all(tokens: &[TokenWithSpan]) -> bool {
     false
 }
 
-fn validate_query(query: &Query) -> Result<(), SqlError> {
-    let Query {
-        with,
-        body,
-        order_by,
-        limit_clause,
-        fetch,
-        locks,
-        for_clause,
-        settings,
-        format_clause,
-        pipe_operators,
-    } = query;
-    if order_by.is_some()
-        || limit_clause.is_some()
-        || fetch.is_some()
-        || !locks.is_empty()
-        || for_clause.is_some()
-        || settings.is_some()
-        || format_clause.is_some()
-        || !pipe_operators.is_empty()
+// SqlToRel and lowering own relational capabilities. Reject only syntax whose
+// meaning the pinned planner would discard before producing that plan.
+fn reject_ignored_query_parts(query: &Query) -> Result<(), SqlError> {
+    if !query.locks.is_empty()
+        || query.for_clause.is_some()
+        || query.settings.is_some()
+        || query.format_clause.is_some()
+        || query.pipe_operators.iter().any(|pipe| match pipe {
+            PipeOperator::Join(join) => join.global,
+            PipeOperator::Aggregate {
+                full_table_exprs,
+                group_by_expr,
+            } => full_table_exprs
+                .iter()
+                .chain(group_by_expr)
+                .any(|expr| expr.order_by.sort.is_some() || expr.order_by.nulls_first.is_some()),
+            _ => false,
+        })
     {
         return Err(SqlError::Unsupported("query modifier".to_owned()));
     }
-    if let Some(with) = with {
-        validate_with(with)?;
-    }
-    validate_set_expr(body)
-}
-
-fn validate_with(with: &With) -> Result<(), SqlError> {
-    let With {
-        with_token: _,
-        recursive,
-        cte_tables,
-    } = with;
-    if *recursive {
-        return Err(SqlError::Unsupported("recursive CTE".to_owned()));
-    }
-    for cte in cte_tables {
-        let Cte {
-            alias,
-            query,
-            from,
-            materialized,
-            closing_paren_token: _,
-        } = cte;
-        validate_alias(alias)?;
-        if from.is_some() || materialized.is_some() {
-            return Err(SqlError::Unsupported("CTE modifier".to_owned()));
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            reject_ignored_alias_parts(Some(&cte.alias))?;
+            if cte.from.is_some() || cte.materialized.is_some() {
+                return Err(SqlError::Unsupported("CTE modifier".to_owned()));
+            }
         }
-        validate_query(query)?;
     }
     Ok(())
 }
 
-fn validate_set_expr(expression: &SetExpr) -> Result<(), SqlError> {
-    match expression {
-        SetExpr::Select(select) => validate_select(select),
-        SetExpr::Query(query) => validate_query(query),
-        SetExpr::SetOperation {
-            left,
-            op: SetOperator::Union,
-            set_quantifier: SetQuantifier::All,
-            right,
-        } => {
-            validate_set_expr(left)?;
-            validate_set_expr(right)
-        }
-        SetExpr::SetOperation { .. } => Err(SqlError::Unsupported(
-            "set operation other than UNION ALL".to_owned(),
-        )),
-        SetExpr::Values(_)
-        | SetExpr::Insert(_)
-        | SetExpr::Update(_)
-        | SetExpr::Delete(_)
-        | SetExpr::Merge(_)
-        | SetExpr::Table(_) => Err(SqlError::Unsupported("query body".to_owned())),
-    }
-}
-
-fn validate_select(select: &Select) -> Result<(), SqlError> {
-    let Select {
-        select_token: _,
-        optimizer_hints,
-        distinct,
-        select_modifiers,
-        top,
-        top_before_distinct,
-        projection: _,
-        exclude,
-        into,
-        from,
-        lateral_views,
-        prewhere,
-        selection: _,
-        connect_by,
-        group_by,
-        cluster_by,
-        distribute_by,
-        sort_by,
-        having,
-        named_window,
-        qualify,
-        window_before_qualify,
-        value_table_mode,
-        flavor,
-    } = select;
-    let plain_group_by = matches!(
-        group_by,
-        GroupByExpr::Expressions(_, modifiers) if modifiers.is_empty()
-    );
-    if !optimizer_hints.is_empty()
-        || !matches!(distinct, None | Some(SelectDistinct::Distinct))
-        || select_modifiers.is_some()
-        || top.is_some()
-        || *top_before_distinct
-        || exclude.is_some()
-        || into.is_some()
-        || !lateral_views.is_empty()
-        || prewhere.is_some()
-        || !connect_by.is_empty()
-        || !plain_group_by
-        || !cluster_by.is_empty()
-        || !distribute_by.is_empty()
-        || !sort_by.is_empty()
-        || having.is_some()
-        || !named_window.is_empty()
-        || qualify.is_some()
-        || *window_before_qualify
-        || value_table_mode.is_some()
-        || *flavor != SelectFlavor::Standard
+fn reject_ignored_select_parts(select: &Select) -> Result<(), SqlError> {
+    let group_modifiers = match &select.group_by {
+        GroupByExpr::All(modifiers) | GroupByExpr::Expressions(_, modifiers) => modifiers,
+    };
+    if !select.optimizer_hints.is_empty()
+        || matches!(select.distinct, Some(SelectDistinct::All))
+        || select.select_modifiers.is_some()
+        || select.exclude.is_some()
+        || select.into.is_some()
+        || select.prewhere.is_some()
+        || !select.connect_by.is_empty()
+        || !group_modifiers.is_empty()
+        || select.value_table_mode.is_some()
+        || select.flavor != SelectFlavor::Standard
     {
         return Err(SqlError::Unsupported("SELECT modifier".to_owned()));
     }
-    for table in from {
-        validate_table(table)?;
+    for table in &select.from {
+        reject_global_joins(table)?;
     }
     Ok(())
 }
 
-fn validate_table(table: &TableWithJoins) -> Result<(), SqlError> {
-    let TableWithJoins { relation, joins } = table;
-    validate_table_factor(relation)?;
-    for join in joins {
-        if join.global {
-            return Err(SqlError::Unsupported("join modifier".to_owned()));
-        }
-        match &join.join_operator {
-            JoinOperator::Join(JoinConstraint::On(condition))
-            | JoinOperator::Inner(JoinConstraint::On(condition))
-            | JoinOperator::Left(JoinConstraint::On(condition))
-            | JoinOperator::LeftOuter(JoinConstraint::On(condition))
-            | JoinOperator::Right(JoinConstraint::On(condition))
-            | JoinOperator::RightOuter(JoinConstraint::On(condition))
-            | JoinOperator::FullOuter(JoinConstraint::On(condition))
-            | JoinOperator::LeftSemi(JoinConstraint::On(condition))
-            | JoinOperator::RightSemi(JoinConstraint::On(condition))
-            | JoinOperator::LeftAnti(JoinConstraint::On(condition))
-            | JoinOperator::RightAnti(JoinConstraint::On(condition)) => {
-                validate_join_condition(condition)?;
-            }
-            JoinOperator::AsOf {
-                match_condition: _,
-                constraint: JoinConstraint::On(_) | JoinConstraint::Using(_) | JoinConstraint::None,
-            } => {}
-            _ => {
-                return Err(SqlError::Unsupported("join type or constraint".to_owned()));
-            }
-        }
-        validate_table_factor(&join.relation)?;
+fn reject_global_joins(table: &TableWithJoins) -> Result<(), SqlError> {
+    if table.joins.iter().any(|join| join.global) {
+        return Err(SqlError::Unsupported("join modifier".to_owned()));
     }
     Ok(())
 }
 
-fn validate_table_factor(relation: &TableFactor) -> Result<(), SqlError> {
-    match relation {
+fn reject_ignored_table_parts(relation: &TableFactor) -> Result<(), SqlError> {
+    let alias = match relation {
         TableFactor::Table {
-            name: _,
             alias,
-            args: _,
             with_hints,
             version,
             with_ordinality,
@@ -332,78 +235,52 @@ fn validate_table_factor(relation: &TableFactor) -> Result<(), SqlError> {
             json_path,
             sample,
             index_hints,
-        } if with_hints.is_empty()
-            && version.is_none()
-            && !with_ordinality
-            && partitions.is_empty()
-            && json_path.is_none()
-            && sample.is_none()
-            && index_hints.is_empty() =>
-        {
-            validate_optional_alias(alias.as_ref())
+            ..
+        } => {
+            if !with_hints.is_empty()
+                || version.is_some()
+                || *with_ordinality
+                || !partitions.is_empty()
+                || json_path.is_some()
+                || sample.is_some()
+                || !index_hints.is_empty()
+            {
+                return Err(SqlError::Unsupported("table modifier".to_owned()));
+            }
+            alias.as_ref()
         }
         TableFactor::Derived {
             lateral,
-            subquery,
             alias,
             sample,
-        } if !lateral && sample.is_none() => {
-            validate_optional_alias(alias.as_ref())?;
-            validate_query(subquery)
+            ..
+        } => {
+            if *lateral || sample.is_some() {
+                return Err(SqlError::Unsupported("table modifier".to_owned()));
+            }
+            alias.as_ref()
         }
         TableFactor::NestedJoin {
             table_with_joins,
             alias,
         } => {
-            validate_optional_alias(alias.as_ref())?;
-            validate_table(table_with_joins)
+            reject_global_joins(table_with_joins)?;
+            alias.as_ref()
         }
-        _ => Err(SqlError::Unsupported("table modifier".to_owned())),
-    }
+        TableFactor::UNNEST { alias, .. } => alias.as_ref(),
+        _ => None,
+    };
+    reject_ignored_alias_parts(alias)
 }
 
-fn validate_join_condition(condition: &Expr) -> Result<(), SqlError> {
-    fn contains_equality_conjunct(condition: &Expr) -> bool {
-        match condition {
-            Expr::Nested(condition) => contains_equality_conjunct(condition),
-            Expr::BinaryOp {
-                left,
-                op: BinaryOperator::And,
-                right,
-            } => contains_equality_conjunct(left) || contains_equality_conjunct(right),
-            Expr::BinaryOp {
-                op: BinaryOperator::Eq,
-                ..
-            } => true,
-            _ => false,
-        }
-    }
-
-    if contains_equality_conjunct(condition) {
-        Ok(())
-    } else {
-        Err(SqlError::Unsupported(
-            "JOIN requires an equality conjunct".to_owned(),
-        ))
-    }
-}
-
-fn validate_optional_alias(alias: Option<&TableAlias>) -> Result<(), SqlError> {
-    alias.map_or(Ok(()), validate_alias)
-}
-
-fn validate_alias(alias: &TableAlias) -> Result<(), SqlError> {
-    let TableAlias {
-        explicit: _,
-        name: _,
-        columns,
-        at,
-    } = alias;
-    let typed_column = columns.iter().any(|column| {
-        let TableAliasColumnDef { name: _, data_type } = column;
-        data_type.is_some()
-    });
-    if at.is_some() || typed_column {
+fn reject_ignored_alias_parts(alias: Option<&TableAlias>) -> Result<(), SqlError> {
+    if alias.is_some_and(|alias| {
+        alias.at.is_some()
+            || alias
+                .columns
+                .iter()
+                .any(|column| column.data_type.is_some())
+    }) {
         return Err(SqlError::Unsupported("typed or indexed alias".to_owned()));
     }
     Ok(())

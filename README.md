@@ -165,7 +165,7 @@ bin/dogpaddle run SQL_FILE [--state DIR]
 | 维度 | 当前支持 |
 | --- | --- |
 | 数据源 | PostgreSQL CDC、MySQL CDC；一致初始快照与后续 WAL/binlog |
-| SQL | `SELECT`、`WHERE`、表达式、普通 `JOIN`、动态 `ASOF JOIN`、`GROUP BY`、`DISTINCT`、`UNION ALL` |
+| SQL | `SELECT`、`WHERE`、表达式、普通 `JOIN`、动态 `ASOF JOIN`、`GROUP BY` / `HAVING`、`DISTINCT`、`UNION` / `UNION ALL`（含 `BY NAME`） |
 | 普通 Join | Inner、Left/Right/Full Outer、Left/Right Semi、Left/Right Anti，以及 residual 条件 |
 | 聚合 | 非空分组上的 `COUNT`、`SUM`、`AVG`、`MIN`、`MAX` |
 | 目标端 | PostgreSQL、SQLite、ClickHouse、Doris |

@@ -65,6 +65,7 @@ impl PlanningContext {
     fn new(scans: &[OperationDefinition]) -> Result<Self, SqlError> {
         let mut options = ConfigOptions::default();
         options.sql_parser.map_string_types_to_utf8view = false;
+        options.sql_parser.enable_subquery_sort_elimination = false;
         let sources = scans
             .iter()
             .enumerate()
@@ -284,10 +285,7 @@ impl Lowerer<'_> {
                 self.add_transform(inputs, definition)
             }
             LogicalPlan::SubqueryAlias(alias) => self.lower(&alias.input),
-            _ => Err(SqlError::Unsupported(format!(
-                "relational plan node {}",
-                plan.display()
-            ))),
+            _ => Err(SqlError::Unsupported("relational plan node".to_owned())),
         }
     }
 
@@ -688,8 +686,11 @@ fn lower_aggregate_call(
     logical_schema: &DFSchema,
     physical_schema: &SchemaRef,
 ) -> Result<AggregateCall, SqlError> {
-    let Expr::AggregateFunction(AggregateFunction { func, params }) = expression.clone().unalias()
-    else {
+    let mut expression = expression;
+    while let Expr::Alias(alias) = expression {
+        expression = &alias.expr;
+    }
+    let Expr::AggregateFunction(AggregateFunction { func, params }) = expression.clone() else {
         return Err(SqlError::invalid(
             "DataFusion aggregate node contains a non-aggregate expression",
         ));

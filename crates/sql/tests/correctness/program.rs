@@ -157,7 +157,7 @@ fn parse_accepts_the_native_asof_join_surface() {
 }
 
 #[test]
-fn parse_rejects_join_constraints_and_conditions_outside_the_family() {
+fn unsupported_join_constraints_and_conditions_fail_without_creating_a_flow() {
     let queries = [
         (
             "using",
@@ -194,11 +194,12 @@ fn parse_rejects_join_constraints_and_conditions_outside_the_family() {
         ),
     ];
 
-    for (case, query) in queries {
-        assert!(
-            SqlProgram::parse(&format!("INSERT INTO discard() {query}")).is_err(),
-            "accepted {case}"
-        );
+    let root = tempfile::tempdir().unwrap();
+    for (index, (case, query)) in queries.into_iter().enumerate() {
+        let path = root.path().join(format!("join-{index}"));
+        let program = SqlProgram::parse(&format!("INSERT INTO discard() {query}")).unwrap();
+        assert!(program.start(&path).is_err(), "started {case}");
+        assert!(!path.exists(), "{case} created a Flow path");
     }
 }
 
@@ -583,11 +584,6 @@ fn unsupported_relational_plans_fail_without_creating_a_flow() {
             "SELECT value FROM sequence(start => 0) ORDER BY value",
         ),
         ("limit", "SELECT value FROM sequence(start => 0) LIMIT 1"),
-        (
-            "union distinct",
-            "SELECT value FROM sequence(start => 0) \
-             UNION SELECT value FROM sequence(start => 0)",
-        ),
         ("values", "SELECT value FROM (VALUES (1)) AS rows(value)"),
         (
             "window",

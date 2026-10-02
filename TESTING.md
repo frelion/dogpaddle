@@ -54,7 +54,7 @@ Definition 覆盖逻辑 ID、owner identity 的 Some/None 编码、自动融合�
 
 ### SQL
 
-SQL 只有一个公共 `correctness` target，并只通过 `SqlProgram::{parse,read,start}` 验证产品契约。护栏覆盖 parser/endpoint 参数契约、所有拒绝路径不创建 Flow、Sequence→SQLite 的结果与精确目标列结构、Program identity、已有状态恢复和真实 PostgreSQL 端到端恢复。普通表和全部未支持节点必须在创建 Flow 路径前拒绝，AST 层还必须拒绝 DataFusion 可能擦除的 sampling、hint、row lock、typed alias 与 `LIMIT ALL`。
+SQL 只有一个公共 `correctness` target，并只通过 `SqlProgram::{parse,read,start}` 验证产品契约。护栏覆盖 parser/endpoint 参数契约、所有拒绝路径不创建 Flow、Sequence→SQLite 的结果与精确目标列结构、Program identity、已有状态恢复和真实 PostgreSQL 端到端恢复。普通表和执行计划中的未支持节点必须在创建 Flow 状态或目标表前拒绝；新状态 `start` 的失败前可解析环境、规范化 runtime 路径、创建父目录或读取 source 元数据。AST 层必须在所有查询位置拒绝 DataFusion 可能擦除的 sampling、hint、row lock、typed alias、`LIMIT ALL` 与 pipe `AGGREGATE` 排序选项，包括未引用 CTE 和表达式子查询。
 
 CDC 固定列使用 Arrow `Fields`；公共 correctness 必须覆盖两源各自类型集合、Decimal128 范围、精确微秒/UTC、空 metadata、空投影仍完整校验，以及旧 Column JSON 拒绝。v1 literal golden 由真实 codec 验证，Flow 另验证旧列格式恢复失败不改写原定义。
 
@@ -69,6 +69,10 @@ Store/source I/O 前完成、准确映射到具体 connector、bootstrap heartbe
 和查询语义必须改变 identity。CDC 测试只用绝对 `DOGPADDLE_DEBEZIUM_RUNTIME` 指向构建产物。
 
 SQLite 结果矩阵必须覆盖别名与 qualified column、隐式 cast、CASE、TRY_CAST、算术、CTE fan-out、多 Scan、`UNION ALL` 的首分支列名、common type、nullable widening 和重复行语义，以及 `SELECT DISTINCT` 的最终 exact-row 结果；不得只断言构建或一次 advance 成功。Distinct witness 必须跨 drop/start，证明已经提交的权重状态会恢复且后续重复不会再次输出。Aggregate witness 必须在一个非空 GROUP BY 中覆盖 `COUNT(*)`、同义 `COUNT(1)`、nullable `COUNT(expr)`、signed/unsigned SUM、signed/unsigned AVG、MIN/MAX 的最终关系并跨 drop/start；纯分组另有最终结果 witness。global aggregate、grouping sets、聚合 modifier/UDF、浮点 group key 与未支持参数类型必须证明不创建 Flow。不可达 Scan 声明也必须有同样的无目录副作用证据。公共链路同时验证稳定逻辑 Operation ID、持久调用位置与 drop/start 后最终关系；语义相同但格式或 endpoint 参数顺序不同的 SQL 必须能恢复，语义或持久 endpoint 身份不同的 Program 必须因 owner identity mismatch 失败且不能替换磁盘 Definition。损坏、不完整、已存在但不可打开或被占用的状态不得触发自动重建。每新增一种 SQL LogicalPlan lowering，都必须增加至少一个最终结果 witness；每新增一种明确拒绝的节点，都必须增加无目录副作用 witness。真实 PostgreSQL SQL gate 另外覆盖 `postgres_cdc → CTE/Filter/nullable UnionAll → postgres`、已结算后的进程终止与 start 保持最终关系和技术 ID；目标提交后本地结算前的输入前缀重投由直接 Sink 系统 gate 验证；CDC gate 使用预先写入的非空源，分别在 terminal capture commit 后 ACK 前和 2050 行快照中途 commit 后 ACK 前杀进程，验证 start 会恢复既有状态、丢弃未封口的私有 spool、完整重拍且只发布一次，再继续消费 WAL。
+
+SQL 关系能力只由真实 Schema 的现有 lowering 判断。新增 `HAVING` witness 必须验证 old negative 和 new positive 被筛选后的完整变化；`UNION`、`UNION DISTINCT` 与三种 `BY NAME` 形式覆盖重复、NULL、common type、字段重排和缺失列补 NULL，显式 `UNION DISTINCT BY NAME` 另保留固定 planner 的等宽分支限制及不等宽拒绝证据；`GROUP BY ALL` 与无排序的 pipe Aggregate 验证完整分组结果。固定有限 Sequence 的手写 bag 作为独立结果 oracle；从持久 Definition 通过公开 `OperationDefinition::output_schema` 核对完整 Arrow Schema，而不以 SQLite affinity 代替字段类型、nullability 或 metadata。新能力都跨未完成与完成后的 drop/start，原有支持查询的身份和装配 golden 不改期望。
+
+普通与 pipe Sort 在顶层、派生查询和实际引用 CTE 中都须在新状态 `start` 拒绝；不进入最终执行关系的未引用 CTE Sort 明确可以接受，必须证明最终完整关系不变。pipe Aggregate 被 planner 忽略的两组排序选项在 parse 拒绝。大 literal 的 Sort 与 Values 另外断言短的通用未支持节点诊断、Flow 和目标均未创建；不把短诊断证据扩大为整个 planner 的资源保证。
 
 Join 的 SQL witness 必须覆盖 Inner、Left/Right/Full Outer 与 Left/Right Semi/Anti 的最终关系和 drop/start 恢复；
 Right lowering 还要断言原 SQL 字段顺序与 nullability。所有 Join family 的 residual 必须证明 predicate
