@@ -2,7 +2,7 @@ use std::io::{self, Write};
 
 use super::{
     definition::FlowDefinition,
-    validate::{self, ResolvedTopology, TopologyError},
+    validate::{self, TopologyError},
 };
 use thiserror::Error;
 
@@ -65,9 +65,7 @@ pub(crate) fn encode(definition: &FlowDefinition) -> Result<Vec<u8>, FlowDefinit
     Ok(encoded)
 }
 
-pub(crate) fn decode(
-    encoded: &[u8],
-) -> Result<(FlowDefinition, ResolvedTopology), FlowDefinitionError> {
+pub(crate) fn decode(encoded: &[u8]) -> Result<FlowDefinition, FlowDefinitionError> {
     if encoded.len() > MAX_DEFINITION_BYTES {
         return Err(FlowDefinitionError::LengthOverflow("definition"));
     }
@@ -106,8 +104,8 @@ pub(crate) fn decode(
     if !comparison.matches || comparison.position != payload.len() {
         return Err(FlowDefinitionError::NonCanonical);
     }
-    let topology = validate::resolve(&definition)?;
-    Ok((definition, topology))
+    validate::validate_definition(&definition)?;
+    Ok(definition)
 }
 
 fn json_error(error: &serde_json::Error) -> FlowDefinitionError {

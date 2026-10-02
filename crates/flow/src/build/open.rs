@@ -20,12 +20,12 @@ impl FlowFactory {
             .read(store.read_transaction().access())?
             .get_bounded(codec::MAX_DEFINITION_BYTES)?
             .ok_or(FlowError::IncompleteBuild)?;
-        let (definition, topology) = codec::decode(&encoded)?;
+        let definition = codec::decode(&encoded)?;
         if definition.owner_identity != self.owner_identity {
             return Err(FlowError::OwnerIdentityMismatch);
         }
         let resources = preflight_resources(&definition, self.resources)?;
-        let mut runtime = construct(definition, topology, &mut store.data_scope(), resources)?;
+        let mut runtime = construct(definition, &mut store.data_scope(), resources)?;
         runtime.restore(store.read_transaction().access())?;
         let (transactions, reads) = store.into_transactions().split();
         Ok(Flow::from_parts(self.path, runtime, transactions, reads))

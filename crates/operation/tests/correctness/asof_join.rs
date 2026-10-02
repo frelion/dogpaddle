@@ -6,7 +6,7 @@ use arrow_array::{Array, Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    OperationDefinition, OperationKind, RuntimeResource, col,
+    OperationDefinition, RuntimeResource, col,
     operation::{
         Operation, OperationError, OperationInput, Progress, Resume, Step, StepBudget,
         transform::{
@@ -17,7 +17,7 @@ use dogpaddle_operation::{
 use dogpaddle_store::{
     Cell, OrderedMap, ScanDirection, ScanLimit, Store, StoreSetup, Transactions,
 };
-use std::{collections::BTreeMap, num::NonZeroU32, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 
 type Row = (Option<u64>, Option<i64>, i64);
 type ResultRow = (Row, Option<Row>);
@@ -486,10 +486,7 @@ fn the_current_v1_payload_and_layout_reject_retired_asof_capabilities() {
         serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(&decoded).unwrap(),
         literal
     );
-    assert_eq!(
-        decoded.kind(),
-        OperationKind::PagedTransform(NonZeroU32::new(2).unwrap())
-    );
+    assert_eq!(decoded.input_count(), 2);
     let mut payload =
         serde_json::to_value(definition(AsOfDirection::Backward { allow_exact: true })).unwrap();
     payload["tolerance"] = serde_json::json!(1);

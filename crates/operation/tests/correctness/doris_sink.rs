@@ -1,8 +1,8 @@
-use std::{num::NonZeroU32, sync::Arc};
+use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dogpaddle_operation::{
-    OperationBindError, OperationDefinition, OperationKind, OperationSetupError, RuntimeResource,
+    OperationBindError, OperationDefinition, OperationSetupError, RuntimeResource,
     operation::sink::{DorisSinkConfig, DorisSinkDefinition, DorisSinkError, DorisSinkSchemaError},
 };
 use dogpaddle_store::{Cell, OrderedMap, Store, StoreSetup};
@@ -44,8 +44,8 @@ fn doris_sink_has_canonical_non_secret_variant_bytes() {
             .unwrap();
     assert_eq!(encoded, literal_definition_bytes());
     assert_eq!(
-        OperationDefinition::from(definition.clone()).kind(),
-        OperationKind::Sink(NonZeroU32::MIN)
+        OperationDefinition::from(definition.clone()).input_count(),
+        1
     );
     let decoded =
         serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&encoded).unwrap();

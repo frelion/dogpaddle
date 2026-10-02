@@ -4,7 +4,7 @@ use arrow_array::{Int64Array, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    OperationBindError, OperationDefinition, OperationKind, RuntimeResource,
+    OperationBindError, OperationDefinition, RuntimeResource,
     operation::{
         OperationInput,
         transform::{UnionAllDefinition, UnionAllError, UnionAllSchemaError},
@@ -73,11 +73,7 @@ fn union_all_requires_its_non_zero_arity_and_exact_input_schema() {
 #[test]
 fn literal_definition_preserves_arity_binding_and_data_contract() {
     let definition = UnionAllDefinition::new(NonZeroU32::new(2).unwrap());
-    let decoded = assert_literal_definition(
-        &definition,
-        UNION_ALL_V1,
-        OperationKind::AtomicTransform(NonZeroU32::new(2).unwrap()),
-    );
+    let decoded = assert_literal_definition(&definition, UNION_ALL_V1, 2);
     assert_eq!(definition.input_count().get(), 2);
     let inputs = [value_schema(), value_schema()];
     assert_eq!(

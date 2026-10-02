@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    num::NonZeroU32,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::Arc,
 };
@@ -9,7 +8,7 @@ use arrow_array::{Array, Int64Array, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_change::{Change, SchemaError};
 use dogpaddle_operation::{
-    Expr, ExpressionBindError, OperationBindError, OperationKind, ProjectionError, col, lit,
+    Expr, ExpressionBindError, OperationBindError, ProjectionError, col, lit,
     operation::{
         OperationInput,
         transform::{SelectDefinition, SelectSchemaError},
@@ -36,11 +35,7 @@ fn persisted_definition() -> SelectDefinition {
 #[test]
 fn literal_definition_reconstructs_ordered_fields_binding_and_runtime() {
     let definition = persisted_definition();
-    let decoded = assert_literal_definition(
-        &definition,
-        SELECT_V1,
-        OperationKind::AtomicTransform(NonZeroU32::MIN),
-    );
+    let decoded = assert_literal_definition(&definition, SELECT_V1, 1);
     let expected_fields = [
         ("renamed", col("value")),
         ("next", col("value") + lit(1_u64)),

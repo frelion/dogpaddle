@@ -8,7 +8,7 @@ use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    OperationBindError, OperationDefinition, OperationKind, OperationSetupError, RuntimeResource,
+    OperationBindError, OperationDefinition, OperationSetupError, RuntimeResource,
     operation::{
         Operation, OperationError, SinkPending,
         sink::{SqliteSinkDefinition, SqliteSinkDefinitionError, SqliteSinkSchemaError},
@@ -25,11 +25,7 @@ const SQLITE_SINK_V1: &str = include_str!("../fixtures/v1/sqlite_sink_output_eve
 fn sqlite_sink_definition_has_stable_v1_literal_and_public_contract() {
     let sqlite =
         SqliteSinkDefinition::try_new("/var/lib/dogpaddle/output.sqlite", "events").unwrap();
-    let decoded = assert_literal_definition(
-        &sqlite,
-        SQLITE_SINK_V1,
-        OperationKind::Sink(std::num::NonZeroU32::MIN),
-    );
+    let decoded = assert_literal_definition(&sqlite, SQLITE_SINK_V1, 1);
     assert_eq!(
         sqlite.database_path(),
         Path::new("/var/lib/dogpaddle/output.sqlite")

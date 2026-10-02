@@ -13,7 +13,7 @@ JSON 错误只报告静态类别和行列，不保留原始 serde 错误或表�
 
 
 根必须是 Source，叶必须是 Sink，输入数量与角色相符，所有输入有输出。构建引用必须来自同一 factory 的较早声明；持久解码同样要求每条输入 ordinal 严格小于当前节点 ordinal，因此图按声明序天然无环。向前引用、自引用和越界输入统一拒绝，不另维护拓扑排序或运行 schedule。任何 DAG 都可按拓扑声明表达。
-新建只解析一次这份原始计划的连接、融合和深度，编码仅用于持久保存，不进行整图 encode→decode 往返；open 才完整解码和重新验证。所有 Schema 与资源先绑定，再由一笔 StoreSetup 事务发布 catalog 和 Definition。
+新建先检查图名称、前向引用和纯 arity，再全量预检 runtime 资源；按声明序构造节点后，从实际 `Operation` variants 推导角色、融合和深度，最后绑定所需 codec。全部检查早于 StoreSetup 事务发布 catalog 和 Definition。编码仅用于持久保存，不进行整图 encode→decode 往返；open 才完整解码 canonical 计划并按同一路径只读绑定，允许缺失资源或绑定失败优先于角色或深度错误。
 Operation 状态前缀为 `operation/{ordinal:08x}`，逻辑 ordinal 与持久 Definition 一致。
 装配按声明序消费每个 Definition，复用其 ID 与 inputs 进入一个 RuntimeNode；该节点直接拥有已构造的 Operation、必要的 output codec 和线性的 pending Delivery。运行期不另保留完整纯计划或 Operation/codec/pending 平行数组；Source/Sink 角色直接由已构造的 Operation 表达。持久 Definition 和调用栈格式不变，open 重新解析并绑定后同样释放纯计划。Flow 不保留表达式逻辑 AST 与 protobuf 根；已编译表达式可能共享其必要值，调用者另存的 Definition 也可延长原计划生命周期，因此这不是进程 RSS 上限。
 

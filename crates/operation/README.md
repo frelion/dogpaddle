@@ -47,14 +47,14 @@ Definition 是可持久化的纯计划，不持有数据库句柄、连接、密
 
 ## 计算能力与分页
 
-`OperationKind` 声明业务角色、输入 arity 和融合资格：
+Definition 只声明纯输入数量；构造后的 `Operation` 是角色与融合资格的唯一权威：
 
-| kind | 输入 / 输出 | 执行能力 |
+| runtime variant | 输入 / 输出 | 执行能力 |
 | --- | --- | --- |
-| `Scan` | 0 / 有输出 | Source capture；已捕获数据的 identity 切片可作为计算 head |
-| `AtomicTransform(N)` | N / 有输出 | `AtomicOperation::apply` 完整处理当前 slice |
-| `PagedTransform(N)` | N / 有输出 | `PagedOperation::step` 处理有界扫描或修正页 |
-| `Sink(N)` | N / 无输出 | 私有 outbox enqueue 与独立外部 drain |
+| `Source` | 0 / 有输出 | Source capture；已捕获数据的 identity 切片可作为计算 head |
+| `Atomic` | N / 有输出 | `AtomicOperation::apply` 完整处理当前 slice |
+| `Paged` | N / 有输出 | `PagedOperation::step` 处理有界扫描或修正页 |
+| `Sink` | N / 无输出 | 私有 outbox enqueue 与独立外部 drain |
 
 计算 head 可以接单输入 Atomic 尾链；链的编译索引只在内存中存在。
 尾项直接 `apply`，不创建自己的帧、队列、Resume 或生命周期。

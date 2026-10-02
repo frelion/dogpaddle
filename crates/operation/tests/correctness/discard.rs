@@ -1,7 +1,5 @@
-use std::num::NonZeroU32;
-
 use dogpaddle_operation::{
-    OperationDefinition, OperationKind, RuntimeResource, operation::sink::DiscardDefinition,
+    OperationDefinition, RuntimeResource, operation::sink::DiscardDefinition,
 };
 use dogpaddle_store::StoreSetup;
 
@@ -19,11 +17,7 @@ fn decoded_definition() -> OperationDefinition {
 #[test]
 fn definition_has_stable_v1_literal_and_is_a_data_free_exact_sink() {
     let definition = DiscardDefinition::new();
-    let decoded = assert_literal_definition(
-        &definition,
-        DISCARD_V1,
-        OperationKind::Sink(NonZeroU32::MIN),
-    );
+    let decoded = assert_literal_definition(&definition, DISCARD_V1, 1);
     assert!(
         construct_checked(&decoded, &[value_schema()])
             .unwrap()

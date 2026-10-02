@@ -6,8 +6,8 @@ pub mod operation;
 mod resource;
 
 pub use definition::{
-    ConstructedOperation, OperationBindError, OperationDefinition, OperationKind,
-    OperationSchemaError, OperationSetupError,
+    ConstructedOperation, OperationBindError, OperationDefinition, OperationSchemaError,
+    OperationSetupError,
 };
 pub use expression::{
     Expr, ExpressionBindError, ExpressionDefinitionError, ExpressionError, Operator,

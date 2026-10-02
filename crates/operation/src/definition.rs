@@ -1,4 +1,4 @@
-use std::{any::TypeId, error::Error, num::NonZeroU32};
+use std::{any::TypeId, error::Error};
 
 use arrow_schema::SchemaRef;
 use dogpaddle_change::{SchemaError, validate_schema};
@@ -15,56 +15,6 @@ use crate::{
 
 /// Type-erased error from a concrete operation's pure Schema compiler.
 pub type OperationSchemaError = Box<dyn Error + Send + Sync + 'static>;
-
-const TWO_INPUTS: NonZeroU32 = NonZeroU32::new(2).expect("two is nonzero");
-
-/// Declared execution role and exact input arity of an operation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum OperationKind {
-    /// Zero-input source with a dedicated capture protocol.
-    Scan,
-    /// Transaction-local transform with the given nonzero input arity.
-    AtomicTransform(NonZeroU32),
-    /// Paged transform that may head an atomic tail.
-    PagedTransform(NonZeroU32),
-    /// Outputless terminal operation.
-    Sink(NonZeroU32),
-}
-impl OperationKind {
-    /// Returns the exact number of ordered inputs.
-    #[must_use]
-    pub const fn input_count(self) -> u32 {
-        match self {
-            Self::Scan => 0,
-            Self::AtomicTransform(n) | Self::PagedTransform(n) | Self::Sink(n) => n.get(),
-        }
-    }
-
-    /// Returns whether this kind is a Scan.
-    #[must_use]
-    pub const fn is_scan(self) -> bool {
-        matches!(self, Self::Scan)
-    }
-
-    /// Returns whether this kind is a sink.
-    #[must_use]
-    pub const fn is_sink(self) -> bool {
-        matches!(self, Self::Sink(_))
-    }
-
-    /// Returns whether this kind completely consumes its offered input slice in the current transaction.
-    #[must_use]
-    pub const fn is_atomic(self) -> bool {
-        matches!(self, Self::AtomicTransform(_))
-    }
-
-    /// Returns whether this kind owns an output stream.
-    #[must_use]
-    pub const fn has_output(self) -> bool {
-        !matches!(self, Self::Sink(_))
-    }
-}
 
 /// Persistent, typed plan for one built-in operation.
 ///
@@ -259,25 +209,23 @@ impl ConstructedOperation {
 }
 
 impl OperationDefinition {
-    /// Returns the execution role and exact input arity.
+    /// Returns the exact number of ordered input schemas required for binding.
     #[must_use]
-    pub fn kind(&self) -> OperationKind {
+    pub fn input_count(&self) -> u32 {
         match self {
-            Self::MySqlCdcScan(_) | Self::PostgresCdcScan(_) | Self::SequenceScan(_) => {
-                OperationKind::Scan
-            }
-            Self::AsOfJoin(_) | Self::EquiJoin(_) => OperationKind::PagedTransform(TWO_INPUTS),
-            Self::UnionAll(definition) => OperationKind::AtomicTransform(definition.input_count()),
+            Self::MySqlCdcScan(_) | Self::PostgresCdcScan(_) | Self::SequenceScan(_) => 0,
+            Self::AsOfJoin(_) | Self::EquiJoin(_) => 2,
+            Self::UnionAll(definition) => definition.input_count().get(),
             Self::Aggregate(_)
             | Self::Distinct(_)
             | Self::RunningEventCount(_)
             | Self::Filter(_)
-            | Self::Select(_) => OperationKind::AtomicTransform(NonZeroU32::MIN),
-            Self::ClickHouseSink(_)
+            | Self::Select(_)
+            | Self::ClickHouseSink(_)
             | Self::Discard(_)
             | Self::DorisSink(_)
             | Self::PostgresSink(_)
-            | Self::SqliteSink(_) => OperationKind::Sink(NonZeroU32::MIN),
+            | Self::SqliteSink(_) => 1,
         }
     }
 
@@ -373,16 +321,16 @@ impl OperationDefinition {
     ///
     /// # Errors
     /// Returns an error for invalid plan data, input arity or Schemas, a concrete Schema rejection, or an
-    /// output whose presence or logical Schema violates the declared operation kind.
+    /// output whose logical Schema is invalid.
     pub fn output_schema(
         &self,
         inputs: &[SchemaRef],
     ) -> Result<Option<SchemaRef>, OperationBindError> {
-        validate_inputs(self.kind(), inputs)?;
+        validate_inputs(self.input_count(), inputs)?;
         let output = self
             .output_schema_unchecked(inputs)
             .map_err(|source| OperationBindError::Rejected { source })?;
-        validate_output(self.kind(), output.as_ref())?;
+        validate_output(output.as_ref())?;
         Ok(output)
     }
 
@@ -400,19 +348,14 @@ impl OperationDefinition {
         data: &mut DataScope<'_>,
         resource: RuntimeResource,
     ) -> Result<ConstructedOperation, OperationSetupError> {
-        let kind = self.kind();
-        validate_inputs(kind, inputs)?;
+        validate_inputs(self.input_count(), inputs)?;
         resource.validate(self.resource_type())?;
         let built = self.construct_unchecked(inputs, data, resource)?;
-        validate_output(kind, built.output_schema.as_ref())?;
-        if !matches!(
-            (kind, &built.operation),
-            (OperationKind::AtomicTransform(_), Operation::Atomic(_))
-                | (OperationKind::Scan, Operation::Source(_))
-                | (OperationKind::PagedTransform(_), Operation::Paged(_))
-                | (OperationKind::Sink(_), Operation::Sink(_))
-        ) {
-            return Err(OperationSetupError::ExecutionKind);
+        validate_output(built.output_schema.as_ref())?;
+        match (&built.operation, built.output_schema.is_some()) {
+            (Operation::Sink(_), true) => return Err(OperationBindError::UnexpectedOutput.into()),
+            (Operation::Sink(_), false) | (_, true) => {}
+            (_, false) => return Err(OperationBindError::MissingOutput.into()),
         }
         Ok(built)
     }
@@ -426,8 +369,8 @@ impl OperationDefinition {
     }
 }
 
-fn validate_inputs(kind: OperationKind, inputs: &[SchemaRef]) -> Result<(), OperationBindError> {
-    let expected = kind.input_count() as usize;
+fn validate_inputs(input_count: u32, inputs: &[SchemaRef]) -> Result<(), OperationBindError> {
+    let expected = input_count as usize;
     if inputs.len() != expected {
         return Err(OperationBindError::InputCount {
             expected,
@@ -441,17 +384,12 @@ fn validate_inputs(kind: OperationKind, inputs: &[SchemaRef]) -> Result<(), Oper
     Ok(())
 }
 
-fn validate_output(
-    kind: OperationKind,
-    output: Option<&SchemaRef>,
-) -> Result<(), OperationBindError> {
-    match (kind.has_output(), output) {
-        (true, None) => Err(OperationBindError::MissingOutput),
-        (false, Some(_)) => Err(OperationBindError::UnexpectedOutput),
-        (true, Some(schema)) => validate_schema(schema)
-            .map_err(|source| OperationBindError::InvalidOutputSchema { source }),
-        (false, None) => Ok(()),
+fn validate_output(output: Option<&SchemaRef>) -> Result<(), OperationBindError> {
+    if let Some(schema) = output {
+        validate_schema(schema)
+            .map_err(|source| OperationBindError::InvalidOutputSchema { source })?;
     }
+    Ok(())
 }
 
 #[derive(Debug, Error)]
@@ -470,17 +408,15 @@ pub enum OperationBindError {
         #[source]
         source: OperationSchemaError,
     },
-    #[error("operation kind requires an output schema but construction has none")]
+    #[error("computing operation requires an output schema but construction has none")]
     MissingOutput,
-    #[error("outputless operation kind constructed an output schema")]
+    #[error("sink constructed an output schema")]
     UnexpectedOutput,
     #[error("operation output schema is invalid: {source}")]
     InvalidOutputSchema {
         #[source]
         source: SchemaError,
     },
-    #[error("operation execution capability does not match its declared kind")]
-    ExecutionKind,
 }
 
 #[derive(Debug, Error)]
@@ -501,8 +437,6 @@ pub enum OperationSetupError {
     UnexpectedRuntimeResource,
     #[error(transparent)]
     Store(#[from] dogpaddle_store::StoreError),
-    #[error("operation construction execution capability does not match its declared kind")]
-    ExecutionKind,
 }
 
 pub(crate) fn schema_error<E>(source: E) -> OperationSetupError

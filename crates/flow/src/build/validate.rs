@@ -2,6 +2,8 @@ use super::{
     DeclaredOperation, OperationRef,
     definition::{FlowDefinition, OperationNode},
 };
+use crate::flow::RuntimeNode;
+use dogpaddle_operation::operation::Operation;
 use std::collections::HashSet;
 use thiserror::Error;
 
@@ -96,7 +98,7 @@ pub(super) fn finish_definition(
     owner_identity: Option<[u8; 32]>,
     token: u64,
     declarations: Vec<DeclaredOperation>,
-) -> Result<(FlowDefinition, ResolvedTopology), TopologyError> {
+) -> Result<FlowDefinition, TopologyError> {
     let mut operations = Vec::with_capacity(declarations.len());
     for declaration in declarations {
         let inputs = declaration
@@ -120,15 +122,11 @@ pub(super) fn finish_definition(
         owner_identity,
         operations,
     };
-    let topology = resolve(&definition)?;
-    Ok((definition, topology))
+    validate_definition(&definition)?;
+    Ok(definition)
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "Keep bounded DAG validation and derived call indices together."
-)]
-pub(crate) fn resolve(definition: &FlowDefinition) -> Result<ResolvedTopology, TopologyError> {
+pub(crate) fn validate_definition(definition: &FlowDefinition) -> Result<(), TopologyError> {
     let nodes = &definition.operations;
     if nodes.is_empty() {
         return Err(TopologyError::EmptyTopology);
@@ -157,12 +155,11 @@ pub(crate) fn resolve(definition: &FlowDefinition) -> Result<ResolvedTopology, T
             return Err(TopologyError::DuplicateOperationId(node.id.clone()));
         }
     }
-    let mut consumers = vec![Vec::new(); nodes.len()];
     for (index, node) in nodes.iter().enumerate() {
         if node.inputs.len() > MAX_OPERATIONS {
             return Err(TopologyError::Limit("1024 inputs per operation"));
         }
-        let expected = node.definition.kind().input_count() as usize;
+        let expected = node.definition.input_count() as usize;
         if expected != node.inputs.len() {
             return Err(TopologyError::InputCount {
                 operation: node.id.clone(),
@@ -170,20 +167,22 @@ pub(crate) fn resolve(definition: &FlowDefinition) -> Result<ResolvedTopology, T
                 actual: node.inputs.len(),
             });
         }
-        for (port, &input) in node.inputs.iter().enumerate() {
-            let producer =
-                nodes[..index]
-                    .get(input)
-                    .ok_or_else(|| TopologyError::InputNotEarlier {
-                        operation: node.id.clone(),
-                        input,
-                    })?;
-            if !producer.definition.kind().has_output() {
-                return Err(TopologyError::InputHasNoOutput {
+        for &input in &node.inputs {
+            if input >= index {
+                return Err(TopologyError::InputNotEarlier {
                     operation: node.id.clone(),
-                    input: producer.id.clone(),
+                    input,
                 });
             }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn resolve(nodes: &[RuntimeNode]) -> Result<ResolvedTopology, TopologyError> {
+    let mut consumers = vec![Vec::new(); nodes.len()];
+    for (index, node) in nodes.iter().enumerate() {
+        for (port, &input) in node.inputs.iter().enumerate() {
             consumers[input].push(Consumer {
                 operation: index,
                 port,
@@ -191,10 +190,10 @@ pub(crate) fn resolve(definition: &FlowDefinition) -> Result<ResolvedTopology, T
         }
     }
     for (index, node) in nodes.iter().enumerate() {
-        if node.inputs.is_empty() && !node.definition.kind().is_scan() {
+        if node.inputs.is_empty() && !matches!(&node.operation, Operation::Source(_)) {
             return Err(TopologyError::RootIsNotScan(node.id.clone()));
         }
-        if consumers[index].is_empty() && !node.definition.kind().is_sink() {
+        if consumers[index].is_empty() && !matches!(&node.operation, Operation::Sink(_)) {
             return Err(TopologyError::TerminalIsNotSink(node.id.clone()));
         }
     }
@@ -202,7 +201,7 @@ pub(crate) fn resolve(definition: &FlowDefinition) -> Result<ResolvedTopology, T
     let mut heads = vec![true; nodes.len()];
     let mut head_of = (0..nodes.len()).collect::<Vec<_>>();
     for (index, node) in nodes.iter().enumerate() {
-        if node.definition.kind().is_atomic() && node.inputs.len() == 1 {
+        if matches!(&node.operation, Operation::Atomic(_)) && node.inputs.len() == 1 {
             let producer = node.inputs[0];
             if consumers[producer].len() == 1 {
                 let head = head_of[producer];
@@ -214,7 +213,7 @@ pub(crate) fn resolve(definition: &FlowDefinition) -> Result<ResolvedTopology, T
     }
     let mut depth = vec![0; nodes.len()];
     for (index, node) in nodes.iter().enumerate() {
-        if !heads[index] || node.definition.kind().is_sink() {
+        if !heads[index] || matches!(&node.operation, Operation::Sink(_)) {
             continue;
         }
         depth[index] = node

@@ -2,7 +2,7 @@ use super::support::{TestStore, assert_literal_definition, construct_checked, va
 use arrow_array::UInt64Array;
 use dogpaddle_change::SchemaBoundChangeCodec;
 use dogpaddle_operation::{
-    OperationDefinition, OperationKind, RuntimeResource,
+    OperationDefinition, RuntimeResource,
     operation::{Operation, scan::SequenceScanDefinition},
 };
 use dogpaddle_store::{Store, StoreSetup};
@@ -10,7 +10,7 @@ const SEQUENCE_V1: &str = include_str!("../fixtures/v1/sequence_scan_start_42.he
 #[test]
 fn definition_has_stable_v1_literal_exact_schema_and_published_queue() {
     let definition = SequenceScanDefinition::new(42);
-    let decoded = assert_literal_definition(&definition, SEQUENCE_V1, OperationKind::Scan);
+    let decoded = assert_literal_definition(&definition, SEQUENCE_V1, 0);
     assert_eq!(definition.start(), 42);
     assert_eq!(
         construct_checked(&decoded, &[]).unwrap().as_ref(),

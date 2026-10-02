@@ -1,11 +1,11 @@
-use std::{collections::BTreeMap, num::NonZeroU32, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 
 use crate::support::TestStore;
 use arrow_array::{Array, Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    OperationDefinition, OperationKind, RuntimeResource, col, lit,
+    OperationDefinition, RuntimeResource, col, lit,
     operation::{
         Operation, OperationError, OperationInput, Progress, Resume, Step, StepBudget,
         transform::{EquiJoinDefinition, EquiJoinError, EquiJoinKind},
@@ -512,10 +512,7 @@ fn definitions_keep_the_five_literal_golden_payloads_and_no_operator_cursor_reso
         let decoded =
             serde_json::from_slice::<OperationDefinition>(&crate::support::decode_hex(literal))
                 .unwrap();
-        assert_eq!(
-            decoded.kind(),
-            OperationKind::PagedTransform(NonZeroU32::new(2).unwrap())
-        );
+        assert_eq!(decoded.input_count(), 2);
         assert_eq!(
             serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(&decoded).unwrap(),
             crate::support::decode_hex(literal)

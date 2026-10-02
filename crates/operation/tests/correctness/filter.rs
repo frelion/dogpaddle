@@ -1,4 +1,4 @@
-use std::{num::NonZeroU32, sync::Arc};
+use std::sync::Arc;
 
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Int64Array,
@@ -8,7 +8,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    Expr, ExpressionError, OperationKind, Operator, ScalarValue, col, lit,
+    Expr, ExpressionError, Operator, ScalarValue, col, lit,
     operation::{
         OperationInput,
         transform::{FilterDefinition, FilterError},
@@ -59,11 +59,7 @@ fn literal_definition_reconstructs_predicate_binding_and_runtime() {
     let input = value_schema();
     let predicate = complex_predicate();
     let definition = FilterDefinition::try_new(predicate.clone()).unwrap();
-    let decoded = assert_literal_definition(
-        &definition,
-        FILTER_V1,
-        OperationKind::AtomicTransform(NonZeroU32::MIN),
-    );
+    let decoded = assert_literal_definition(&definition, FILTER_V1, 1);
     assert_eq!(definition.predicate(), &predicate);
     assert_eq!(
         construct_checked(&decoded, std::slice::from_ref(&input))

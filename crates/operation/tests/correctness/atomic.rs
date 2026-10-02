@@ -5,7 +5,7 @@ use arrow_schema::{DataType, Field, Schema};
 use datafusion_expr::placeholder;
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    OperationDefinition, OperationKind, col,
+    OperationDefinition, RuntimeResource, col,
     operation::{
         AtomicOperation, Operation, OperationInput, StepBudget,
         transform::{
@@ -18,12 +18,8 @@ use dogpaddle_store::StoreSetup;
 
 use super::support::{TestStore, stateless_operation};
 
-fn unary() -> NonZeroU32 {
-    NonZeroU32::MIN
-}
-
 #[test]
-fn transform_kind_declares_atomic_execution_explicitly() {
+fn transform_construction_exposes_atomic_execution() {
     let definitions: Vec<OperationDefinition> = vec![
         FilterDefinition::try_new(col("keep")).unwrap().into(),
         SelectDefinition::try_new([("id", col("id"))])
@@ -35,14 +31,36 @@ fn transform_kind_declares_atomic_execution_explicitly() {
             .unwrap()
             .into(),
     ];
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::UInt64, false),
+        Field::new("keep", DataType::Boolean, false),
+    ]));
     for definition in definitions {
-        assert_eq!(definition.kind(), OperationKind::AtomicTransform(unary()));
+        assert_eq!(definition.input_count(), 1);
+        let mut setup = StoreSetup::new();
+        let (operation, _) = definition
+            .construct(
+                &[Arc::clone(&schema)],
+                &mut setup.data_scope(),
+                RuntimeResource::none(),
+            )
+            .unwrap()
+            .into_parts();
+        assert!(matches!(operation, Operation::Atomic(_)));
     }
     let union = UnionAllDefinition::new(NonZeroU32::new(2).unwrap());
-    assert_eq!(
-        OperationDefinition::from(union).kind(),
-        OperationKind::AtomicTransform(NonZeroU32::new(2).unwrap())
-    );
+    let union = OperationDefinition::from(union);
+    assert_eq!(union.input_count(), 2);
+    let mut setup = StoreSetup::new();
+    let (operation, _) = union
+        .construct(
+            &[Arc::clone(&schema), schema],
+            &mut setup.data_scope(),
+            RuntimeResource::none(),
+        )
+        .unwrap()
+        .into_parts();
+    assert!(matches!(operation, Operation::Atomic(_)));
 }
 
 #[test]

@@ -1,8 +1,8 @@
-use std::{num::NonZeroU32, sync::Arc};
+use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema};
 use dogpaddle_operation::{
-    OperationBindError, OperationDefinition, OperationKind, RuntimeResource,
+    OperationBindError, OperationDefinition, RuntimeResource,
     operation::{
         Operation, OperationInput,
         transform::{RunningEventCountDefinition, RunningEventCountError},
@@ -28,11 +28,7 @@ fn decoded_definition() -> OperationDefinition {
 #[test]
 fn definition_has_stable_v1_literal_exact_schema_and_count_declaration() {
     let definition = RunningEventCountDefinition::new();
-    let decoded = assert_literal_definition(
-        &definition,
-        RUNNING_EVENT_COUNT_V1,
-        OperationKind::AtomicTransform(NonZeroU32::MIN),
-    );
+    let decoded = assert_literal_definition(&definition, RUNNING_EVENT_COUNT_V1, 1);
     assert_eq!(
         construct_checked(&decoded, &[value_schema()])
             .unwrap()

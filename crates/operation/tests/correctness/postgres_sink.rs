@@ -1,10 +1,10 @@
-use std::{num::NonZeroU32, sync::Arc};
+use std::sync::Arc;
 
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    OperationBindError, OperationDefinition, OperationKind, OperationSetupError, RuntimeResource,
+    OperationBindError, OperationDefinition, OperationSetupError, RuntimeResource,
     operation::{
         Operation,
         sink::{
@@ -66,8 +66,8 @@ fn literal_definition_bytes() -> Vec<u8> {
 fn postgres_sink_definition_has_canonical_non_secret_variant_bytes() {
     let definition = definition();
     assert_eq!(
-        OperationDefinition::from(definition.clone()).kind(),
-        OperationKind::Sink(NonZeroU32::MIN)
+        OperationDefinition::from(definition.clone()).input_count(),
+        1
     );
     let encoded =
         serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(&definition.clone().into())
@@ -77,7 +77,7 @@ fn postgres_sink_definition_has_canonical_non_secret_variant_bytes() {
 
     let decoded =
         serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&encoded).unwrap();
-    assert_eq!(decoded.kind(), OperationKind::Sink(NonZeroU32::MIN));
+    assert_eq!(decoded.input_count(), 1);
     assert_eq!(
         serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(&decoded).unwrap(),
         encoded
@@ -176,8 +176,8 @@ fn postgres_sink_decoder_rejects_every_truncated_payload_prefix() {
 fn postgres_sink_declares_exact_buffered_state_and_runtime_resource() {
     let definition = definition();
     assert_eq!(
-        OperationDefinition::from(definition.clone()).kind(),
-        OperationKind::Sink(NonZeroU32::MIN)
+        OperationDefinition::from(definition.clone()).input_count(),
+        1
     );
     assert!(matches!(
         OperationDefinition::from(definition.clone()).validate_resource(&RuntimeResource::none()),

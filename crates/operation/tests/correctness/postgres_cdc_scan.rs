@@ -1,5 +1,5 @@
 use dogpaddle_operation::{
-    OperationDefinition, OperationKind, OperationSetupError, RuntimeResource,
+    OperationDefinition, OperationSetupError, RuntimeResource,
     operation::{
         Operation,
         scan::{CdcOptions, PostgresCdcScanConfig, PostgresCdcScanDefinition, PostgresCdcScanSpec},
@@ -63,8 +63,8 @@ fn literal_definition_bytes() -> Vec<u8> {
 fn postgres_cdc_definition_has_a_canonical_non_secret_variant_and_exact_schema() {
     let definition = definition();
     assert_eq!(
-        OperationDefinition::from(definition.clone()).kind(),
-        OperationKind::Scan
+        OperationDefinition::from(definition.clone()).input_count(),
+        0
     );
     let bytes =
         serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(&definition.clone().into())
@@ -73,7 +73,7 @@ fn postgres_cdc_definition_has_a_canonical_non_secret_variant_and_exact_schema()
     assert_eq!(bytes, expected);
     let decoded =
         serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&bytes).unwrap();
-    assert_eq!(decoded.kind(), OperationKind::Scan);
+    assert_eq!(decoded.input_count(), 0);
     assert_eq!(
         serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(&decoded).unwrap(),
         bytes

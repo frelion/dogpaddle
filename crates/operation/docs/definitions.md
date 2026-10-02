@@ -7,16 +7,16 @@
 
 具体 `XxxOperation` 运行类型及其构造入口只在 operation crate 内可见；公共调用方通过 `OperationDefinition::construct` 的统一 checked 入口得到 `Operation`，不另设手工装配入口。
 
-`OperationDefinition` 是内建算子的封闭 enum。具体 Definition 只保存自身的计划数据；公共 enum 明确列出允许进入 Flow 的算子，并集中给出每个 variant 的 `OperationKind::Scan`、`AtomicTransform(NonZeroU32)`、`PagedTransform(NonZeroU32)` 或 `Sink(NonZeroU32)`。role、融合资格与非零 input arity 不能从拓扑位置、空 data 或持久化 tag 反向推断。
+`OperationDefinition` 是内建算子的封闭 enum，只集中给出纯 `input_count()`，供无句柄 Schema 编译与构造前 arity 检查。具体 Definition 只保存自身计划数据。构造得到的 `Operation::{Atomic,Paged,Source,Sink}` 是角色和融合资格的唯一权威，不另维护平行 role enum；Flow 绑定后据此推导融合和调用深度。
 head 可接非空或空的单输入 Atomic 尾链，融合索引只在内存中存在，不拥有独立 ID、持久资源或生命周期。
 PagedTransform 使用借用 Resume 的 step；未提交页从未变化的真实状态和帧位置重算。
 Source/Sink 使用具体 capture/delivery 数据协议，不参与通用 prepared/callback 执行接口。
 普通关系表达式统一要求 immutable、逐行可执行；Definition 构造与 decode 都执行相同准入规则，不能借恢复绕过。
-Filter、Select、Aggregate 固定声明 Atomic；Aggregate 同时检查 group expression 与 call argument。
+Filter、Select、Aggregate 固定构造成 Atomic；Aggregate 同时检查 group expression 与 call argument。
 `OperationDefinition::construct` 把有序、精确的 input logical `SchemaRef`、已限定资源名范围的短期 `DataScope` 和首 Operation runtime resource 一次性构造成最终运行 `Operation` 与精确 output Schema。
-入口统一校验 input arity、全部 input/output DogPaddle Schema、runtime resource 类型、kind/output 与执行能力一致性；各具体 Definition 的私有 `construct_unchecked` 只实现自身规则、表达式编译、类型化状态句柄取得和最终 runtime 构造，外部调用方不能绕过公共校验。
+入口统一校验 input arity、全部 input/output DogPaddle Schema、runtime resource 类型，以及最终 runtime 能力与 output 存在性；各具体 Definition 的私有 `construct_unchecked` 只实现自身规则、表达式编译、类型化状态句柄取得和最终 runtime 构造，外部调用方不能绕过公共校验。
 资源前缀由调用方通过 `DataScope::scoped` 限定；具体 Definition 只向 `DataScope::data` 传固定逻辑名，不拼接全局资源名。Store 声明/查找错误透明传递，保留完整资源名。
-Scan 接收空 inputs，Scan/Transform 必须给出完整 output Schema，Sink 必须没有 output。
+Source 接收空 inputs；checked construct 根据最终 runtime variant 要求 Source/Transform 有完整 output Schema、Sink 没有 output。纯 output_schema 只验证存在的 Schema，不构造 runtime 或维护平行 role 分类。
 构造不得读取业务状态、开始事务、访问外部系统、时间或随机性；相同持久化算子名、计划数据 与有序 input Schemas 必须维持相同 Schema、状态资源集合和执行语义。
 
 ## 计划表示与持久化

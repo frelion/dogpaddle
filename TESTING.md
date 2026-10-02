@@ -28,7 +28,7 @@ DogPaddle 只保留能够证明当前公共语义、持久化格式、事务边�
 
 ### Operation
 
-Operation 的公共测试采用垂直所有权：每个内建算子各有一个 owner module，自己拥有 literal golden、kind、data declaration、checked construct、runtime 和 reopen 证据；超大 owner 可用一个 façade 按独立行为域分卷。跨算子文件只保留：
+Operation 的公共测试采用垂直所有权：每个内建算子各有一个 owner module，自己拥有 literal golden、实际执行能力、data declaration、checked construct、runtime 和 reopen 证据；超大 owner 可用一个 façade 按独立行为域分卷。跨算子文件只保留：
 
 - `expression`：DataFusion Expr protobuf、精确 Schema binding 和 evaluate；
 - `protocol`：Atomic 完整消费、Paged 的 `Resume/Progress` 与共享 `StepBudget`，以及 Source/Sink 的具体边界协议；

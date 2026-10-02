@@ -1,4 +1,4 @@
-use std::{collections::HashMap, num::NonZeroU32, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use arrow_array::{
     Array, Decimal128Array, Int32Array, Int64Array, RecordBatch, StringArray, UInt64Array,
@@ -6,7 +6,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Metadata, Schema};
 use dogpaddle_change::{Change, MAX_SCHEMA_TEXT_BYTES, SchemaError};
 use dogpaddle_operation::{
-    ExpressionBindError, OperationBindError, OperationKind, ProjectionError, cast, col,
+    ExpressionBindError, OperationBindError, ProjectionError, cast, col,
     operation::{
         OperationInput,
         transform::{SelectDefinition, SelectField, SelectSchemaError},
@@ -168,11 +168,7 @@ fn field_and_schema_metadata_share_the_complete_output_schema_text_limit() {
 #[test]
 fn literal_definition_reconstructs_metadata_binding_and_runtime() {
     let definition = persisted_definition();
-    let decoded = assert_literal_definition(
-        &definition,
-        SELECT_EXPLICIT_V1,
-        OperationKind::AtomicTransform(NonZeroU32::MIN),
-    );
+    let decoded = assert_literal_definition(&definition, SELECT_EXPLICIT_V1, 1);
     assert!(definition.fields().eq([
         ("renamed", &col("value")),
         ("signed", &cast(col("value"), DataType::Int64)),

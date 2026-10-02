@@ -26,7 +26,7 @@ fn structural_trace(
         Field::new("left", DataType::UInt64, false),
         Field::new("right", DataType::UInt64, false),
     ]));
-    let input_schemas = (0..definition.kind().input_count())
+    let input_schemas = (0..definition.input_count())
         .map(|_| Arc::clone(&schema))
         .collect::<Vec<_>>();
     let fixture = TestStore::new();

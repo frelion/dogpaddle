@@ -9,7 +9,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    OperationBindError, OperationDefinition, OperationKind, RuntimeResource,
+    OperationBindError, OperationDefinition, RuntimeResource,
     operation::{BudgetExceeded, Operation, OperationError, OperationInput, Progress, StepBudget},
 };
 use dogpaddle_store::{Store, StoreSetup, Transactions};
@@ -35,11 +35,11 @@ impl TestStore {
 pub fn assert_literal_definition<D: Clone + Into<OperationDefinition>>(
     definition: &D,
     fixture: &str,
-    expected_kind: OperationKind,
+    expected_inputs: u32,
 ) -> OperationDefinition {
     let definition = definition.clone().into();
     let literal = decode_hex(fixture);
-    assert_eq!(definition.kind(), expected_kind);
+    assert_eq!(definition.input_count(), expected_inputs);
     assert_eq!(
         serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(&definition).unwrap(),
         literal
@@ -47,7 +47,7 @@ pub fn assert_literal_definition<D: Clone + Into<OperationDefinition>>(
 
     let decoded =
         serde_json::from_slice::<dogpaddle_operation::OperationDefinition>(&literal).unwrap();
-    assert_eq!(decoded.kind(), expected_kind);
+    assert_eq!(decoded.input_count(), expected_inputs);
     assert_eq!(
         serde_json::to_vec::<dogpaddle_operation::OperationDefinition>(&decoded).unwrap(),
         literal

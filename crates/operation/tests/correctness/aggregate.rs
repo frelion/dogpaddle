@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    num::NonZeroU32,
     sync::Arc,
 };
 
@@ -10,7 +9,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    OperationDefinition, OperationKind, OperationSetupError, RuntimeResource,
+    OperationDefinition, OperationSetupError, RuntimeResource,
     operation::{
         Operation, StepBudget,
         transform::{
@@ -282,14 +281,10 @@ fn aggregate_trace(events: &[(&str, Option<i64>, i64)], batches: &[usize]) -> Ve
 #[test]
 fn definition_binds_schema_and_typed_setup_requires_the_stable_three_resource_layout() {
     let definition = definition();
-    let decoded = assert_literal_definition(
-        &definition,
-        AGGREGATE_V1,
-        OperationKind::AtomicTransform(NonZeroU32::MIN),
-    );
+    let decoded = assert_literal_definition(&definition, AGGREGATE_V1, 1);
     assert_eq!(
-        OperationDefinition::from(definition.clone()).kind(),
-        OperationKind::AtomicTransform(NonZeroU32::MIN)
+        OperationDefinition::from(definition.clone()).input_count(),
+        1
     );
     let input = input_schema();
     let binding = construct_checked(&definition, std::slice::from_ref(&input)).unwrap();

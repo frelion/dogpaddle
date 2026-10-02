@@ -1,5 +1,5 @@
 use crate::{
-    build::{FlowDefinition, ResolvedTopology, codec},
+    build::{FlowDefinition, TopologyError, codec, validate},
     error::{FlowError, setup_error},
     flow::{Frames, Runtime, RuntimeNode},
 };
@@ -10,19 +10,12 @@ use dogpaddle_store::DataScope;
 
 pub(crate) fn construct(
     definition: FlowDefinition,
-    topology: ResolvedTopology,
     data: &mut DataScope<'_>,
     resources: Vec<RuntimeResource>,
 ) -> Result<Runtime, FlowError> {
     let count = definition.operations.len();
-    let mut message_outputs = vec![false; count];
-    for (head, &is_head) in topology.heads.iter().enumerate() {
-        if is_head {
-            message_outputs[topology.tails[head].last().copied().unwrap_or(head)] = true;
-        }
-    }
     let mut schemas: Vec<Option<SchemaRef>> = Vec::with_capacity(count);
-    let mut nodes = Vec::with_capacity(count);
+    let mut nodes: Vec<RuntimeNode> = Vec::with_capacity(count);
     let mut sources = Vec::new();
     let mut sinks = Vec::new();
     for (index, (node, resource)) in definition.operations.into_iter().zip(resources).enumerate() {
@@ -31,11 +24,13 @@ pub(crate) fn construct(
             .iter()
             .map(|&input| {
                 schemas[input]
-                    .as_ref()
-                    .expect("validated producer has output")
                     .clone()
+                    .ok_or_else(|| TopologyError::InputHasNoOutput {
+                        operation: node.id.clone(),
+                        input: nodes[input].id.clone(),
+                    })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
         let (operation, schema) = node
             .definition
             .construct(
@@ -45,18 +40,6 @@ pub(crate) fn construct(
             )
             .map_err(|source| setup_error(&node.id, source))?
             .into_parts();
-        let codec = schema
-            .as_ref()
-            .filter(|_| matches!(&operation, Operation::Source(_)) || message_outputs[index])
-            .map(|schema| {
-                SchemaBoundChangeCodec::try_new(schema.clone()).map_err(|source| {
-                    FlowError::OutputCodec {
-                        operation_id: node.id.clone(),
-                        source,
-                    }
-                })
-            })
-            .transpose()?;
         schemas.push(schema);
         match &operation {
             Operation::Source(_) => sources.push(index),
@@ -67,9 +50,30 @@ pub(crate) fn construct(
             id: node.id,
             inputs: node.inputs,
             operation,
-            codec,
+            codec: None,
             pending: None,
         });
+    }
+    let topology = validate::resolve(&nodes)?;
+    let mut message_outputs = vec![false; count];
+    for (head, &is_head) in topology.heads.iter().enumerate() {
+        if is_head {
+            message_outputs[topology.tails[head].last().copied().unwrap_or(head)] = true;
+        }
+    }
+    for (index, (node, schema)) in nodes.iter_mut().zip(schemas).enumerate() {
+        node.codec = schema
+            .as_ref()
+            .filter(|_| matches!(&node.operation, Operation::Source(_)) || message_outputs[index])
+            .map(|schema| {
+                SchemaBoundChangeCodec::try_new(schema.clone()).map_err(|source| {
+                    FlowError::OutputCodec {
+                        operation_id: node.id.clone(),
+                        source,
+                    }
+                })
+            })
+            .transpose()?;
     }
     let frames = Frames::bind(data)?;
     Ok(Runtime {

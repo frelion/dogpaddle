@@ -97,13 +97,13 @@ impl FlowFactory {
     /// Returns topology, schema, resource or Store errors. Failed persistent creation
     /// can leave an incomplete path; open never repairs or deletes it.
     pub fn build(self) -> Result<Flow, FlowError> {
-        let (definition, topology) =
+        let definition =
             validate::finish_definition(self.owner_identity, self.token, self.operations)?;
         let encoded = codec::encode(&definition)?;
         let resources = preflight_resources(&definition, self.resources)?;
         let mut setup = StoreSetup::new();
         let published: Cell<Vec<u8>> = setup.create_data(codec::DEFINITION_DATA_NAME)?;
-        let mut runtime = construct(definition, topology, &mut setup.data_scope(), resources)?;
+        let mut runtime = construct(definition, &mut setup.data_scope(), resources)?;
         let transactions =
             setup.commit(&self.path, |access| published.access(access)?.set(&encoded))?;
         let (transactions, reads) = transactions.split();

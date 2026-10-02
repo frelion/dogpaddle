@@ -73,8 +73,8 @@ fn run(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
 
 `resource(operation_id, value)` 注入临时凭据或连接配置，`owner_identity` 设置 build/open 必须精确匹配的身份。
 每个输入必须引用同一 factory 中较早声明的 Operation；声明顺序就是唯一的构造与轮询顺序，不另排拓扑序。
-`build()` 在创建路径前只解析一次图并检查资源和 Schema，将原计划编码后原子发布完整 catalog 和 Definition，不先把自己编码的计划重新解码；
-`open()` 只读已存在的资源，验证帧与图的对应关系后恢复运行。失败不删除、修复或重建状态。
+`build()` 在创建路径前检查图的名称、输入与 arity，全量预检资源，再构造算子并从实际 runtime 能力推导融合和深度、检查 Schema，将原计划编码后原子发布完整 catalog 和 Definition，不先把自己编码的计划重新解码；
+`open()` 只读已存在的资源，验证帧与图的对应关系后恢复运行；缺失 handle 或绑定错误可以优先于角色或深度错误。失败不删除、修复或重建状态。
 
 `operation_ids()` 返回全部逻辑 ID；`status()` 返回栈深度、栈顶 Operation、是否正在发送，以及是否必须重开。
 提交、barrier 或外部效果不确定时，整个 Flow 进入 fail-stop。`FlowRunError::requires_reopen()` 给出这个区别。

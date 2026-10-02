@@ -1,4 +1,4 @@
-use std::{mem::size_of, num::NonZeroU32, sync::Arc};
+use std::{mem::size_of, sync::Arc};
 
 use arrow_array::{
     Float64Array, Int64Array, ListArray, NullArray, RecordBatch, RecordBatchOptions, StringArray,
@@ -8,7 +8,7 @@ use arrow_buffer::OffsetBuffer;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dogpaddle_change::Change;
 use dogpaddle_operation::{
-    OperationDefinition, OperationKind, OperationSetupError, RuntimeResource,
+    OperationDefinition, OperationSetupError, RuntimeResource,
     operation::{
         BudgetExceeded, Operation, Progress, StepBudget,
         transform::{DistinctDefinition, DistinctError},
@@ -102,11 +102,7 @@ fn open_reports_the_full_name_and_kind_for_a_wrong_collection() {
 #[test]
 fn literal_definition_has_variant_exact_schema_and_one_weight_multiset() {
     let definition = DistinctDefinition::new();
-    let decoded = assert_literal_definition(
-        &definition,
-        DISTINCT_V1,
-        OperationKind::AtomicTransform(NonZeroU32::MIN),
-    );
+    let decoded = assert_literal_definition(&definition, DISTINCT_V1, 1);
     let input = schema();
     assert_eq!(
         construct_checked(&decoded, std::slice::from_ref(&input))
