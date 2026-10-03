@@ -174,8 +174,10 @@ struct Fixture {
 }
 impl Fixture {
     fn new(kind: EquiJoinKind, residual: Residual) -> Self {
+        Self::with_definition(definition(kind, residual))
+    }
+    fn with_definition(definition: EquiJoinDefinition) -> Self {
         let root = TestStore::new();
-        let definition = definition(kind, residual);
         let mut setup = StoreSetup::new();
         let operation = OperationDefinition::from(definition.clone())
             .construct(
@@ -272,6 +274,59 @@ impl Fixture {
             }
         }
         panic!("join did not finish")
+    }
+}
+
+#[test]
+fn null_type_equality_never_matches_across_join_kinds_and_reopen() {
+    for kind in KINDS {
+        for residual in [Residual::None, Residual::Greater] {
+            let names: &[&str] = if matches!(kind, EquiJoinKind::LeftSemi | EquiJoinKind::LeftAnti)
+            {
+                &["left_key", "left_value"]
+            } else {
+                &["left_key", "left_value", "right_key", "right_value"]
+            };
+            let null = lit(dogpaddle_operation::ScalarValue::Null);
+            let definition = EquiJoinDefinition::try_new(
+                kind,
+                [(null.clone(), null)],
+                names.iter().copied(),
+                residual.expression(),
+            )
+            .unwrap();
+            let mut fixture = Fixture::with_definition(definition);
+            let mut left = BTreeMap::new();
+            let mut right = BTreeMap::new();
+            let mut actual = BTreeMap::new();
+            for (port, row, diff) in [
+                (0, (None, 20), 2),
+                (1, (None, 10), 3),
+                (0, (None, 20), -1),
+                (1, (None, 10), -3),
+                (0, (None, 20), -1),
+            ] {
+                let input = change(&[(row, diff)]);
+                let rolled = fixture.page(port, &input, 1, false).unwrap();
+                fixture = fixture.reopen();
+                let step = fixture.page(port, &input, 1, true).unwrap();
+                assert_eq!(rolled.progress, step.progress);
+                assert_eq!(step.progress, Progress::Done);
+                assert_eq!(
+                    rolled.output.as_ref().map(|c| output(c, kind)),
+                    step.output.as_ref().map(|c| output(c, kind))
+                );
+                if let Some(change) = step.output {
+                    for (row, diff) in output(&change, kind) {
+                        adjust(&mut actual, row, diff);
+                    }
+                }
+                adjust(if port == 0 { &mut left } else { &mut right }, row, diff);
+                assert_eq!(actual, oracle(&left, &right, kind, residual));
+                fixture = fixture.reopen();
+            }
+            assert!(actual.is_empty());
+        }
     }
 }
 

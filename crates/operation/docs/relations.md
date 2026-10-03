@@ -39,6 +39,7 @@ group key 不能包含 Float32/Float64；global aggregate、grouping sets、aggr
 `EquiJoin` 是两输入 `PagedTransform`；port 0 为 left，port 1 为 right。
 Definition 保留 `Inner/LeftSemi/LeftAnti/LeftOuter/FullOuter`、非空 equality pairs、output names 和可选 residual。
 所有表达式 immutable；每对 key exact 同型、flat non-float，NULL 不匹配。
+`Null` 类型的 key array 没有 physical validity bitmap，仍须按全 NULL 处理；该规则也适用于 ASOF equality。
 residual 在 `left.* + right.*` candidate Schema 上绑定，必须 Boolean，只有 non-null true qualifying。
 
 两侧 rows 为 `OrderedMap<PartitionKey<Vec<u8>, Vec<u8>>, NonZeroU64>`，以完整 equality key 和 canonical row
@@ -52,6 +53,7 @@ match-count key 为单字节 port 加 canonical row；不声明 operator continu
 每个事件在第一页从真实本侧权重准入，不保存全输入 RowEffect、影子关系或跨事务 prepared rows。
 
 页内批量扫描候选、求值 residual，并立即更新真实 support。
+对侧 support 的完整行 key 读写在 residual 求值前准入，包括 Semi/Anti 右侧 presence 变化而没有结果输出的页。
 outer null correction 与对应 pair 共同占一个 head work item，即使该项输出两行，也不二次扣 head 数量。
 最后一页把本事件已 checked 的 after 权重写回本侧 rows，不重复点读；after 只在当前事件调用内存活，More 后仍重新读取和检查真实权重。More 持久位置与状态和输出同事务。
 帧的 DFS 顺序保证当前输入处理完前对侧不被后续事件改变。

@@ -143,8 +143,10 @@ struct Fixture {
 }
 impl Fixture {
     fn new(direction: AsOfDirection) -> Self {
+        Self::with_definition(definition(direction))
+    }
+    fn with_definition(definition: AsOfJoinDefinition) -> Self {
         let root = TestStore::new();
-        let definition = definition(direction);
         let mut setup = StoreSetup::new();
         let operation = OperationDefinition::from(definition.clone())
             .construct(
@@ -279,6 +281,64 @@ impl Fixture {
             .entries
     }
 }
+
+#[test]
+fn null_type_equality_skips_winners_and_history_corrections_after_reopen() {
+    for direction in [
+        AsOfDirection::Backward { allow_exact: false },
+        AsOfDirection::Backward { allow_exact: true },
+        AsOfDirection::Forward { allow_exact: false },
+        AsOfDirection::Forward { allow_exact: true },
+    ] {
+        let null = dogpaddle_operation::lit(dogpaddle_operation::ScalarValue::Null);
+        let definition = AsOfJoinDefinition::try_new(
+            direction,
+            [AsOfEqualityKey::new(null.clone(), null)],
+            AsOfOrderKey::new(col("at"), col("at")),
+            [
+                "left_group",
+                "left_at",
+                "left_id",
+                "right_group",
+                "right_at",
+                "right_id",
+            ],
+        )
+        .unwrap();
+        let mut fixture = Fixture::with_definition(definition);
+        let mut left = BTreeMap::new();
+        let mut right = BTreeMap::new();
+        let mut actual = BTreeMap::new();
+        for (port, row, diff) in [
+            (0, (None, Some(20), 1), 2),
+            (1, (None, Some(10), 2), 1),
+            (1, (None, Some(30), 3), 1),
+            (0, (None, Some(20), 4), 1),
+            (1, (None, Some(10), 2), -1),
+            (0, (None, Some(20), 1), -2),
+        ] {
+            let input = change(&[(row, diff)]);
+            let rolled = fixture.page(port, &input, 1, false).unwrap();
+            fixture = fixture.reopen();
+            let step = fixture.page(port, &input, 1, true).unwrap();
+            assert_eq!(rolled.progress, step.progress);
+            assert_eq!(step.progress, Progress::Done);
+            assert_eq!(
+                rolled.output.as_ref().map(output),
+                step.output.as_ref().map(output)
+            );
+            if let Some(change) = step.output {
+                for (row, diff) in output(&change) {
+                    adjust(&mut actual, row, diff);
+                }
+            }
+            adjust(if port == 0 { &mut left } else { &mut right }, row, diff);
+            assert_eq!(actual, oracle(&left, &right, direction));
+            fixture = fixture.reopen();
+        }
+    }
+}
+
 #[test]
 fn strict_and_inclusive_neighbors_match_independent_bags_after_historical_insert_delete() {
     for direction in [
@@ -489,8 +549,12 @@ fn the_current_v1_payload_and_layout_reject_retired_asof_capabilities() {
     assert_eq!(decoded.input_count(), 2);
     let mut payload =
         serde_json::to_value(definition(AsOfDirection::Backward { allow_exact: true })).unwrap();
+    serde_json::from_slice::<AsOfJoinDefinition>(&serde_json::to_vec(&payload).unwrap()).unwrap();
     payload["tolerance"] = serde_json::json!(1);
-    assert!(serde_json::from_value::<AsOfJoinDefinition>(payload).is_err());
+    assert!(
+        serde_json::from_slice::<AsOfJoinDefinition>(&serde_json::to_vec(&payload).unwrap())
+            .is_err()
+    );
     let fixture = Fixture::new(AsOfDirection::Backward { allow_exact: true });
     let Fixture {
         root,

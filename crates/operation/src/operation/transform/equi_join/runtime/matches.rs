@@ -191,10 +191,7 @@ impl EquiJoinOperation {
         // Only retained match slots and support reads/writes belong here.
         // Candidate Arrow and every output row are admitted at construction.
         bytes = bytes.saturating_add(candidates.len().saturating_mul(size_of::<PreparedMatch>()));
-        if !self.kind.left_only()
-            && self.tracks_match_count(1 - port)
-            && !matches!(effect.transition, KeyTransition::None)
-        {
+        if self.tracks_match_count(1 - port) && !matches!(effect.transition, KeyTransition::None) {
             for candidate in candidates {
                 bytes = bytes.saturating_add(candidate.0.len().saturating_add(9).saturating_mul(3));
             }

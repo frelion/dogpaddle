@@ -375,3 +375,127 @@ fn pure_join_pages_after_reopen(key: &ArrayRef, page_bytes: usize, probe_bytes: 
     assert!(output.records().column(3).is_null(0));
     transaction.commit().unwrap();
 }
+
+fn residual_support_event(schema: &SchemaRef, value: i64, payload: &str, diff: i64) -> Change {
+    Change::try_new(
+        RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![value])),
+                Arc::new(StringArray::from(vec![payload])),
+            ],
+        )
+        .unwrap(),
+        Int64Array::from(vec![diff]),
+    )
+    .unwrap()
+}
+
+fn residual_support_step(
+    operation: &Operation,
+    transactions: &mut dogpaddle_store::Transactions,
+    port: usize,
+    input: &Change,
+    bytes: usize,
+    commit: bool,
+) -> Result<dogpaddle_operation::operation::Step, dogpaddle_operation::operation::OperationError> {
+    let transaction = transactions.begin();
+    let step = operation.step(
+        OperationInput {
+            port,
+            change: input,
+        },
+        &operation.initial_resume(),
+        transaction.access(),
+        &mut StepBudget::new(1, bytes),
+    )?;
+    assert_eq!(step.progress, Progress::Done);
+    if commit {
+        transaction.commit()?;
+    }
+    Ok(step)
+}
+
+#[test]
+fn residual_existence_support_writes_are_charged_even_without_output() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("key", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+        Field::new("payload", DataType::Utf8, false),
+    ]));
+    let payload = "x".repeat(960 * 1024);
+    let left = residual_support_event(&schema, 10, &payload, 1);
+    let first = residual_support_event(&schema, 0, "", 1);
+    let second = residual_support_event(&schema, 1, "", 1);
+    let first_death = residual_support_event(&schema, 0, "", -1);
+    let second_death = residual_support_event(&schema, 1, "", -1);
+    for kind in [EquiJoinKind::LeftSemi, EquiJoinKind::LeftAnti] {
+        let definition = OperationDefinition::from(
+            EquiJoinDefinition::try_new(
+                kind,
+                [(col("key"), col("key"))],
+                ["key", "value", "payload"],
+                Some(col("left.value").gt(col("right.value"))),
+            )
+            .unwrap(),
+        );
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("store");
+        let mut setup = StoreSetup::new();
+        let mut operation = definition
+            .construct(
+                &[Arc::clone(&schema), Arc::clone(&schema)],
+                &mut setup.data_scope().scoped("operation"),
+                RuntimeResource::none(),
+            )
+            .unwrap()
+            .into_parts()
+            .0;
+        let mut transactions = setup.commit(&path, |_| Ok(())).unwrap();
+        let ample = 16 * 1024 * 1024;
+        residual_support_step(&operation, &mut transactions, 0, &left, ample, true).unwrap();
+        residual_support_step(&operation, &mut transactions, 1, &first, ample, true).unwrap();
+        // Support 1 -> 2 changes persisted left-row support but emits no row.
+        let error =
+            residual_support_step(&operation, &mut transactions, 1, &second, PAGE_BYTES, false)
+                .unwrap_err();
+        let mut cause: &(dyn std::error::Error + 'static) = error.as_ref();
+        while !cause.is::<BudgetExceeded>() {
+            cause = cause
+                .source()
+                .expect("the only expected failure is budget exhaustion");
+        }
+        drop((operation, transactions));
+        let store = Store::open(&path).unwrap();
+        operation = open_operation(&store, &definition, &schema);
+        transactions = store.into_transactions();
+        // Neither the failed attempt nor a successful rollback can leak support.
+        for (input, commit) in [(&second, false), (&second, true), (&first_death, true)] {
+            assert!(
+                residual_support_step(&operation, &mut transactions, 1, input, ample, commit)
+                    .unwrap()
+                    .output
+                    .is_none()
+            );
+            drop((operation, transactions));
+            let store = Store::open(&path).unwrap();
+            operation = open_operation(&store, &definition, &schema);
+            transactions = store.into_transactions();
+        }
+        let output =
+            residual_support_step(&operation, &mut transactions, 1, &second_death, ample, true)
+                .unwrap()
+                .output
+                .unwrap();
+        assert_eq!(output.records(), left.records());
+        assert_eq!(
+            output.diffs().values(),
+            &[if kind == EquiJoinKind::LeftSemi {
+                -1
+            } else {
+                1
+            }]
+        );
+    }
+}

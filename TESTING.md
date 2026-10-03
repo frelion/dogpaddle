@@ -42,6 +42,8 @@ EquiJoin 的 owner 文件用独立关系 oracle 覆盖 Inner、LeftSemi、LeftAn
 
 AsOfJoin 的 owner 文件固定 tagged JSON 名称 `asof_join`、v1 golden 与 `asof_join.left_index/right_index` 两个索引，覆盖 LeftOuter、Backward/Forward、exact 开关、零/多 Equal 键、单 order、NULL、重复 multiplicity、两侧 insert/retract 和歧义拒绝。独立 winner oracle 验证相邻版本定义的受影响区间、旧负新正顺序、每页 rollback/rebuild，以及 RHS 更新只在最后一页提交。零列 canonical 行验证四种邻接边界；行尾截断、多余字节、坏 Resume 和空/非空旧布局均须拒绝且不改写状态。产品只保留 SQL 可表达的 ASOF 语义；不维护 nearest、tolerance、residual 或 tie policy 扩展。
 
+Join 的 NULL equality witness 必须包含求值结果为 `Null` 类型的 array，不能只覆盖有 validity bitmap 的 nullable scalar；两种 Join 都跨 rollback/reopen 核对完整关系。EquiJoin residual Semi/Anti 另用宽 left row 证明无输出的 RHS support 更新仍扣完整 key 读写费用，预算拒绝及成功后 rollback 不泄漏支持计数，足额重试和撤回跨 reopen 保持结果。
+
 ### Flow
 
 Flow correctness 按机制分为 `binding`、`topology`、`definition` 与运行期领域。代表性算子覆盖融合尾部失败、UnionAll 多输入、Distinct 持久状态、ASOF 历史修正、同源自 Join、SQLite Sink 和 temporal/decimal unary chain；算子关系 oracle 归 Operation。

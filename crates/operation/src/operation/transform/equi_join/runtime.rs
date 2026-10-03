@@ -6,7 +6,7 @@ mod output;
 use std::{mem::size_of, num::NonZeroU64, sync::Arc};
 
 use arrow_array::{Array, Int64Array};
-use arrow_schema::{Field, SchemaRef};
+use arrow_schema::{DataType, Field, SchemaRef};
 use dogpaddle_store::{MapPartition, OrderedMapAccess, TransactionAccess};
 
 use crate::{
@@ -233,7 +233,7 @@ impl EquiJoinOperation {
             })?;
             budget.charge(crate::operation::logical_array_bytes(column.as_ref()))?;
             for (index, row) in rows.iter_mut().enumerate() {
-                row.matchable &= !column.is_null(index);
+                row.matchable &= column.data_type() != &DataType::Null && !column.is_null(index);
                 let before = row.key.len();
                 let result = encode_canonical_bounded(
                     &bound.field,

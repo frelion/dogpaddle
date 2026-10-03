@@ -1,7 +1,7 @@
 use std::{num::NonZeroU64, ops::Bound, sync::Arc};
 
 use arrow_array::Array;
-use arrow_schema::Field;
+use arrow_schema::{DataType, Field};
 use datafusion_common::ScalarValue;
 use dogpaddle_store::{OrderedMapAccess, ScanDirection, ScanLimit, StoreError, TransactionAccess};
 
@@ -119,7 +119,7 @@ impl AsOfJoinOperation {
             })?;
             budget.charge(crate::operation::logical_array_bytes(column.as_ref()))?;
             for (index, row) in rows.iter_mut().enumerate() {
-                row.matchable &= !column.is_null(index);
+                row.matchable &= column.data_type() != &DataType::Null && !column.is_null(index);
                 let before = row.partition.len();
                 let encoded = encode_canonical_bounded(
                     &scalar.field,
