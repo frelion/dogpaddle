@@ -736,9 +736,9 @@ dependencies = [
 
 [[package]]
 name = "crc32fast"
-version = "1.5.2"
+version = "1.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01a7799fd6b852db0e61728dde9a204c423b44d689dbd432522543614b490e78"
+checksum = "0ba106e844045ddc02c20768ac4b0b7cb45f2cc2ecbd833ac9f5dacb183c2055"
 dependencies = [
  "cfg-if",
 ]
@@ -1527,7 +1527,7 @@ dependencies = [
  "crc32fast",
  "jni",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "tempfile",
 ]
 
@@ -2379,9 +2379,9 @@ dependencies = [
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.38.2"
+version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8"
+checksum = "14a5f01b87b92705d07b433c06f96cbc764637d81a0bffb5734ce17cf0f9a2b3"
 dependencies = [
  "cc",
  "pkg-config",
@@ -2511,9 +2511,9 @@ dependencies = [
 
 [[package]]
 name = "mysql"
-version = "28.0.3"
+version = "28.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d3d30e2806645e218163f49c2656286061cc91ffce24d93d758fd136e70eb5d"
+checksum = "ca3de8a73b7c70f76dbcdd4b6abc9b53bbb6c4f7bd6c79d8e8a7ea2157c02487"
 dependencies = [
  "arc-swap",
  "bufstream",
@@ -2878,7 +2878,7 @@ dependencies = [
  "md-5",
  "memchr",
  "rand 0.10.2",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "stringprep",
 ]
 
@@ -3060,9 +3060,9 @@ dependencies = [
 
 [[package]]
 name = "rusqlite"
-version = "0.40.2"
+version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23f2a97da3e3873c73cb2a2e71b35c40ff95e0b1eefa8d72d8499a6928c3b5b3"
+checksum = "9c026b4444579e8d754556c6c75d040d69c4a44283cdb648ab8a8d5965c2cfa8"
 dependencies = [
  "bitflags",
  "fallible-iterator 0.3.0",
@@ -3189,10 +3189,11 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.151"
+version = "1.0.154"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
+checksum = "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6"
 dependencies = [
+ "foldhash 0.2.0",
  "indexmap",
  "itoa",
  "memchr",
@@ -3225,9 +3226,9 @@ dependencies = [
 
 [[package]]
 name = "sha2"
-version = "0.11.0"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "446ba717509524cb3f22f17ecc096f10f4822d76ab5c0b9822c5f9c284e825f4"
+checksum = "47d7069beb7d6ac7b9acd1039986e73443f24234f41074da099d6f994ac9ad19"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.1",
@@ -3452,9 +3453,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.53.1"
+version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
+checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
  "bytes",
  "libc",
@@ -3618,9 +3619,9 @@ checksum = "6d49784317cd0d1ee7ec5c716dd598ec5b4483ea832a2dced265471cc0f690ae"
 
 [[package]]
 name = "ureq"
-version = "3.4.2"
+version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a7ac20be9b7726e0bbdbf974c059676d9acb1cd414961f570a4e8231cacd7fc"
+checksum = "cde93ff05758a36a851a398a772b0b79a82fbe3c186a46f2696baaeaf84c966b"
 dependencies = [
  "base64 0.23.1",
  "log",
@@ -3631,9 +3632,9 @@ dependencies = [
 
 [[package]]
 name = "ureq-proto"
-version = "0.6.3"
+version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b0809a01d1ca5a51ca70db32bb2a19157582a526505ef3c19e3b343a59aa5ad"
+checksum = "841583fc36089d7d59419568ae157f43a5a03a2e5a81ba87c77d1596ef46e922"
 dependencies = [
  "base64 0.23.1",
  "http",
